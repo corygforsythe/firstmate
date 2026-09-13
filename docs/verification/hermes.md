@@ -13,9 +13,9 @@ The skill tree rooted at [`.agents/skills/harness-adapters/SKILL.md`](../../.age
 | Platform | macOS arm64 (Darwin 25.6.0) |
 | Account | GitHub Copilot via `gh auth token` (pooled credential, `copilot` provider) |
 
-Two prior scout investigations established the baseline facts with no adapter code landed:
-[`data/hermes-harness-verify/report.md`](../../data/hermes-harness-verify/report.md) (launch shape, detection problem, busy/interrupt findings, terminal-backend blocker) and
-[`data/hermes-serve-verify/report.md`](../../data/hermes-serve-verify/report.md) (the `hermes serve`/`/api/ws` JSON-RPC transport alternative).
+Two prior scout investigations established the baseline facts with no adapter code landed, recorded as private task reports (not tracked in this repo):
+`data/hermes-harness-verify/report.md` (launch shape, detection problem, busy/interrupt findings, terminal-backend blocker) and
+`data/hermes-serve-verify/report.md` (the `hermes serve`/`/api/ws` JSON-RPC transport alternative).
 This task landed the executable owners against those facts, re-verified every load-bearing one live, and found one the scouts could not have found without wiring code against a real dispatch: the delivery gate's composer-empty conjunct (see below).
 
 ## Detection
@@ -216,7 +216,7 @@ Matching rovo: no `hermes` entry exists in `bin/fm-quota-choose.sh`'s `provider_
 
 ## Transport decision: tmux/`--cli`, not `/api/ws`
 
-Per this task's brief, the `/api/ws` JSON-RPC transport (`data/hermes-serve-verify/report.md`) was NOT pursued: it requires either resolving the captain's VPS ticket-auth flow (out of scope, a real design decision) or deciding whether Firstmate should launch its own scratch `hermes serve` process per crewmate versus dispatching against the captain's existing persistent instance (also a real design decision, not one this task should presuppose).
+Per this task's brief, the `/api/ws` JSON-RPC transport (see `data/hermes-serve-verify/report.md` above) was NOT pursued: it requires either resolving the captain's VPS ticket-auth flow (out of scope, a real design decision) or deciding whether Firstmate should launch its own scratch `hermes serve` process per crewmate versus dispatching against the captain's existing persistent instance (also a real design decision, not one this task should presuppose).
 The tmux/`--cli` adapter landed here works today with zero additional Hermes-side setup beyond the terminal-backend prerequisite above, matches every other verified harness's launch-then-send shape, and is the one the brief designated as the initial adapter.
 A `hermes serve`/`/api/ws` adapter remains a materially promising, larger follow-up ship task, not built speculatively here.
 
