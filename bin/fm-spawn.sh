@@ -133,7 +133,7 @@
 #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
 #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy)
+#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes)
 #   overrides it for this spawn (either kind). A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
 #   new adapters. For pi and pi-signed, fm-spawn resolves the selected executable
@@ -282,6 +282,7 @@
 #     __GEMINISETTINGS__ firstmate-owned per-task gemini settings file (busy-state hooks)
 #     __ROVOBIN__   resolved, rovo-verified executable for a rovo launch
 #     __AGYBIN__    resolved, agy-verified executable for an agy launch
+#     __HERMESBIN__ resolved, hermes-verified executable for a hermes launch
 # Verified per-harness turn-end hooks are installed automatically where enabled; some live outside the worktree.
 # Kimi uses one surgically installed Firstmate region in $HOME/.kimi-code/config.toml,
 # a firstmate-owned global hook and registry, and a gitignored per-task pointer.
@@ -297,6 +298,20 @@
 # only after a TUI readiness gate, then a delivery-confirmation gate - the same
 # launch-then-send shape as kimi. Its busy state is a screen-scrape fallback like
 # grok. rovo is crewmate/scout only and is refused for --secondmate, like muse.
+# hermes installs no hook either - no turn-granularity or busy/idle-granularity
+# hook was found (hermes hooks/--accept-hooks exist but were not confirmed to
+# carry one) - so it carries no busy-source wiring at all and no turn-end hook.
+# `--cli` takes no positional prompt (--tui hits a hard Responses-API wall on
+# a GitHub Copilot integrator and -z/--oneshot never attempts a turn), so
+# hermes launches BARE and receives an absolute brief pointer only after a
+# readiness gate, then a delivery-confirmation gate - the same launch-then-send
+# shape as kimi/rovo. Its busy state is a screen-scrape fallback like grok and
+# rovo. hermes has no verified bin/fm-control.sh lifecycle support at all
+# (Ctrl+C exits the whole session and Escape does not cancel a running tool
+# call, so no key-based interrupt exists for it - the only verified-safe
+# redirect is typing new text and submitting it, which the control plane's
+# key-based interrupt contract does not support today; docs/verification/hermes.md).
+# hermes is crewmate/scout only and is refused for --secondmate, like rovo.
 # agy installs no hook either - it exposes no hook surface at all - so it
 # carries no busy-source wiring and no turn-end hook. Its brief rides the launch
 # command, but a fresh worktree would park it on a folder-trust dialog, so the
@@ -1400,7 +1415,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   }
 elif [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy)
+    ''|claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes)
       ARG3=${POS[1]:-}
       ;;
     *' '*)
@@ -1721,6 +1736,28 @@ launch_template() {
     # when a supported effort is requested, since a second --config-override
     # would silently discard the first (confirmed live).
     rovo) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __ROVOBIN__ run --yolo __MODELFLAG____ROVOCONFIGOVERRIDE__' ;;
+    # Hermes Agent (`hermes` CLI): `--tui` hits a hard Responses-API wall on
+    # this account's GitHub Copilot integrator and `-z`/`--oneshot` never even
+    # attempts a turn (confirmed live, data/hermes-harness-verify/report.md),
+    # so `--cli` is the only working mode and it takes no positional prompt
+    # either - hermes launches BARE, exactly like kimi/rovo, and receives an
+    # absolute brief pointer only after the readiness gate below. --yolo
+    # bypasses hermes's own dangerous-command approval prompts, the same
+    # headless-dispatch role rovo's --disable-permission-checks/--yolo and
+    # muse's --yolo play. hermes does NOT scrub an inherited
+    # CLAUDECODE/CURSOR_AGENT/etc (unverified either way; cleared here as
+    # defense in depth like every other markerless adapter). hermes has no
+    # turn-end hook and no reasoning-effort flag, so no placeholder for
+    # either exists here.
+    # Deliberately NOT forced here: --ignore-user-config. The captain's real
+    # ~/.hermes/config.yaml has terminal.backend: ssh with no ssh_host/
+    # ssh_user set, which breaks every bash/file tool call outright; that
+    # flag reliably routes around it in testing but also discards every
+    # other real config (provider auth beyond .env). Forcing it silently
+    # here would make that tradeoff FOR the captain rather than surfacing it;
+    # see docs/verification/hermes.md for the live evidence and the
+    # open captain decision this leaves.
+    hermes) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESBIN__ --cli --yolo __MODELFLAG__' ;;
     *) return 1 ;;
   esac
 }
@@ -1785,6 +1822,19 @@ fi
 # standing one up with no way to arm its watch cycle.
 if [ "$KIND" = secondmate ] && [ "$HARNESS" = rovo ]; then
   echo "error: rovo is a verified crewmate/scout adapter only and cannot run a secondmate; it has no primary supervision protocol. Select a harness verified for secondmates." >&2
+  exit 1
+fi
+
+# hermes carries the same gap again, and a materially worse one on top: it has
+# no primary supervision protocol AND no verified bin/fm-control.sh lifecycle
+# support at all (docs/verification/hermes.md - Ctrl+C exits the whole
+# session and Escape does not cancel a running tool call, so no key-based
+# interrupt exists for it; the only verified-safe redirect is typing new text
+# and submitting it, which the control plane's key-based interrupt contract
+# does not support today). A secondmate that could never be interrupted,
+# exited, or relaunched through the control plane is refused outright.
+if [ "$KIND" = secondmate ] && [ "$HARNESS" = hermes ]; then
+  echo "error: hermes is a verified crewmate/scout adapter only and cannot run a secondmate; it has no primary supervision protocol. Select a harness verified for secondmates." >&2
   exit 1
 fi
 
@@ -1944,6 +1994,30 @@ resolve_rovo_binary() {
   return 1
 }
 
+resolve_hermes_binary() {
+  local candidate dir fallback
+  candidate=$(command -v hermes 2>/dev/null || true)
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    case "$candidate" in
+      /*) printf '%s\n' "$candidate"; return 0 ;;
+      *)
+        dir=$(cd "$(dirname "$candidate")" 2>/dev/null && pwd -P) || dir=
+        if [ -n "$dir" ]; then
+          printf '%s/%s\n' "$dir" "$(basename "$candidate")"
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  fallback="${HOME:-}/.local/bin/hermes"
+  if [ -n "${HOME:-}" ] && [ -x "$fallback" ]; then
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+  echo "error: hermes executable not found; searched PATH for 'hermes' and fallback '$fallback'" >&2
+  return 1
+}
+
 # muse_credential_present: 0 when a launched muse pane can reach its provider
 # without an interactive login. muse offers exactly two credential paths
 # (verified, muse 0.1.0-R708.1): the META_API_KEY environment variable, which
@@ -1987,6 +2061,17 @@ model_flag_for_harness() {
     claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy)
       printf -- '--model %s ' "$(shell_quote "$model")"
       ;;
+    # hermes's `--cli`/`--tui`/top-level flag is `-m MODEL`, not `--model`
+    # (confirmed against the installed v0.16.0 --help). The account's
+    # configured default model (gpt-5.3-codex) is unavailable for this
+    # GitHub Copilot integrator, and hermes has no quota-axi provider mapping
+    # (stays unmapped, like rovo), so a real dispatch needs an explicit
+    # --model naming one this account's integrator actually grants (verified
+    # live: gpt-4o, gpt-4.1) or the first turn fails outright. --provider is
+    # deliberately not passed here: the account's ~/.hermes/config.yaml
+    # already pins model.provider: copilot, so an explicit -m alone reaches
+    # it without a second flag.
+    hermes) printf -- '-m %s ' "$(shell_quote "$model")" ;;
   esac
 }
 
@@ -2066,6 +2151,10 @@ effort_flag_for_harness() {
     # task metadata but never reaches the launch command. Cursor encodes effort
     # in model ids such as cursor-grok-4.5-high, so it also receives no separate
     # effort flag.
+    # hermes exposes no effort/reasoning-level concept at all (checked against
+    # v0.16.0 --help and a grep of both hermes --help and hermes chat --help
+    # for effort/reasoning); the requested axis stays in task metadata only,
+    # same record-and-omit contract as kimi.
   esac
 }
 
@@ -2106,6 +2195,13 @@ case "$LAUNCH" in
   *__ROVOBIN__*)
     ROVO_BIN=$(resolve_rovo_binary) || exit 1
     LAUNCH=${LAUNCH//__ROVOBIN__/$(shell_quote "$ROVO_BIN")}
+    ;;
+esac
+
+case "$LAUNCH" in
+  *__HERMESBIN__*)
+    HERMES_BIN=$(resolve_hermes_binary) || exit 1
+    LAUNCH=${LAUNCH//__HERMESBIN__/$(shell_quote "$HERMES_BIN")}
     ;;
 esac
 
@@ -3174,6 +3270,83 @@ rovo_spawn_fail() {  # <detail>
   rovo_endpoint_cleanup
 }
 
+# hermes mirrors the rovo/kimi launch-then-send shape exactly: `--cli` takes
+# no positional prompt, so it launches bare and takes its brief pointer only
+# after a readiness gate, then a delivery-confirmation gate. Both route their
+# composer-emptiness half through the shared classifier
+# (fm_backend_composer_state) like rovo/kimi. The banner and context-usage
+# greps are launch-progress signals, not composer shapes.
+hermes_capture() {
+  fm_backend_capture "$BACKEND" "$T" 120 "$W" 2>/dev/null || true
+}
+
+hermes_composer_is_empty() {
+  [ "$(fm_backend_composer_state "$BACKEND" "$T" "$W" 2>/dev/null)" = empty ]
+}
+
+hermes_wait_for_ready() {
+  local pane i=0 max=${FM_HERMES_READY_POLLS:-60} interval=${FM_HERMES_POLL_INTERVAL:-0.5}
+  while [ "$i" -lt "$max" ]; do
+    pane=$(hermes_capture)
+    # 'Welcome to Hermes Agent!' is hermes's own fresh-launch banner
+    # (confirmed live, v0.16.0), the same primary evidence kimi's 'Welcome to
+    # Kimi Code!' and rovo's 'Welcome to Rovo!' matches use. Composer-empty is
+    # the fallback for a banner that has already scrolled out of the capture.
+    if printf '%s\n' "$pane" | grep -Fq 'Welcome to Hermes Agent!' \
+       || hermes_composer_is_empty; then
+      return 0
+    fi
+    i=$((i + 1))
+    [ "$i" -ge "$max" ] || sleep "$interval"
+  done
+  return 1
+}
+
+hermes_delivery_is_confirmed() {  # <plain-pane-capture>
+  local pane=$1
+  # Deliberately NOT gated on hermes_composer_is_empty, unlike rovo/kimi.
+  # Confirmed live: while a submitted turn is busy, hermes's prompt row
+  # renders the `⚕ ❯ msg=interrupt · ...` hint line, which the shared
+  # composer classifier (bin/fm-composer-lib.sh) reads as an unrecognized
+  # shape ("unknown"), never "empty" - so a hard composer-empty AND-gate
+  # would block delivery confirmation for the agent's entire first turn, not
+  # just the in-flight moment, and could time this gate out on any brief
+  # whose first response takes longer than the poll window. The real
+  # discriminator between "typed but not yet submitted" and "submitted" is
+  # the leading `●` hermes prepends to an accepted user message in its
+  # transcript (confirmed live: the unsubmitted composer shows
+  # `❯ Read the brief at ...` with no bullet; the accepted, echoed message
+  # shows `● Read the brief at ...` on its own transcript line). hermes's
+  # footer also shows `ctx --` (no digits) before any message is submitted,
+  # and a real `<used>/<total>` token count (e.g. `12.2K/128K`) once a turn
+  # is in flight (confirmed live: the count advances the moment the message
+  # is sent, not only after a tool call completes) - kept as a second,
+  # independent corroborating signal in case a hermes release changes the
+  # bullet glyph.
+  if printf '%s\n' "$pane" | grep -qE '^●[[:space:]]*Read the brief at' \
+     || printf '%s\n' "$pane" | grep -qE '[0-9][0-9.]*K/[0-9]+K'; then
+    return 0
+  fi
+  return 1
+}
+
+hermes_wait_for_delivery() {
+  local pane i=0 max=${FM_HERMES_DELIVERY_POLLS:-40} interval=${FM_HERMES_POLL_INTERVAL:-0.5}
+  while [ "$i" -lt "$max" ]; do
+    pane=$(hermes_capture)
+    hermes_delivery_is_confirmed "$pane" && return 0
+    i=$((i + 1))
+    [ "$i" -ge "$max" ] || sleep "$interval"
+  done
+  return 1
+}
+
+hermes_spawn_fail() {  # <detail>
+  printf 'failed: %s\n' "$1" >> "$STATE/$ID.status"
+  echo "error: $1; inspect window $T" >&2
+  rovo_endpoint_cleanup
+}
+
 # The launch-then-confirm gates run after the task record is published, when
 # ORCA_ABORT_CLEANUP is already cleared and neither the abort trap nor a
 # teardown owns this endpoint yet, so a gate failure must close the launched
@@ -3456,9 +3629,9 @@ if [ "$KIND" != secondmate ]; then
   # adapter with a verified semantic source. The launch brief sent below IS a
   # submitted turn, so the seed record is busy/fm-spawn. The minted gen is
   # embedded into each adapter's wiring so an event from a superseded
-  # incarnation is rejected as stale. Grok and rovo stay on their isolated
-  # rendered-tail fallbacks and standalone Kimi stays unknown until
-  # fm_busy_kimi_verified opens, so none of the three is armed here. Gemini IS
+  # incarnation is rejected as stale. Grok, rovo, and hermes stay on their
+  # isolated rendered-tail fallbacks and standalone Kimi stays unknown until
+  # fm_busy_kimi_verified opens, so none of the four is armed here. Gemini IS
   # armed: its BeforeAgent / AfterAgent / SessionEnd hooks are a verified
   # open-close pair.
   BUSY_GEN=
@@ -4062,7 +4235,7 @@ case "$HARNESS" in
 esac
 LAUNCH=${LAUNCH//__WORKTREE__/$sq_worktree}
 case "$HARNESS" in
-  claude|codex|opencode|pi|pi-signed|grok|kimi|gemini|muse|rovo|agy)
+  claude|codex|opencode|pi|pi-signed|grok|kimi|gemini|muse|rovo|agy|hermes)
     LAUNCH="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI $LAUNCH"
     ;;
 esac
@@ -4231,6 +4404,30 @@ if [ "$HARNESS" = rovo ]; then
   fi
   if ! rovo_wait_for_delivery; then
     rovo_spawn_fail "rovo brief pointer delivery was not confirmed in window $T"
+    exit 1
+  fi
+fi
+if [ "$HARNESS" = hermes ]; then
+  if ! hermes_wait_for_ready; then
+    hermes_spawn_fail "hermes did not show a verified ready signal before brief delivery in window $T"
+    exit 1
+  fi
+  HERMES_POINTER="Read the brief at $BRIEF_REAL and follow it exactly."
+  HERMES_SUBMIT_RETRIES=${FM_HERMES_SUBMIT_RETRIES:-3}
+  HERMES_SUBMIT_SLEEP=${FM_HERMES_SUBMIT_SLEEP:-${FM_HERMES_POLL_INTERVAL:-0.5}}
+  HERMES_SUBMIT_SETTLE=${FM_HERMES_SUBMIT_SETTLE:-0}
+  if ! HERMES_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
+      "$BACKEND" "$T" "$HERMES_POINTER" "$HERMES_SUBMIT_RETRIES" \
+      "$HERMES_SUBMIT_SLEEP" "$HERMES_SUBMIT_SETTLE" "$W"); then
+    hermes_spawn_fail "hermes brief pointer could not be submitted into window $T"
+    exit 1
+  fi
+  if [ "$HERMES_SUBMIT_VERDICT" = send-failed ]; then
+    hermes_spawn_fail "hermes brief pointer could not be submitted into window $T"
+    exit 1
+  fi
+  if ! hermes_wait_for_delivery; then
+    hermes_spawn_fail "hermes brief pointer delivery was not confirmed in window $T"
     exit 1
   fi
 fi

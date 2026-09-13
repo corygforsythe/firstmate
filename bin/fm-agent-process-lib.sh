@@ -17,6 +17,8 @@
 . "$(dirname -- "${BASH_SOURCE[0]}")/fm-session-lock-lib.sh"
 # shellcheck source=bin/fm-gemini-lib.sh
 . "$(dirname -- "${BASH_SOURCE[0]}")/fm-gemini-lib.sh"
+# shellcheck source=bin/fm-hermes-lib.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/fm-hermes-lib.sh"
 
 # fm_agent_process_classify_name: the single owner of the process-name
 # vocabulary shared by every liveness signal - `agent` for a verified harness,
@@ -100,6 +102,14 @@ fm_agent_process_classify() {  # <name> <argv0> <args> [pid] -> agent|shell|othe
     return 0
   fi
   if [ -n "$args" ] && fm_gemini_args_are_gemini "$args"; then
+    printf 'agent'
+    return 0
+  fi
+  if [ -n "$pid" ] && fm_hermes_pid_is_hermes "$pid"; then
+    printf 'agent'
+    return 0
+  fi
+  if [ -n "$args" ] && fm_hermes_args_are_hermes "$args"; then
     printf 'agent'
     return 0
   fi
