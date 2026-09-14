@@ -234,14 +234,14 @@ Re-run it once the account's rate limit has cleared, and treat a clean pass as c
 
 ## VPS `/api/ws` gated-mode auth: the ticket-mint flow, resolved by source but not yet live-dispatched
 
-`data/hermes-serve-verify/report.md` (2026-09-13) found that the captain's real VPS (`http://vps.tail8bdd14.ts.net:9119`, Hermes Agent v0.21.2) puts `/api/ws` in gated mode (`_ws_auth_reason()` in `hermes_cli/web_server.py`) and left the ticket-minting flow uninventoried.
+`data/hermes-serve-verify/report.md` (2026-09-13) found that the captain's real VPS (`http://<your-vps-host>:9119`, Hermes Agent v0.21.2) puts `/api/ws` in gated mode (`_ws_auth_reason()` in `hermes_cli/web_server.py`) and left the ticket-minting flow uninventoried.
 This section resolves the flow itself, by reading the actual v0.21.2 upstream source (via the local install's already-fetched-but-not-checked-out git history at `~/.hermes/hermes-agent`, commit `ee4452991d17534aa561f31ee55596d082aa94e7`, since the local checkout is v0.16.0 and predates it) and confirming the two public, unauthenticated probe endpoints live against the real VPS.
 No write or state-changing call was made against the VPS; both requests below are plain `GET`s.
 
 ```
-$ curl -sS http://vps.tail8bdd14.ts.net:9119/api/status
+$ curl -sS http://<your-vps-host>:9119/api/status
 {"version":"0.21.2", ..., "auth_required":true,"auth_providers":["basic"],"auth_flows":["cookie","native_pkce"], ...}
-$ curl -sS http://vps.tail8bdd14.ts.net:9119/api/auth/providers
+$ curl -sS http://<your-vps-host>:9119/api/auth/providers
 {"providers":[{"name":"basic","display_name":"Username & Password","supports_password":true}]}
 ```
 
@@ -299,7 +299,7 @@ The last two `dispatch` cases pin the fix on this section's own claim above: the
 
 ### Live verification against the real VPS
 
-Run 2026-09-14, `FM_HERMES_WS_BASE_URL=http://vps.tail8bdd14.ts.net:9119`, credentials from `$FM_HOME/.env`, Hermes Agent v0.21.2 (`gateway_mode: multiplex`, model `claude-opus-5 (anthropic)`).
+Run 2026-09-14, `FM_HERMES_WS_BASE_URL=http://<your-vps-host>:9119`, credentials from `$FM_HOME/.env`, Hermes Agent v0.21.2 (`gateway_mode: multiplex`, model `claude-opus-5 (anthropic)`).
 `bin/fm-hermes-ws.py` defaults `Origin` to the base URL's own origin; the real gated connect succeeded on that default with no override needed, so `FM_HERMES_WS_ORIGIN` stays available but unexercised.
 
 Every primitive round-tripped for real:
