@@ -255,3 +255,50 @@ The resolved flow (`hermes_cli/dashboard_auth/routes.py`, `hermes_cli/dashboard_
 This is a real, scriptable, non-browser credential exchange - no PKCE round trip, no `native_pkce` flow needed, since the VPS's only registered provider (`basic`) supports direct password login.
 **What remains unresolved is not the mechanism but the credential**: exercising step 1 needs the captain's actual VPS login username and password for the `basic` provider, which is not present in any file this task can read (checked `data/captain.md`, `data/learnings.md`, `.env`, and `~/.hermes/config.yaml`) and must not be guessed or fabricated.
 Until that credential is supplied, this flow is verified by source and by the two public read-only endpoints above, but NOT yet exercised end to end against the real VPS - see `state/hermes-vps-gateway.status` for the open decision this blocks.
+
+## `bin/fm-hermes-ws.py`/`.sh`: a standalone JSON-RPC-over-WebSocket dispatch client, offline-verified
+
+Per the captain's decision on `state/hermes-vps-gateway.status`, this is a standalone dispatch primitive only - it is deliberately NOT wired into `bin/fm-spawn.sh`, `bin/fm-control.sh`, `bin/fm-crew-state.sh`, or `bin/fm-busy-lib.sh`, since those are entirely pane/text-capture-shaped (`fm_backend_capture`, `fm_backend_composer_state`, `fm_backend_send_key`, ...) and a `/api/ws` session has no pane at all.
+Fleet-dispatch wiring is deferred to a follow-up task once this primitive is proven live.
+
+The client (`bin/fm-hermes-ws.py`, stdlib-only Python - no third-party dependency, matching `bin/fm-mail.py`'s existing no-dependency stance rather than the real Hermes reference client's `pip install websockets`) implements, from scratch: the RFC 6455 client handshake and masked text-frame framing, the gated-mode `password-login -> cookie -> ws-ticket -> ?ticket=` flow above (loopback/`--insecure` mode uses a static `?token=` instead, via `FM_HERMES_WS_TOKEN`), and id-matched JSON-RPC request/response over the connection, draining the server's `gateway.ready` notification on connect.
+`bin/fm-hermes-ws.sh` is a thin wrapper resolving `FM_HERMES_WS_*` configuration from the environment, filling gaps from `$FM_HOME/.env` (env wins), matching `fm-mail.sh`'s convention - the captain's VPS login credentials belong in `$FM_HOME/.env` as `FM_HERMES_WS_USER`/`FM_HERMES_WS_PASS`, the same already-gitignored, already-documented file that holds mail-plane credentials, never in a task brief, status line, or report.
+It exposes every primitive the captain's spec named: `create`, `submit`, `status`, `history`, `steer`, `interrupt`, `close`, plus a `dispatch` convenience (create + submit + wait for `message.complete`/`error` + `history` + `close`) for smoke-testing and live verification.
+
+### Wire-protocol grounding
+
+The real Hermes source (v0.21.2, commit `ee4452991d17534aa561f31ee55596d082aa94e7` at `~/.hermes/hermes-agent`, the same git history used for the auth-ticket flow above) was read directly rather than inferred from the earlier scout report's paraphrased transcript:
+
+- `tui_gateway/ws.py`'s `handle_ws` reuses `tui_gateway.server.dispatch` verbatim and reads exactly one JSON-RPC message per `ws.receive_text()` call (confirmed by reading the function body, not just its docstring), so one WebSocket text frame carries one JSON-RPC message on this transport.
+- `handle_ws` sends `{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready",...}}` immediately after accepting the connection - a client must drain this before its first request-scoped read, which `HermesWsSession.__init__` does.
+- `scripts/iso-certify.py`'s `WSClient` - a real first-party Hermes client for this exact endpoint, not a test double - is `HermesWsSession`'s direct structural model: drain `gateway.ready`, then id-matched request/response, and its `drive_heavy_turn` treats a submitted turn as done only on a `message.complete` event (or failed on `error`, with the message at `params.payload.message`) after a `message.start`, never on an earlier or unrelated event - `cmd_dispatch` mirrors that exact predicate.
+
+### Offline verification (no Hermes install, no VPS)
+
+`tests/fixtures/fm-hermes-ws-stub-server.py` is a from-scratch, independently-written HTTP + WebSocket double for `/auth/password-login`, `/api/auth/ws-ticket`, and `/api/ws` (its own framing code was written independently of the client's, so a shared bug would not hide behind a passing test).
+`tests/fm-hermes-ws.test.sh` drives every subcommand through `bin/fm-hermes-ws.sh` against it over a real loopback socket:
+
+```
+$ bash tests/fm-hermes-ws.test.sh
+ok - token mode: every RPC primitive round-trips over a real WebSocket
+ok - gated mode: password-login -> cookie -> ws-ticket -> /api/ws?ticket= round-trips for real
+ok - gated mode: bad credentials fail closed with no ticket minted and no leaked secret
+ok - dispatch: waits past message.start/message.delta and completes only on message.complete
+ok - dispatch: a turn's error event fails the call and surfaces its message
+ok - config: a missing FM_HERMES_WS_BASE_URL fails closed by name, no guessed connection
+ok - config: fm-hermes-ws.sh fills missing env from $FM_HOME/.env, env still wins over it
+```
+
+Run 2026-09-14 (macOS arm64, Python 3.13.12).
+This proves the HTTP auth calls, the RFC 6455 handshake and framing, JSON-RPC id matching, event-notification handling, and the `dispatch` completion predicate all work correctly against a real socket speaking the documented wire protocol.
+
+### What remains unverified
+
+This client has NOT been run against the real VPS or a real Hermes install of any version - only against the offline stub above.
+Two things stand between this and a genuine live verification matching this record's own bar (a real dispatch, a real turn, real output):
+
+1. **The captain's VPS login credentials**, per the open decision on `state/hermes-vps-gateway.status` - not present in any file this task can read, and not guessed or fabricated.
+2. **The `Origin` header on a real gated (non-loopback) connection is unconfirmed.** `scripts/iso-certify.py`'s `WSClient` sets `Origin` to `http://127.0.0.1:<port>` for its loopback-only scratch instance, matching `hermes_cli/web_server.py`'s CORS `allow_origin_regex` (`localhost`/`127.0.0.1` only); whether the gated remote path enforces that same regex on the WS upgrade specifically, or checks Origin at all, was not established by reading `_ws_auth_reason`/the WS accept path in the time this task had.
+   `bin/fm-hermes-ws.py` defaults `Origin` to the real base URL's own origin (the honest choice for a non-loopback connection) and exposes `FM_HERMES_WS_ORIGIN` to override it if a real gated connect is rejected on this header.
+
+Re-run `bash tests/fm-hermes-ws.test.sh` after any change to the client or the stub, and record a real VPS `dispatch` transcript here once the credential and Origin questions above are resolved.
