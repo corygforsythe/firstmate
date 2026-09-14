@@ -356,7 +356,10 @@ class _WSSocket:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise HermesWsError('timed out waiting for a WebSocket message')
-            self._sock.settimeout(remaining)
+            try:
+                self._sock.settimeout(remaining)
+            except OSError as exc:
+                raise HermesWsError(f'connection error while setting timeout: {exc}') from exc
             fin, opcode, payload = self._recv_frame()
             if opcode == _OPCODE_PING:
                 self._send_control(_OPCODE_PONG, payload)
