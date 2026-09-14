@@ -212,16 +212,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # "session_id": sid}; params["payload"] = payload when given) -
                 # confirmed by reading that source directly rather than
                 # inferred from this stub's own pre-existing (flatter) shape.
-                _send_text(self.wfile, json.dumps(
-                    {'jsonrpc': '2.0', 'method': 'event',
-                     'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
                 if 'TRIGGER_ERROR' in text:
+                    _send_text(self.wfile, json.dumps(
+                        {'jsonrpc': '2.0', 'method': 'event',
+                         'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
                     _send_text(self.wfile, json.dumps(
                         {'jsonrpc': '2.0', 'method': 'event',
                          'params': {'type': 'error', 'payload': {'message': 'stub turn error'}}}))
                 elif 'TRIGGER_HANG' in text:
                     pass  # never send message.complete/error: the client must time out
+                elif text.startswith('STUB_ECHO:'):
+                    # Lets a test control the turn's real content, streamed as
+                    # a delta exactly like the real server does (embedded
+                    # newlines included, since this is a single RPC text
+                    # param, never split by a client-side readline()) instead
+                    # of the fixed 'stub reply' below - used by
+                    # tests/fm-hermes-vps-bridge.test.sh to drive the
+                    # bridge's real FIRSTMATE-STATUS/FIRSTMATE-REPORT
+                    # marker-processing over a real socket. message.complete's
+                    # own "text" carries the same content too, matching a
+                    # normal (non-interleaved-tool-call) turn.
+                    echoed = text[len('STUB_ECHO:'):]
+                    _send_text(self.wfile, json.dumps(
+                        {'jsonrpc': '2.0', 'method': 'event',
+                         'params': {'type': 'message.delta', 'payload': {'text': echoed}}}))
+                    _send_text(self.wfile, json.dumps(
+                        {'jsonrpc': '2.0', 'method': 'event',
+                         'params': {'type': 'message.complete',
+                                    'payload': {'text': echoed, 'status': 'complete'}}}))
+                elif text.startswith('STUB_SPLIT_ECHO:'):
+                    # Regression fixture for the live-verified finding
+                    # (data/hv-protocol-verify/report.md): a turn that emits
+                    # text, then a tool call, then more text fires exactly
+                    # ONE message.start/message.complete pair for the WHOLE
+                    # turn, and message.complete's own "text" field holds
+                    # ONLY the LAST segment - the first segment survives only
+                    # in its own earlier message.delta. Payload shape:
+                    # "STUB_SPLIT_ECHO:<segment1>|||<segment2>".
+                    seg1, _, seg2 = text[len('STUB_SPLIT_ECHO:'):].partition('|||')
+                    _send_text(self.wfile, json.dumps(
+                        {'jsonrpc': '2.0', 'method': 'event',
+                         'params': {'type': 'message.delta', 'payload': {'text': seg1}}}))
+                    _send_text(self.wfile, json.dumps(
+                        {'jsonrpc': '2.0', 'method': 'event',
+                         'params': {'type': 'tool.start', 'payload': {'tool_id': 't1', 'name': 'terminal'}}}))
+                    _send_text(self.wfile, json.dumps(
+                        {'jsonrpc': '2.0', 'method': 'event',
+                         'params': {'type': 'tool.complete', 'payload': {'tool_id': 't1', 'name': 'terminal'}}}))
+                    _send_text(self.wfile, json.dumps(
+                        {'jsonrpc': '2.0', 'method': 'event',
+                         'params': {'type': 'message.delta', 'payload': {'text': seg2}}}))
+                    _send_text(self.wfile, json.dumps(
+                        {'jsonrpc': '2.0', 'method': 'event',
+                         'params': {'type': 'message.complete',
+                                    'payload': {'text': seg2, 'status': 'complete'}}}))
                 else:
+                    _send_text(self.wfile, json.dumps(
+                        {'jsonrpc': '2.0', 'method': 'event',
+                         'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
                     _send_text(self.wfile, json.dumps(
                         {'jsonrpc': '2.0', 'method': 'event',
                          'params': {'type': 'message.complete',

@@ -8,6 +8,8 @@
 # section for the live evidence this was built from.
 #
 # Usage: fm-hermes-vps-bridge.sh --cwd <path>
+#          [--status-file <path>] [--report-file <path>] [--inbox-dir <path>]
+#   See fm-hermes-vps-bridge.py's own header for what the optional flags arm.
 #
 # Configuration and credentials are resolved the identical way
 # bin/fm-hermes-ws.sh resolves them (bin/fm-hermes-ws-env-lib.sh is the one

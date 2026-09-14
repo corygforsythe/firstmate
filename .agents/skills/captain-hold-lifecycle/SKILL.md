@@ -17,6 +17,7 @@ The agent performs the semantic inventory because scripts must not infer captain
 ## Policy
 
 Every unresolved question that belongs to the captain and is discovered while producing, reading, presenting, or ending an investigation or visual review must be carried by a captain-held task in the authoritative backlog of the home that owns the originating work before that work or review may be treated as complete.
+A harness whose worker cannot read this skill or run `bin/fm-captain-hold.sh` (`.agents/skills/harness-adapters/references/harness/hermes-vps.md`'s "Status, report, and steering") routes this gate to firstmate itself instead: the worker names the open question in its report and firstmate applies this policy on receipt, rather than leaving the gate silently unenforced.
 Prefer holding the work item the question gates over minting a new row; create a new task only when no work item exists to hold.
 Put the question and its options in the hold reason, and keep one held task per genuine gate: a multi-question review is one held task pointing at its report, not a row per question. Represent that task with exactly one board card that consolidates its questions and options; never fan one task id into duplicate same-key cards.
 Register or re-hold through `bin/fm-captain-hold.sh hold`, which is idempotent per task id.

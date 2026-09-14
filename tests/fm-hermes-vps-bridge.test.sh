@@ -31,6 +31,20 @@
 #      not just the client's exit code) and then the process exits.
 #   7. /interrupt sends a real session.interrupt RPC and never reaches the
 #      model as a submitted message.
+#   8. Status/report/inbox protocol (the fix for the live-verification
+#      finding that a hermes-vps crewmate had no way back to this machine's
+#      filesystem at all, not even to report its own blocked status): a
+#      FIRSTMATE-STATUS line in a completed turn's real text lands in the
+#      real local status file; a malformed one is rejected and replaced with
+#      a bridge-authored diagnostic instead of being written verbatim; a
+#      FIRSTMATE-REPORT block lands in the real local report file; a
+#      pre-existing steering inbox record is delivered and acknowledged
+#      (moved to handled/) without the remote agent touching either path;
+#      and the doorbell line typed into every pane for a steering message is
+#      recognized and swallowed locally rather than forwarded as chat text
+#      the remote agent could never act on. The stub server's STUB_ECHO:
+#      prefix (tests/fixtures/fm-hermes-ws-stub-server.py) is what lets these
+#      tests control message.complete's own final text over the real socket.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -420,6 +434,268 @@ test_bridge_closes_session_on_sighup() {
   pass "SIGHUP: the bridge runs the same clean-shutdown path as SIGTERM, sending a real session.close RPC before exiting"
 }
 
+# --- 8. status/report/inbox protocol -----------------------------------------
+
+# Launches the bridge with the three protocol flags armed, over fifos named
+# from <tag>, and waits for its readiness banner. Sets BRIDGE_PID.
+# These tests assert on the real local FILES the bridge writes, not on its
+# rendered pane output, so a background drain continuously empties fd 4
+# (DRAIN_PID) once readiness is confirmed - the OS pipe buffer is small
+# enough that a bridge rendering its usual echo/delta/turn-complete output
+# with nobody reading fd 4 would otherwise block INSIDE the bridge process
+# on a full pipe, silently wedging it (no stderr, no crash) before it ever
+# reaches the RPC that would satisfy the file-content assertion below.
+DRAIN_PID=""
+stop_drain() {
+  if [ -n "$DRAIN_PID" ] && kill -0 "$DRAIN_PID" 2>/dev/null; then
+    kill "$DRAIN_PID" >/dev/null 2>&1 || true
+    wait "$DRAIN_PID" 2>/dev/null || true
+  fi
+  DRAIN_PID=""
+}
+start_bridge_with_protocol() {  # <port> <tag> <status-file> <report-file> <inbox-dir>
+  local port=$1 tag=$2 status_file=$3 report_file=$4 inbox_dir=$5 line
+  local in_fifo="$TMP_ROOT/$tag.in" out_fifo="$TMP_ROOT/$tag.out"
+  rm -f "$in_fifo" "$out_fifo"
+  mkfifo "$in_fifo" "$out_fifo"
+  exec 3<>"$in_fifo"
+  exec 4<>"$out_fifo"
+  env -i PATH="$PATH" \
+    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
+    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
+    python3 "$BRIDGE" --cwd /tmp/some-worktree \
+      --status-file "$status_file" --report-file "$report_file" --inbox-dir "$inbox_dir" \
+      <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/$tag.err" &
+  BRIDGE_PID=$!
+  line=$(read_line_timeout 4 10)
+  case "$line" in
+    'Hermes VPS bridge ready.'*) ;;
+    *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/$tag.err" 2>/dev/null))" ;;
+  esac
+  cat <&4 > "$TMP_ROOT/$tag.rendered.log" 2>/dev/null &
+  DRAIN_PID=$!
+}
+
+# wait_for_file_content <path> <needle> <seconds> -> fails the test if <path>
+# never contains <needle> within the deadline. Polling, not a fixed sleep,
+# because delivery timing (inbox poll, a full round trip to the stub and
+# back) is not deterministic to the millisecond.
+wait_for_file_content() {
+  local path=$1 needle=$2 secs=$3 tries
+  tries=$((secs * 10))
+  while [ "$tries" -gt 0 ]; do
+    if [ -f "$path" ] && grep -qF "$needle" "$path" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+    tries=$((tries - 1))
+  done
+  return 1
+}
+
+test_bridge_status_line_over_real_socket() {
+  local port rpc_log status_file report_file inbox_dir
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-status.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  status_file="$TMP_ROOT/status-8a.status"
+  report_file="$TMP_ROOT/status-8a-report.md"
+  inbox_dir="$TMP_ROOT/status-8a.inbox"
+  rm -f "$status_file"
+
+  start_bridge_with_protocol "$port" bridge-status "$status_file" "$report_file" "$inbox_dir"
+
+  # A real completed turn whose text carries a valid FIRSTMATE-STATUS line -
+  # the stub echoes it back verbatim as message.complete's own text, exactly
+  # like a real remote agent's reply would.
+  printf 'STUB_ECHO:FIRSTMATE-STATUS: working: setup complete\n' >&3
+  wait_for_file_content "$status_file" 'working: setup complete' 10 \
+    || fail "expected the real local status file to receive 'working: setup complete', got: $(cat "$status_file" 2>/dev/null)"
+  grep -q '^FIRSTMATE-STATUS:' "$status_file" 2>/dev/null \
+    && fail "the sentinel prefix must never reach the real status file, only the state:note it wraps"
+
+  printf '/exit\n' >&3
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  BRIDGE_PID=""
+  stop_drain
+  exec 3>&- 4>&-
+  stop_stub
+  pass "status protocol: a valid FIRSTMATE-STATUS line in a completed turn's real text lands in the real local status file, sentinel stripped"
+}
+
+test_bridge_recovers_status_line_split_by_tool_call() {
+  # Regression for the live-verification finding (data/hv-protocol-verify/
+  # report.md): a turn that emits text, then a tool call, then more text
+  # fires exactly ONE message.start/message.complete pair for the WHOLE
+  # turn on the real server, and message.complete's own "text" field holds
+  # ONLY the last segment - an opening FIRSTMATE-STATUS line before the
+  # agent reaches for a tool would be silently dropped if the bridge
+  # trusted that field alone. The bridge must instead use the turn's full
+  # accumulated delta text, which carries both segments.
+  local port rpc_log status_file report_file inbox_dir
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-split.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  status_file="$TMP_ROOT/status-8e.status"
+  report_file="$TMP_ROOT/status-8e-report.md"
+  inbox_dir="$TMP_ROOT/status-8e.inbox"
+  rm -f "$status_file"
+
+  start_bridge_with_protocol "$port" bridge-split "$status_file" "$report_file" "$inbox_dir"
+
+  printf 'STUB_SPLIT_ECHO:FIRSTMATE-STATUS: working: before the tool call|||FIRSTMATE-STATUS: done: after the tool call\n' >&3
+  wait_for_file_content "$status_file" 'done: after the tool call' 10 \
+    || fail "expected the second (message.complete-carried) segment to land, got: $(cat "$status_file" 2>/dev/null)"
+  wait_for_file_content "$status_file" 'working: before the tool call' 2 \
+    || fail "expected the FIRST segment (message.delta-only, absent from message.complete's own text) to also land - got: $(cat "$status_file" 2>/dev/null)"
+
+  printf '/exit\n' >&3
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  BRIDGE_PID=""
+  stop_drain
+  exec 3>&- 4>&-
+  stop_stub
+  pass "status protocol: a FIRSTMATE-STATUS line in an EARLIER text segment, before a tool call, still lands even though message.complete's own text field drops it"
+}
+
+test_bridge_rejects_malformed_status_line() {
+  local port rpc_log status_file report_file inbox_dir
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-malformed.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  status_file="$TMP_ROOT/status-8b.status"
+  report_file="$TMP_ROOT/status-8b-report.md"
+  inbox_dir="$TMP_ROOT/status-8b.inbox"
+  rm -f "$status_file"
+
+  start_bridge_with_protocol "$port" bridge-malformed "$status_file" "$report_file" "$inbox_dir"
+
+  # "not-a-real-state" is not in the state vocabulary: the remote agent must
+  # never be able to make the bridge write arbitrary text to the status file
+  # merely by emitting a line that LOOKS like the sentinel shape.
+  printf 'STUB_ECHO:FIRSTMATE-STATUS: not-a-real-state: oops\n' >&3
+  wait_for_file_content "$status_file" 'malformed status line' 10 \
+    || fail "expected a bridge-authored malformed-status diagnostic, got: $(cat "$status_file" 2>/dev/null)"
+  grep -qE '^not-a-real-state:' "$status_file" 2>/dev/null \
+    && fail "the invalid state line must never be written verbatim as though it were a real status update"
+  grep -q '^blocked:' "$status_file" 2>/dev/null \
+    || fail "the malformed-status diagnostic must itself be a valid blocked: line so firstmate is woken, got: $(cat "$status_file" 2>/dev/null)"
+
+  printf '/exit\n' >&3
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  BRIDGE_PID=""
+  stop_drain
+  exec 3>&- 4>&-
+  stop_stub
+  pass "status protocol: a malformed FIRSTMATE-STATUS line is rejected and replaced with a bridge-authored blocked: diagnostic, never written verbatim"
+}
+
+test_bridge_report_and_inbox_over_real_socket() {
+  local port rpc_log status_file report_file inbox_dir handled_dir
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-report.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  status_file="$TMP_ROOT/status-8c.status"
+  report_file="$TMP_ROOT/status-8c-report.md"
+  inbox_dir="$TMP_ROOT/status-8c.inbox"
+  handled_dir="$inbox_dir/handled"
+  rm -rf "$status_file" "$report_file" "$inbox_dir"
+  mkdir -p "$handled_dir"
+
+  # A steering inbox record in bin/fm-task-inbox-lib.sh's own format: header
+  # lines, a bare "--" separator, then the body verbatim - the remote agent
+  # cannot read this path itself, so the bridge must poll, deliver, and
+  # acknowledge it unassisted. The body carries a STUB_ECHO: turn that
+  # itself contains a multi-line FIRSTMATE-REPORT block plus a status line,
+  # proving embedded newlines in one forwarded record survive intact (the
+  # thing a line-oriented typed-pane input could never carry in one message).
+  printf 'schema=fm-task-inbox.v1\nat=2026-01-01T00:00:00Z\n--\nSTUB_ECHO:FIRSTMATE-REPORT-BEGIN\nfindings: it works\nline two\nFIRSTMATE-REPORT-END\nFIRSTMATE-STATUS: done: wrote the report' \
+    > "$inbox_dir/001.msg"
+
+  start_bridge_with_protocol "$port" bridge-report "$status_file" "$report_file" "$inbox_dir"
+
+  wait_for_file_content "$report_file" 'findings: it works' 10 \
+    || fail "expected the real local report file to receive the FIRSTMATE-REPORT block's content, got: $(cat "$report_file" 2>/dev/null)"
+  grep -qF 'line two' "$report_file" 2>/dev/null \
+    || fail "expected the report's second line to survive, got: $(cat "$report_file" 2>/dev/null)"
+  grep -qE '^(FIRSTMATE-REPORT-(BEGIN|END)|STUB_ECHO:)' "$report_file" 2>/dev/null \
+    && fail "the report markers/echo prefix must never leak into the real report file"
+
+  wait_for_file_content "$status_file" 'done: wrote the report' 10 \
+    || fail "expected the real local status file to receive 'done: wrote the report', got: $(cat "$status_file" 2>/dev/null)"
+
+  local tries=100
+  while [ ! -f "$handled_dir/001.msg" ] && [ "$tries" -gt 0 ]; do sleep 0.1; tries=$((tries - 1)); done
+  [ -f "$handled_dir/001.msg" ] \
+    || fail "expected the delivered inbox record to be moved to handled/ as its acknowledgement"
+  [ -f "$inbox_dir/001.msg" ] \
+    && fail "the delivered inbox record must be moved out of the inbox root, not merely copied"
+  if ! grep -q '"method": "prompt.submit"' "$rpc_log" 2>/dev/null; then
+    fail "the bridge never sent a real prompt.submit RPC to deliver the inbox record's body"
+  fi
+
+  printf '/exit\n' >&3
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  BRIDGE_PID=""
+  stop_drain
+  exec 3>&- 4>&-
+  stop_stub
+  pass "report + inbox protocol: the bridge polls, delivers, and acknowledges a steering record unassisted, and a FIRSTMATE-REPORT block lands in the real local report file"
+}
+
+test_bridge_suppresses_inbox_doorbell_line() {
+  local port rpc_log status_file report_file inbox_dir
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-doorbell.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  status_file="$TMP_ROOT/status-8d.status"
+  report_file="$TMP_ROOT/status-8d-report.md"
+  inbox_dir="$TMP_ROOT/status-8d.inbox"
+  rm -f "$status_file"
+
+  start_bridge_with_protocol "$port" bridge-doorbell "$status_file" "$report_file" "$inbox_dir"
+
+  # The exact self-describing doorbell shape fm_task_inbox_doorbell_line()
+  # (bin/fm-task-inbox-lib.sh) types into every pane for a steering message -
+  # it names a LOCAL path the remote agent can never reach, so the bridge
+  # must swallow it locally rather than forward it as chat text.
+  printf ": Firstmate instruction waiting: list '/Users/someone/firstmate/state/x.inbox'/*.msg and, in numeric order, read and act on each, then mv each handled file to '/Users/someone/firstmate/state/x.inbox'/handled/.\n" >&3
+
+  # Prove the bridge is still alive and responsive with an ordinary line
+  # afterward, and that ONLY that ordinary line reached the model.
+  printf 'STUB_ECHO:FIRSTMATE-STATUS: working: still alive\n' >&3
+  wait_for_file_content "$status_file" 'working: still alive' 10 \
+    || fail "expected the bridge to remain responsive after the doorbell line, got: $(cat "$status_file" 2>/dev/null)"
+
+  local submit_count
+  submit_count=$(grep -c '"method": "prompt.submit"' "$rpc_log" 2>/dev/null || true)
+  [ "$submit_count" = 1 ] \
+    || fail "expected exactly one prompt.submit RPC (the ordinary line only, never the doorbell), got: $submit_count"
+
+  printf '/exit\n' >&3
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  BRIDGE_PID=""
+  stop_drain
+  exec 3>&- 4>&-
+  stop_stub
+  pass "the inbox doorbell line is recognized and swallowed locally, never forwarded as chat text the remote agent cannot act on"
+}
+
 test_bridge_identity_functions
 test_agent_process_classify_recognizes_bridge
 test_busy_hermes_vps_agent_running_parses_status
@@ -428,4 +704,14 @@ stop_bridge
 test_bridge_missing_brief_never_reports_false_delivery
 stop_bridge
 test_bridge_closes_session_on_sighup
+stop_bridge
+test_bridge_status_line_over_real_socket
+stop_bridge
+test_bridge_recovers_status_line_split_by_tool_call
+stop_bridge
+test_bridge_rejects_malformed_status_line
+stop_bridge
+test_bridge_report_and_inbox_over_real_socket
+stop_bridge
+test_bridge_suppresses_inbox_doorbell_line
 stop_bridge

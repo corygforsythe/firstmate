@@ -7,6 +7,10 @@
 # not by anything rendered here.
 #
 # Usage: fm-hermes-vps-bridge.py --cwd <path>
+#          [--status-file <path>] [--report-file <path>] [--inbox-dir <path>]
+#   The three optional flags arm the local status/report/inbox protocol
+#   below; omitting one only disables that one piece (existing callers and
+#   tests that predate this protocol still work with --cwd alone).
 #
 # Design (harness=hermes-vps, distinct from harness=hermes's pane-based
 # `hermes --cli` adapter):
@@ -30,14 +34,15 @@
 #     below), because every other harness's "Read the brief at <path> and
 #     follow it exactly." pointer assumes the AGENT can open that path
 #     itself, which a remote VPS session cannot.
-#   - THE KEY LIMITATION, not solved here: session.create's cwd param is
-#     NOT honored on the captain's real VPS deployment (live-verified,
-#     docs/verification/hermes.md), so the VPS agent's own file/terminal
-#     tools reach only the VPS's OWN filesystem, never this task's local
-#     git worktree. A hermes-vps crewmate can converse and use tools in the
-#     VPS's own sandbox but cannot read or edit this project's code; do not
-#     dispatch a ship/scout task onto it that needs local repo access -
-#     see .agents/skills/harness-adapters/references/harness/hermes-vps.md.
+#   - THE KEY LIMITATION, addressed here for the status/report/inbox surface
+#     only: session.create's cwd param is NOT honored on the captain's real
+#     VPS deployment (live-verified, docs/verification/hermes.md), so the
+#     VPS agent's own file/terminal tools reach only the VPS's OWN
+#     filesystem, never this task's local git worktree. A hermes-vps
+#     crewmate can converse and use tools in the VPS's own sandbox but
+#     cannot read or edit this project's code; do not dispatch a ship/scout
+#     task onto it that needs local repo access - see
+#     .agents/skills/harness-adapters/references/harness/hermes-vps.md.
 #
 # Brief delivery: fm-spawn.sh's launch-then-send shape for hermes-vps types
 # the SAME pointer sentence every launch-then-send harness receives -
@@ -50,6 +55,62 @@
 # readable, it reads the file itself and forwards the file's own CONTENT to
 # the VPS session instead of the sentence about it. Every later line (an
 # ordinary steer) is forwarded verbatim, unexamined.
+#
+# Status/report/inbox protocol (live-verification finding,
+# data/hermes-vps-live-verify/report.md): the remote agent has NO path back
+# to this Mac's filesystem at all, so it cannot append its own
+# state/<id>.status, cannot write data/<id>/report.md, and cannot read or
+# acknowledge state/<id>.inbox/*.msg the way every other harness's crewmate
+# does directly with shell commands. Before this fix that made the failure
+# mode silent: a crewmate that hit this wall had no way to even append a
+# `blocked:` line about it. This bridge - which DOES run locally - now owns
+# all three as a transport concern instead of a filesystem one, using
+# --status-file/--report-file/--inbox-dir (all optional; omitting one only
+# disables that one piece, for callers or tests that predate this protocol):
+#   - Status: bin/fm-brief.sh's hermes-vps scaffold tells the remote agent to
+#     emit a line of the exact shape `FIRSTMATE-STATUS: <state>[ [key=..]]: <note>`
+#     in its own chat output, mirroring the literal `echo "{state}: ..." >>`
+#     convention every other harness's brief already uses (fm-classify-lib.sh
+#     owns the state vocabulary). This bridge scans each completed turn's
+#     full accumulated text - every message.delta chunk concatenated across
+#     the turn, never message.complete's own "text" field alone, which
+#     live-verification proved holds only the LAST text segment when a turn
+#     interleaves text with a tool call (handle_event's own comment on the
+#     message.complete branch has the evidence) - for
+#     that sentinel, validates the state word itself, and appends the
+#     validated line to the REAL local status file. A line that carries the
+#     sentinel but fails validation is never forwarded verbatim: the remote
+#     agent cannot make this bridge write arbitrary bytes to the status file
+#     merely by emitting them in chat, because only text matching the exact
+#     state vocabulary is ever accepted (write_status_line's docstring).
+#   - Report: the remote agent wraps its findings between two bare marker
+#     lines, FIRSTMATE-REPORT-BEGIN and FIRSTMATE-REPORT-END, in one
+#     completed turn. This bridge extracts exactly the text between them and
+#     writes it to the real local report file, replacing prior content.
+#   - Inbox: every loop iteration (so at least every EVENT_WAIT_TIMEOUT
+#     seconds even when nothing else wakes the select() below), this bridge
+#     itself lists --inbox-dir for *.msg records (fm-task-inbox-lib.sh's own
+#     format: header lines, a bare "--" separator, then the message body),
+#     forwards each body through the same _forward() path pane-typed input
+#     uses, and moves the record to inbox-dir/handled/ ONLY after a
+#     confirmed successful forward - exactly the local read-act-acknowledge
+#     loop every other harness's crewmate performs on itself, performed here
+#     on the remote agent's behalf because it cannot reach those paths. The
+#     doorbell line fm_task_inbox_doorbell_line() types into every pane
+#     (starting ": Firstmate instruction waiting:") asks the reader to list
+#     and read a LOCAL path the remote agent can never reach; forwarding it
+#     as chat would only confuse the model with an instruction it cannot
+#     carry out, so this bridge recognizes and swallows that exact line
+#     locally instead - the proactive poll above already delivers the real
+#     content.
+#   - Failure signal: if the protocol itself breaks locally (a malformed
+#     status line, a status/report file write that fails, an unreadable or
+#     unacknowledgeable inbox record), that is never silent and never
+#     something the remote agent's own text can forge: write_status_line()
+#     is the one function that ever appends to the real status file, and
+#     every failure path calls it with a bridge-authored (not
+#     remote-authored) diagnostic line, falling back to a plain pane-visible
+#     stderr-equivalent print only if that write itself fails.
 #
 # Delivery confirmation mirrors the native hermes adapter's own convention
 # (docs/verification/hermes.md "Delivery gate"): every line this bridge
@@ -71,6 +132,7 @@
 # wire-protocol gap.
 import importlib.util
 import os
+import re
 import select
 import signal
 import sys
@@ -99,34 +161,94 @@ EVENT_WAIT_TIMEOUT = 30.0
 RECONNECT_ATTEMPTS = 5
 RECONNECT_BACKOFF = 2.0
 
+# The doorbell line fm_task_inbox_doorbell_line() (bin/fm-task-inbox-lib.sh)
+# types into every pane for a steering message - that file is the one owner
+# of the exact wording. Only the stable, self-describing prefix is matched
+# here, the same "recognize a known local convention, don't restate it"
+# pattern BRIEF_POINTER_PREFIX/SUFFIX above already use for fm-spawn.sh's
+# launch-then-send pointer sentence.
+DOORBELL_PREFIX = ': Firstmate instruction waiting:'
+
+# Status/report protocol (see the module docstring's "Status/report/inbox
+# protocol" section). fm-classify-lib.sh is the one owner of the state
+# vocabulary; FM_CLASSIFY_PAUSED_VERB is read the same way every shell
+# producer of a status line already does, so a captain override of the
+# paused verb is honored here too.
+STATUS_SENTINEL = 'FIRSTMATE-STATUS: '
+REPORT_BEGIN_MARKER = 'FIRSTMATE-REPORT-BEGIN'
+REPORT_END_MARKER = 'FIRSTMATE-REPORT-END'
+_PAUSED_VERB = os.environ.get('FM_CLASSIFY_PAUSED_VERB') or 'paused'
+VALID_STATUS_STATES = frozenset(
+    {'working', 'needs-decision', 'blocked', _PAUSED_VERB, 'done', 'failed', 'resolved'}
+)
+# "<state>[ [key=<slug>]]: <note>", the same shape every other harness's
+# brief already renders as `echo "{state}: {note}" >> status-file`.
+_STATUS_LINE_RE = re.compile(r'^([A-Za-z][A-Za-z-]*)(\s*\[key=[^\]\s]+\])?:\s*(\S.*)$')
+
+INBOX_POLL_INTERVAL = EVENT_WAIT_TIMEOUT
+
 
 def _parse_args(argv):
     cwd = None
+    status_file = None
+    report_file = None
+    inbox_dir = None
     i = 1
     while i < len(argv):
         if argv[i] == '--cwd' and i + 1 < len(argv):
             cwd = argv[i + 1]
             i += 2
             continue
+        if argv[i] == '--status-file' and i + 1 < len(argv):
+            status_file = argv[i + 1]
+            i += 2
+            continue
+        if argv[i] == '--report-file' and i + 1 < len(argv):
+            report_file = argv[i + 1]
+            i += 2
+            continue
+        if argv[i] == '--inbox-dir' and i + 1 < len(argv):
+            inbox_dir = argv[i + 1]
+            i += 2
+            continue
         i += 1
     if not cwd:
         print('fm-hermes-vps-bridge: --cwd is required', file=sys.stderr)
         sys.exit(2)
-    return cwd
+    return cwd, status_file, report_file, inbox_dir
 
 
 def _echo(line):
     print(f'{BULLET} {line}', flush=True)
 
 
+def _inbox_record_body(raw):
+    """Body of one fm-task-inbox-lib.sh record: header lines, a bare "--"
+    separator line, then the message text verbatim. Returns None when no
+    separator is present (a malformed or foreign file), matching
+    fm_task_inbox_body's own contract without sourcing shell from Python."""
+    lines = raw.split('\n')
+    for idx, ln in enumerate(lines):
+        if ln == '--':
+            return '\n'.join(lines[idx + 1:])
+    return None
+
+
 class Bridge:
-    def __init__(self, cwd):
+    def __init__(self, cwd, status_file=None, report_file=None, inbox_dir=None):
         self.cwd = cwd
+        self.status_file = status_file
+        self.report_file = report_file
+        self.inbox_dir = inbox_dir
         self.session = HermesWsSession()
         self.session_id = None
         self.busy = False
         self.brief_delivered = False
         self._shutdown = False
+        self._stdin_fd = sys.stdin.fileno()
+        self._stdin_buf = b''
+        self._turn_text_buf = ''
+        self._last_inbox_poll = 0.0
 
     def start(self):
         created = self.session.rpc('session.create', {'cwd': self.cwd})
@@ -138,22 +260,169 @@ class Bridge:
     def _forward(self, text):
         """Submit or steer <text> depending on the last-observed turn state.
         A real RPC failure is printed into the pane rather than swallowed -
-        a captain steering a wedged session needs to see that, not silence."""
+        a captain steering a wedged session needs to see that, not silence.
+        Returns True once the RPC is confirmed sent, False otherwise, so a
+        caller with its own delivery-then-acknowledge contract (the inbox
+        poll below) never acknowledges a delivery that never happened."""
         try:
             method = 'session.steer' if self.busy else 'prompt.submit'
             self.session.rpc(method, {'session_id': self.session_id, 'text': text})
+            return True
         except HermesWsError as exc:
             # One reconnect-and-retry: the connection may have dropped (see
             # reconnect()'s docstring) between the last event and this input.
             if not self.reconnect():
                 print(f'[fm-hermes-vps-bridge] delivery failed: {exc}', flush=True)
-                return
+                return False
             try:
                 self.session.rpc(method, {'session_id': self.session_id, 'text': text})
+                return True
             except HermesWsError as exc2:
                 print(f'[fm-hermes-vps-bridge] delivery failed: {exc2}', flush=True)
+                return False
+
+    def write_status_line(self, line):
+        """The ONE function that ever appends to the real local status file.
+        Used both for a remote status line already validated by
+        _apply_remote_status_line, and for every bridge-authored diagnostic
+        below - so a protocol failure always has a path to become
+        Firstmate-visible through the same channel a healthy status update
+        would use. Best-effort: a write failure here falls back to a plain
+        pane-visible print rather than raising, because there is nothing
+        further local to retry against and the pane itself remains a valid,
+        Firstmate-readable failure signal."""
+        if not self.status_file:
+            return
+        try:
+            with open(self.status_file, 'a', encoding='utf-8') as fh:
+                fh.write(line.rstrip('\n') + '\n')
+        except OSError as exc:
+            print(f'[fm-hermes-vps-bridge] status write failed ({line.strip()!r}): {exc}', flush=True)
+
+    def _apply_remote_status_line(self, candidate):
+        """<candidate> is the text after STATUS_SENTINEL in one completed
+        turn's final text. Never appended verbatim: only a line whose state
+        word is in VALID_STATUS_STATES is accepted, so the remote agent can
+        never make this bridge write arbitrary bytes to the status file by
+        emitting them in chat - it can only ever select from the same
+        vocabulary every other harness's brief already uses."""
+        match = _STATUS_LINE_RE.match(candidate)
+        state = match.group(1) if match else None
+        if not match or state not in VALID_STATUS_STATES:
+            self.write_status_line(
+                'blocked: hermes-vps bridge rejected a malformed status line from the remote '
+                f'session (state must be one of {", ".join(sorted(VALID_STATUS_STATES))}): '
+                f'{candidate.strip()[:200]!r}'
+            )
+            return
+        self.write_status_line(candidate)
+
+    def _write_report(self, content):
+        if not self.report_file:
+            return
+        if not content.strip():
+            self.write_status_line(
+                'blocked: hermes-vps bridge received an empty FIRSTMATE-REPORT block from the '
+                'remote session; report not written'
+            )
+            return
+        try:
+            report_dir = os.path.dirname(self.report_file)
+            if report_dir:
+                os.makedirs(report_dir, exist_ok=True)
+            with open(self.report_file, 'w', encoding='utf-8') as fh:
+                fh.write(content if content.endswith('\n') else content + '\n')
+        except OSError as exc:
+            print(f'[fm-hermes-vps-bridge] report write failed: {exc}', flush=True)
+            self.write_status_line(f'blocked: hermes-vps bridge could not write the report locally: {exc}')
+
+    def _process_turn_text(self, text):
+        """Called with one turn's FULL accumulated text (every message.delta
+        chunk concatenated since the last message.start, never a bare
+        partial delta and never message.complete's own possibly-truncated
+        "text" field alone - see handle_event's message.complete comment).
+        A marker split across streamed chunks is never misread because this
+        only ever sees the assembled whole. Extracts at most one
+        FIRSTMATE-REPORT block and every FIRSTMATE-STATUS line; the
+        rendered pane output is untouched, these markers are also visible
+        there like any other turn text."""
+        lines = text.splitlines()
+        begin_idx = end_idx = None
+        for idx, raw in enumerate(lines):
+            stripped = raw.strip()
+            if begin_idx is None and stripped == REPORT_BEGIN_MARKER:
+                begin_idx = idx
+            elif begin_idx is not None and end_idx is None and stripped == REPORT_END_MARKER:
+                end_idx = idx
+                break
+        if begin_idx is not None and end_idx is not None:
+            self._write_report('\n'.join(lines[begin_idx + 1:end_idx]))
+        for raw in lines:
+            stripped = raw.strip()
+            if stripped.startswith(STATUS_SENTINEL):
+                self._apply_remote_status_line(stripped[len(STATUS_SENTINEL):])
+
+    def _inbox_handled_dir(self):
+        return os.path.join(self.inbox_dir, 'handled')
+
+    def poll_inbox(self):
+        """Read-act-acknowledge the steering inbox on the remote agent's
+        behalf, since it cannot reach --inbox-dir itself (module docstring's
+        "Status/report/inbox protocol"). A record is moved to handled/ ONLY
+        after _forward() confirms delivery, so a dropped connection leaves it
+        in place for the next poll instead of silently losing the steer -
+        the same durable retry the inbox contract already gives every other
+        harness (fm-task-inbox-lib.sh)."""
+        if not self.inbox_dir:
+            return
+        try:
+            names = os.listdir(self.inbox_dir)
+        except OSError:
+            return
+        records = []
+        for name in names:
+            if not name.endswith('.msg'):
+                continue
+            stem = name[:-4]
+            if not stem.isdigit():
+                continue
+            records.append((int(stem), name))
+        for _, name in sorted(records):
+            path = os.path.join(self.inbox_dir, name)
+            try:
+                with open(path, 'r', encoding='utf-8') as fh:
+                    raw = fh.read()
+            except OSError as exc:
+                self.write_status_line(
+                    f'blocked: hermes-vps bridge could not read steering inbox record {name}: {exc}'
+                )
+                continue
+            body = _inbox_record_body(raw)
+            if body is None:
+                self.write_status_line(
+                    f'blocked: hermes-vps bridge found a malformed steering inbox record {name} '
+                    '(no "--" body separator)'
+                )
+                continue
+            if not self._forward(body):
+                continue  # left in place; retried on the next poll
+            handled_dir = self._inbox_handled_dir()
+            try:
+                os.makedirs(handled_dir, exist_ok=True)
+                os.rename(path, os.path.join(handled_dir, name))
+            except OSError as exc:
+                self.write_status_line(
+                    f'blocked: hermes-vps bridge delivered steering message {name} but could not '
+                    f'acknowledge it (move to handled/ failed): {exc}'
+                )
 
     def handle_input_line(self, line):
+        if line.startswith(DOORBELL_PREFIX):
+            # This tells the reader to list and read a LOCAL path the remote
+            # agent can never reach; poll_inbox() above already delivers the
+            # real content proactively, so forwarding this would only hand
+            # the model an instruction it cannot carry out.
+            return
         if (not self.brief_delivered and line.startswith(BRIEF_POINTER_PREFIX)
                 and line.endswith(BRIEF_POINTER_SUFFIX)):
             path = line[len(BRIEF_POINTER_PREFIX):-len(BRIEF_POINTER_SUFFIX)]
@@ -202,15 +471,34 @@ class Bridge:
         data = payload.get('payload') or {}
         if etype == 'message.start':
             self.busy = True
+            self._turn_text_buf = ''
         elif etype == 'message.delta':
             text = data.get('text', '')
             if text:
                 sys.stdout.write(text)
                 sys.stdout.flush()
+                self._turn_text_buf += text
         elif etype == 'message.complete':
             self.busy = False
             status = data.get('status', 'complete')
             print(f'\n[turn {status}]', flush=True)
+            # message.complete's own "text" field is NOT reliably the turn's
+            # full cumulative text: live-verified against the real VPS
+            # (data/hv-protocol-verify/report.md), a turn that emits text,
+            # then a tool call, then more text fires exactly ONE
+            # message.start/message.complete pair for the whole turn, and
+            # that field holds only the LAST text segment - the FIRST
+            # segment (e.g. an opening FIRSTMATE-STATUS line before the
+            # agent reaches for a tool) is silently absent from it, even
+            # though it streamed correctly through message.delta above and
+            # rendered in the pane. The accumulated delta buffer is the
+            # complete, authoritative record of everything this turn
+            # actually said; message.complete's own field is used only as a
+            # fallback for the degenerate case of a complete with no
+            # preceding deltas at all.
+            text = self._turn_text_buf or (data.get('text') or '')
+            if text:
+                self._process_turn_text(text)
         elif etype == 'tool.start':
             name = data.get('name', '?')
             context = data.get('context', '')
@@ -265,9 +553,13 @@ class Bridge:
 
     def run(self):
         while not self._shutdown:
+            now = time.monotonic()
+            if self.inbox_dir and now - self._last_inbox_poll >= INBOX_POLL_INTERVAL:
+                self._last_inbox_poll = now
+                self.poll_inbox()
             raw_sock = self.session._sock._sock  # same-process bridge; not crossing a public API boundary
             try:
-                readable, _, _ = select.select([sys.stdin, raw_sock], [], [], EVENT_WAIT_TIMEOUT)
+                readable, _, _ = select.select([self._stdin_fd, raw_sock], [], [], EVENT_WAIT_TIMEOUT)
             except (OSError, ValueError):
                 if self.reconnect():
                     continue
@@ -307,17 +599,33 @@ class Bridge:
                     except HermesWsError:
                         break
                     self.handle_event(envelope)
-            if sys.stdin in readable:
-                line = sys.stdin.readline()
-                if line == '':
+            if self._stdin_fd in readable:
+                # Raw os.read(), not sys.stdin.readline(): a buffered
+                # TextIOWrapper can pull MULTIPLE newline-terminated lines
+                # into its own internal buffer from a single underlying
+                # read() whenever more than one line is already queued on
+                # the pipe (exactly what a steering doorbell immediately
+                # followed by real content produces) - readline() would then
+                # return the first line while stranding the second INSIDE
+                # that buffer, invisible to select(), which only observes
+                # the OS-level fd. select() would report "not readable" on
+                # the next iteration even though a second line is sitting
+                # ready, and the bridge would wedge for up to
+                # EVENT_WAIT_TIMEOUT seconds. Reading raw bytes ourselves and
+                # splitting on '\n' keeps everything select() can see.
+                chunk = os.read(self._stdin_fd, 65536)
+                if chunk == b'':
                     self.shutdown()
                     break
-                self.handle_input_line(line.rstrip('\n'))
+                self._stdin_buf += chunk
+                while b'\n' in self._stdin_buf:
+                    raw_line, self._stdin_buf = self._stdin_buf.split(b'\n', 1)
+                    self.handle_input_line(raw_line.decode('utf-8', errors='replace').rstrip('\r'))
 
 
 def main(argv):
-    cwd = _parse_args(argv)
-    bridge = Bridge(cwd)
+    cwd, status_file, report_file, inbox_dir = _parse_args(argv)
+    bridge = Bridge(cwd, status_file=status_file, report_file=report_file, inbox_dir=inbox_dir)
 
     def _on_term(_signum, _frame):
         bridge.shutdown()

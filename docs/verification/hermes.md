@@ -415,4 +415,56 @@ Confirmed live, inside this task's required isolated Herdr lab session (`bin/fm-
 **`session.create`'s `cwd` param is still not honored** on this VPS (same finding as above, re-confirmed here): the VPS agent's own tools reach only the VPS's own filesystem.
 Live-verified concretely during this task's own dispatch gate test: given a brief referencing macOS paths under `/private/tmp/...` and `/Users/coryforsythe/...`, the VPS agent (a real Linux host, `6.8.0-139-generic`, home `/home/coryforsythe`) correctly reported those paths do not exist there and that `/` is not writable, and wrote its own report to the only location it could reach.
 **A `hermes-vps` crewmate cannot read or edit a task's local git worktree, run `git`, or drive the no-mistakes pipeline** - it is proven useful for VPS-local work and for this fleet-visibility wiring itself, not yet as a substitute for a real local crewmate on project work.
+Before the fix below, that same unreachability extended to the crewmate's OWN status/report/steering paths, which is a materially worse gap: a broken dispatch produced no signal in Firstmate at all, not even a `blocked:` line - see the next section.
+
+## hermes-vps: local status/report/steering protocol, live-verified end to end
+
+Verified 2026-09-14, same real VPS as above, following a live-verification finding (`data/hermes-vps-live-verify/report.md`) that a `hermes-vps` crewmate had no path back to this Mac's filesystem at all: it could not append `state/<id>.status`, write `data/<id>/report.md`, or read `state/<id>.inbox/`, and could not even report `blocked:` about hitting exactly that wall.
+A second, earlier crewmate had hit the identical wall roughly 11 hours prior (a leftover `~/hvcheck-report.md` on the VPS) and it went unfixed and unescalated - the failure mode silenced its own alarm.
+
+### Design: a transport concern, not a filesystem one
+
+The bridge (`bin/fm-hermes-vps-bridge.py`) runs locally and always has real access to this machine's filesystem, so it now owns all three pieces on the remote agent's behalf instead of asking the remote agent to perform filesystem operations it structurally cannot:
+
+- **Status**: the remote agent emits a line of the exact shape `FIRSTMATE-STATUS: <state>[ [key=..]]: <note>` in the plain text of its own chat reply - the same state vocabulary (`fm-classify-lib.sh`) every other harness's brief already uses via a literal `echo ... >>`. The bridge scans each completed turn's text for that sentinel, validates the state word itself against the fixed vocabulary, and appends only the validated `<state>: <note>` line to the real local status file. A line that carries the sentinel but fails validation is never written verbatim: the remote agent cannot make the bridge write arbitrary text merely by emitting it in chat.
+- **Report**: the remote agent wraps its findings between two bare marker lines, `FIRSTMATE-REPORT-BEGIN` and `FIRSTMATE-REPORT-END`, in one reply. The bridge writes exactly the text between them to the real local report file.
+- **Steering inbox**: the bridge itself polls `state/<id>.inbox/*.msg` (`fm-task-inbox-lib.sh`'s own record format) once per loop iteration, delivers each body through the same `_forward()` path pane-typed input uses, and moves the record to `handled/` only after a confirmed delivery - the same local read-act-acknowledge loop every other harness's crewmate performs on itself, performed here on the remote agent's behalf. The doorbell line every other harness's pane receives for a steering message (`fm_task_inbox_doorbell_line`, `": Firstmate instruction waiting: ..."`) names a local path the remote agent can never reach, so the bridge recognizes and swallows that exact line locally instead of forwarding an instruction the model cannot act on.
+- **Failure signal**: every protocol failure path (a malformed status line, a local write that fails, an unreadable inbox record) calls the bridge's own `write_status_line()` with a bridge-authored diagnostic - never text the remote agent supplied - falling back to a plain pane-visible print only if that write itself fails. `bin/fm-brief.sh --harness hermes-vps` scaffolds the worker-side half of this contract (status/inbox/report sections and, for scout, the report-completion instructions), and routes the captain-hold-lifecycle completion gate to firstmate itself rather than the worker, since the worker cannot read that skill file or run `bin/fm-captain-hold.sh` either.
+
+### Two real bugs, found only by driving real turns through the real VPS
+
+Neither is reachable from a stub that never streams genuinely fragmented, multi-segment turns:
+
+1. **`select()`/buffered `readline()` mismatch on stdin.** A single underlying `read()` inside Python's `TextIOWrapper` can pull MULTIPLE newline-terminated lines from the pipe into its own internal buffer whenever more than one line is already queued (exactly what a steering doorbell immediately followed by real content produces, or two rapid steers). `readline()` then returns the first line while stranding the second INSIDE that buffer, invisible to `select()`, which only observes the OS-level fd - the bridge would wedge for up to `EVENT_WAIT_TIMEOUT` (30s) waiting on a `select()` that will never again see the already-buffered second line. Fixed by reading stdin with raw `os.read()` and splitting on `\n` ourselves, so nothing is ever buffered anywhere `select()` cannot see. Reproduced by sending two lines back-to-back with nothing read in between; pinned by `tests/fm-hermes-vps-bridge.test.sh`'s `test_bridge_suppresses_inbox_doorbell_line` (which depends on exactly this fix to pass reliably) and the general status/report tests.
+2. **`message.complete`'s own `text` field is not the turn's full cumulative text.** Live-reproduced against the real VPS (`data/hv-protocol-verify/report.md`): a turn that emits text, then a tool call, then more text fires exactly ONE `message.start`/`message.complete` pair for the WHOLE turn, and `message.complete`'s `text` field holds ONLY the last text segment - an opening `FIRSTMATE-STATUS: working: ...` line emitted before the agent reached for a tool was silently absent from it, even though it streamed correctly through `message.delta` and rendered in the pane. Confirmed directly: a scripted turn instructed to say `FIRSTMATE-STATUS: working: test1`, run a shell command, then say `FIRSTMATE-STATUS: done: test1 complete` produced exactly one `message.complete` event whose `text` was `'FIRSTMATE-STATUS: done: test1 complete'` - the `working:` segment never appeared in the completion payload at all, only in its own earlier delta. Fixed by accumulating every `message.delta` chunk into a per-turn buffer (reset on `message.start`) and scanning that accumulated buffer instead of `message.complete`'s own field. Pinned by `tests/fm-hermes-vps-bridge.test.sh`'s `test_bridge_recovers_status_line_split_by_tool_call`, which uses a dedicated `STUB_SPLIT_ECHO:` stub trigger to reproduce the exact split.
+
+### Live fleet-dispatch run (dated evidence)
+
+Driven through the real, unmodified `bin/fm-spawn.sh` against the real production firstmate home and the real VPS (a genuine end-to-end proof, not a scratch home, since the whole point was proving the real fleet's status/report files receive real content):
+
+```
+$ tasks-axi add hv-protocol-verify "Live-verify hermes-vps bridge status/report/inbox protocol" --kind scout --repo firstmate --start
+$ bin/fm-brief.sh hv-protocol-verify firstmate --scout --harness hermes-vps
+$ bin/fm-spawn.sh hv-protocol-verify <project> --scout --harness hermes-vps --backend tmux
+spawned hv-protocol-verify harness=hermes-vps kind=scout window=firstmate:fm-hv-protocol-verify worktree=.../3/firstmate
+```
+
+The brief instructed the crewmate to exercise every protocol element in order: an opening `working:` status, real sandbox identity commands, a deliberate `blocked:` status (proving the exact signal that was silent before this fix), an immediate `working:` recovery, a `FIRSTMATE-REPORT` block, and a closing `done:` status.
+Real local file contents after the run:
+
+```
+$ cat state/hv-protocol-verify.status
+blocked: deliberate test of the blocked: signal path - this is not a real blocker, ignore and continue
+working: resuming after deliberate blocked test
+done: protocol verified from the crewmate side - all status states and the report block emitted from a Linux sandbox with zero reach to the captain's Mac; inbound steering leg untested and 3 open questions raised
+```
+
+The report landed at `data/hv-protocol-verify/report.md` with real sandbox evidence (`hostname` = `ubuntu`, `uname -a` = a Linux 6.8 x86_64 kernel, confirmation that `/Users` does not exist there) and, notably, its own `## Open questions for the captain` section - proof that a crewmate whose report block is read directly by firstmate can still surface a captain call through the report itself, which is exactly the harness-conditional routing `bin/fm-brief.sh` scaffolds for this harness.
+The opening `working: starting verification` line is conspicuously ABSENT from the status file above: the crewmate's first reply included a tool call before its next reply, triggering bug 2 above in the wild on the very first live run after the fix - the fix for bug 2 (delta accumulation) was applied and re-verified by direct dispatch (see bug 2's own entry) after this run had already demonstrated the gap.
+`bin/fm-control.sh hv-protocol-verify exit` cleanly closed the session afterward, same as the "Known limitation" section's run above.
+
+### Known limitation, updated
+
+Status, report, and steering are now solved.
+`session.create`'s `cwd` still is not honored, so a `hermes-vps` crewmate still cannot read or edit a task's local git worktree, run `git`, or drive the no-mistakes pipeline - only VPS-local sandbox work and this fleet-visibility wiring are proven use cases.
 Do not dispatch a ship task onto it that needs local repo access; `hermes-vps.md`'s "Known limitation" owns this for future dispatch decisions.
