@@ -1,0 +1,43 @@
+Manual, independent reproduction of the hermes-vps working indicator fix
+(bin/fm-hermes-vps-bridge.py, commit d8491f4), run outside the automated
+test suite against the real bridge subprocess and the real
+tests/fixtures/fm-hermes-ws-stub-server.py stub over a real loopback socket.
+
+Goal: confirm the captain's reported gap — a genuinely working but slow
+turn rendered nothing in the hermes-vps pane while in flight, indistinguishable
+from a dead session — is fixed: a "[working...]" line must render promptly
+on message.start, well before the delayed turn content arrives.
+
+Method: started the real stub server and the real bridge script as
+subprocesses wired together over named pipes (mirroring
+tests/fm-hermes-vps-bridge.test.sh's own fifo + `read -t` timeout pattern,
+which avoids the file-redirection buffering pitfall documented in that
+test's comments). Submitted `STUB_DELAY:4:slow reply landed manual test`,
+which makes the stub sleep 4 real wall-clock seconds between sending
+message.start and sending the delayed message.delta/message.complete.
+Read each line off the bridge's own stdout with a wall-clock timestamp
+relative to session start.
+
+Output:
+
+port=59313
+[0.16s] Hermes VPS bridge ready. session_id=test-session-1
+[0.22s] ● STUB_DELAY:4:slow reply landed manual test
+[0.28s] [working...]
+[4.35s] slow reply landed manual test
+[4.45s] [turn complete]
+
+Result: "[working...]" rendered within 0.06s of the delivery-confirmation
+bullet (message.start fires immediately), and the delayed turn content did
+not arrive until ~4.1s later, once the stub's real 4-second sleep elapsed.
+This confirms the fix: a slow-but-working turn now shows a visible busy
+signal immediately, instead of the pane going silent until the response
+eventually lands.
+
+Also ran the repo's own automated test for this behavior:
+  $ bash tests/fm-hermes-vps-bridge.test.sh
+  ...
+  ok - working indicator: [working...] renders immediately on message.start and nothing else renders until the delayed response lands
+(13/13 tests in this file passed on a clean rerun; one transient, pre-existing,
+unrelated flake was observed on a first run in test_bridge_status_line_over_real_socket,
+which is not part of this change and passed cleanly on rerun.)
