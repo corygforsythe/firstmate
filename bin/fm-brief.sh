@@ -12,9 +12,27 @@
 # charters still use a single `{TASK}` charter fill. Firstmate may adjust other
 # sections when the task genuinely deviates (e.g. working an existing external
 # PR instead of shipping a new one).
-# Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--herdr-lab]
-#        fm-brief.sh <task-id> <repo-name> --scout [--herdr-lab]
+# Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--herdr-lab] [--harness <name>]
+#        fm-brief.sh <task-id> <repo-name> --scout [--herdr-lab] [--harness <name>]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
+#   --harness <name> is optional and defaults to the ordinary harness-agnostic
+#   scaffold; pass the task's already-resolved harness when it changes what the
+#   worker can literally do. Currently only harness=hermes-vps changes anything:
+#   its remote VPS agent has no path back to this machine's filesystem at all
+#   (.agents/skills/harness-adapters/references/harness/hermes-vps.md "Known
+#   limitation"), so its status/report/steering-inbox sections describe the
+#   bridge-mediated FIRSTMATE-STATUS/FIRSTMATE-REPORT protocol
+#   (bin/fm-hermes-vps-bridge.py's own header owns that contract) instead of
+#   literal local shell commands, and its scout Definition of done routes the
+#   captain-hold-lifecycle completion gate to firstmate instead of the worker,
+#   since the worker cannot read that skill file or run bin/fm-captain-hold.sh
+#   either. Every other harness value is accepted and changes nothing.
+#   When --harness is passed explicitly, the generated brief records a fixed
+#   "Harness contract: harness=<harness>" line (an omitted/default harness needs
+#   no line, since it changes nothing). bin/fm-spawn.sh reads that line back and
+#   refuses to launch a ship or scout task whose own explicit --harness disagrees
+#   on whether hermes-vps applies, so a brief's hermes-vps-specific instructions
+#   and the task's actual dispatch transport cannot drift apart.
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
 #   It offers the Lavish review loop only when `fm-bootstrap.sh lavish-compatible`
@@ -123,6 +141,7 @@ HERDR_LAB=0
 NO_PROJECTS=0
 MODE=
 MODE_SET=0
+HARNESS=
 POS=()
 want_value=
 for a in "$@"; do
@@ -132,6 +151,7 @@ for a in "$@"; do
     esac
     case "$want_value" in
       mode) MODE=$a; MODE_SET=1 ;;
+      harness) HARNESS=$a ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -144,6 +164,8 @@ for a in "$@"; do
     --no-projects) NO_PROJECTS=1 ;;
     --mode) want_value=mode ;;
     --mode=*) MODE=${a#--mode=}; MODE_SET=1 ;;
+    --harness) want_value=harness ;;
+    --harness=*) HARNESS=${a#--harness=} ;;
     # yolo never reaches the worker: it is firstmate's merge authority, not a
     # brief input. Refuse it loudly so it is never silently dropped here and then
     # believed to have been recorded.
@@ -152,6 +174,12 @@ for a in "$@"; do
   esac
 done
 [ -z "$want_value" ] || { echo "error: --$want_value requires a value" >&2; exit 1; }
+
+# Recorded only when --harness was passed explicitly; bin/fm-spawn.sh reads it
+# back and cross-checks it against its own explicit --harness before launch
+# (mirroring the "Delivery contract: mode=<mode>" check below).
+HARNESS_CONTRACT_LINE=""
+[ -z "$HARNESS" ] || HARNESS_CONTRACT_LINE="Harness contract: harness=$HARNESS"
 
 # Ship delivery mode is an explicit per-task decision (AGENTS.md section 7). A
 # missing or invalid value stops the scaffold rather than silently defaulting.
@@ -188,7 +216,7 @@ BRIEF="$DATA/$ID/brief.md"
 mkdir -p "$DATA/$ID"
 
 ASK_USER_BLOCK=
-if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
+if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ] && [ "$HARNESS" != hermes-vps ]; then
   ASK_USER_BLOCK=$(fm_ask_user_escalation_block "$DATA" "$ID")
 fi
 
@@ -206,13 +234,95 @@ INBOX_DIR=$(shell_quote "$STATE/$ID.inbox")
 # owned by bin/fm-task-inbox-lib.sh; the doorbell itself is self-describing,
 # so this section is reinforcement for the natural-checkpoint habit, not the
 # only carrier of the instruction.
+if [ "$HARNESS" = hermes-vps ]; then
+# hermes-vps has no path back to this machine's filesystem at all
+# (.agents/skills/harness-adapters/references/harness/hermes-vps.md "Known
+# limitation"), so it never lists or moves inbox records itself; the local
+# bridge process (bin/fm-hermes-vps-bridge.py) polls $INBOX_DIR on its
+# behalf and delivers each message straight into this conversation.
+IFS= read -r -d '' INBOX_SECTION <<EOF || true
+# Firstmate instruction inbox
+You have no access to this machine's filesystem, so you never read or move anything under an inbox path yourself.
+When firstmate has a new instruction for you, a local bridge process delivers its exact text directly into this conversation as an ordinary message on your behalf. Treat any such message exactly like a normal steer from firstmate arriving mid-task: act on it, then continue.
+EOF
+else
 IFS= read -r -d '' INBOX_SECTION <<EOF || true
 # Firstmate instruction inbox
 Firstmate steers you through durable message files in $INBOX_DIR.
 When a terminal message says an instruction is waiting there - and at any natural checkpoint when you are unsure - list $INBOX_DIR/*.msg, read and act on each message in numeric order, then acknowledge each handled message by moving it: \`mv $INBOX_DIR/NNN.msg $INBOX_DIR/handled/\`.
 The move IS the acknowledgement: without it firstmate rings again and eventually treats you as stuck. An empty or absent inbox needs no action.
 EOF
+fi
 INBOX_SECTION=${INBOX_SECTION%$'\n'}
+
+# The status-append mechanism itself, harness-conditional; the surrounding
+# rule text (state vocabulary, paused-verb semantics, PR-URL formatting,
+# keyed decision/blocker lifecycle) is common and stays inline in each
+# scaffold below. hermes-vps's remote agent cannot run a shell command that
+# reaches this machine, so it emits the same state vocabulary as chat text
+# instead, and the local bridge (bin/fm-hermes-vps-bridge.py, its header
+# owns the exact protocol) appends it on the agent's behalf.
+if [ "$HARNESS" = hermes-vps ]; then
+IFS= read -r -d '' STATUS_REPORT_INTRO <<EOF || true
+Report status: you have no access to this machine's filesystem at all, only to your own remote sandbox, so never try to write $STATUS_FILE yourself.
+   Instead, include this exact line anywhere in the plain text of one of your own chat replies, never inside a code block or shell command:
+   \`FIRSTMATE-STATUS: {state}: {one short line}\`
+   A local bridge process on the captain's machine recognizes that exact line and appends \`{state}: {one short line}\` to the real status file for you.
+   The state word must be exactly one of the states below, optionally followed by \` [key=<slug>]\`; anything else is rejected and reported back to firstmate as a local diagnostic blocker instead of the status you intended.
+EOF
+else
+IFS= read -r -d '' STATUS_REPORT_INTRO <<EOF || true
+Report status by appending one line:
+   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+EOF
+fi
+STATUS_REPORT_INTRO=${STATUS_REPORT_INTRO%$'\n'}
+
+# The worktree/local-file-access rule text, harness-conditional for the same
+# reason: hermes-vps has no path to this machine's worktree, report file, or
+# status file at all (session.create's cwd param is not honored on the real
+# VPS - see the bridge's own header and hermes-vps.md's "Known limitation").
+if [ "$HARNESS" = hermes-vps ]; then
+  SCOUT_WORKTREE_RULE="Stay inside your own remote sandbox; you have no access to this machine's worktree, report file, or status file at all - the status/report protocol below is the only channel back to firstmate."
+  SHIP_WORKTREE_RULE="You have no access to this machine's worktree or any other local path at all; do your actual work in your own remote sandbox and communicate only through the status/report/steering protocol below."
+else
+  SCOUT_WORKTREE_RULE='Stay inside this worktree; the only files you may write outside it are the report and the status file below.'
+  SHIP_WORKTREE_RULE='Stay inside this worktree; modify nothing outside it.'
+fi
+
+# gh-axi and chrome-devtools-axi are LOCAL command-line tools; a hermes-vps
+# remote agent has no shell reaching this machine and so cannot reach either.
+if [ "$HARNESS" = hermes-vps ]; then
+  TOOLS_RULE='gh-axi and chrome-devtools-axi are local command-line tools unreachable from this harness (you have no shell reaching this machine), so GitHub and browser work is not available to you here.'
+else
+  TOOLS_RULE='Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.'
+fi
+
+# `no-mistakes daemon status`/`no-mistakes axi status` are LOCAL commands a
+# hermes-vps remote agent cannot run either; the Definition of done above
+# already routes it away from the pipeline entirely.
+if [ "$HARNESS" = hermes-vps ]; then
+IFS= read -r -d '' DAEMON_RULE <<'EOF' || true
+You have no local shell to run any no-mistakes command at all - not `no-mistakes daemon status`, not `no-mistakes axi status`, nothing.
+   If this task's mode needed the pipeline, the Definition of done above already explains what to do instead.
+EOF
+else
+IFS= read -r -d '' DAEMON_RULE <<'EOF' || true
+Never stop, restart, or update the shared `no-mistakes` daemon - it is one instance serving
+   every lane/home, so restarting it kills other lanes' in-flight pipeline runs; only firstmate
+   manages the daemon.
+   Before you append `blocked:` about the pipeline, run `no-mistakes daemon status` and
+   `no-mistakes axi status`. If the daemon socket refuses connections or is missing, append
+   `blocked: {the daemon error}` and stop even when the local run record still says running or
+   fixing, because that record can be stale after the daemon exits. A run record failed with a
+   daemon error is also a real block.
+   Only after ruling out socket refusal, if the run is still running or fixing, reattach and keep
+   going. A drive-call error, timeout, slow read, or generic unreachability is NOT a daemon error:
+   the daemon accepts `respond` immediately and runs the round in the background, so a killed or
+   timed-out call was only waiting for a read while the run kept working.
+EOF
+fi
+DAEMON_RULE=${DAEMON_RULE%$'\n'}
 
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
@@ -356,11 +466,41 @@ EOF
 TASK_SECTION=${TASK_SECTION%$'\n'}
 
 if [ "$KIND" = scout ]; then
-if "$SCRIPT_DIR/fm-bootstrap.sh" lavish-compatible >/dev/null 2>&1; then
+if [ "$HARNESS" = hermes-vps ]; then
+  # lavish-axi is a LOCAL command-line tool; a remote VPS agent with no path
+  # back to this machine can never invoke it, regardless of local
+  # compatibility, so this never consults fm-bootstrap.sh for this harness.
+  LAVISH_LINE='Lavish is not reachable from this harness (lavish-axi is a local command-line tool and you have no access to this machine), so deliver your findings as a text report without Lavish, even for a visual deliverable.'
+elif "$SCRIPT_DIR/fm-bootstrap.sh" lavish-compatible >/dev/null 2>&1; then
   LAVISH_LINE='If your deliverable is a visual artifact the captain will review and iterate on, you may host the Lavish review loop yourself (poll, revise, re-serve, staying alive) instead of handing it back to firstmate.'
 else
   LAVISH_LINE='Lavish is unavailable (lavish-axi is missing or below its supported version floor), so deliver your findings as a text report without Lavish, even for a visual deliverable.'
 fi
+if [ "$HARNESS" = hermes-vps ]; then
+IFS= read -r -d '' REPORT_DOD_SECTION <<EOF || true
+# Definition of done
+You have no access to this machine's filesystem, so you never write \`$DATA/$ID/report.md\` yourself. Instead, in the plain text of one of your own chat replies, wrap your COMPLETE findings between two bare marker lines on their own, with nothing else on those two lines:
+FIRSTMATE-REPORT-BEGIN
+<your complete report: what you did, what you found, the evidence (commands run, output), and what you recommend>
+FIRSTMATE-REPORT-END
+A local bridge process writes everything between those two lines to the real report file for you, verbatim, replacing whatever was there before - so put the ENTIRE report inside ONE such block in a single reply; it is not accumulated across replies.
+$LAVISH_LINE
+You cannot read \`$FM_ROOT/.agents/skills/captain-hold-lifecycle/SKILL.md\` or run any other local script, so do not try. If your investigation surfaces a question that needs the captain's decision, say so explicitly in a clearly labeled "Open questions for the captain" section inside your report block; firstmate applies its own completion procedure for that gate when it reads your report locally, in your place.
+When the report is written and any open questions are named in it, include a \`FIRSTMATE-STATUS: done: {one-line conclusion}\` line (in the same reply or a later one) and stop.
+If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
+EOF
+else
+IFS= read -r -d '' REPORT_DOD_SECTION <<EOF || true
+# Definition of done
+Write your findings to \`$DATA/$ID/report.md\`.
+The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
+$LAVISH_LINE
+Before reporting done, read and follow \`$FM_ROOT/.agents/skills/captain-hold-lifecycle/SKILL.md\` and pass its shared completion gate for the report and any visual review.
+When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
+If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
+EOF
+fi
+REPORT_DOD_SECTION=${REPORT_DOD_SECTION%$'\n'}
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
@@ -369,6 +509,7 @@ $TASK_SECTION
 $HERDR_SECTION
 
 # Setup
+$HARNESS_CONTRACT_LINE
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
 This is a SCOUT task: the deliverable is a written report, not a PR.
 The worktree is your laboratory - install, run, edit, and make scratch commits freely; all of it is discarded at teardown.
@@ -376,10 +517,9 @@ The report is the only thing that survives, so anything worth keeping must be in
 
 # Rules
 1. Never push to any remote and never open a PR.
-2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.
-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
-4. Report status by appending one line:
-   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+2. $SCOUT_WORKTREE_RULE
+3. $TOOLS_RULE
+4. $STATUS_REPORT_INTRO
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
    would act on and the needs-decision/blocked/paused/done/failed states. No step-by-step
@@ -398,28 +538,11 @@ The report is the only thing that survives, so anything worth keeping must be in
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
-7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs; only firstmate
-   manages the daemon.
-   Before you append \`blocked:\` about the pipeline, run \`no-mistakes daemon status\` and
-   \`no-mistakes axi status\`. If the daemon socket refuses connections or is missing, append
-   \`blocked: {the daemon error}\` and stop even when the local run record still says running or
-   fixing, because that record can be stale after the daemon exits. A run record failed with a
-   daemon error is also a real block.
-   Only after ruling out socket refusal, if the run is still running or fixing, reattach and keep
-   going. A drive-call error, timeout, slow read, or generic unreachability is NOT a daemon error:
-   the daemon accepts \`respond\` immediately and runs the round in the background, so a killed or
-   timed-out call was only waiting for a read while the run kept working.
+7. $DAEMON_RULE
 
 $INBOX_SECTION
 
-# Definition of done
-Write your findings to \`$DATA/$ID/report.md\`.
-The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
-$LAVISH_LINE
-Before reporting done, read and follow \`$FM_ROOT/.agents/skills/captain-hold-lifecycle/SKILL.md\` and pass its shared completion gate for the report and any visual review.
-When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
-If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
+$REPORT_DOD_SECTION
 EOF
 echo "scaffolded: $BRIEF (scout; replace {TASK} and {FIRSTMATE_SPEC})"
 exit 0
@@ -445,7 +568,50 @@ case "$MODE" in
     RULE1='1. Never push to the default branch. Never merge a PR.'
     ;;
 esac
-DOD=$(fm_dod_block "$MODE" "$ID") || exit 1
+DOD=$(fm_dod_block "$MODE" "$ID" "$HARNESS") || exit 1
+
+if [ "$HARNESS" = hermes-vps ]; then
+IFS= read -r -d '' HERMES_VPS_SHIP_NOTE <<EOF || true
+
+**hermes-vps has no access to this worktree at all** (\`.agents/skills/harness-adapters/references/harness/hermes-vps.md\` "Known limitation"). The isolation check, branch creation, and any \`no-mistakes\` command are LOCAL bookkeeping only, so they are omitted below; you have no shell reaching this machine and cannot run any of them. Do your actual work in your own remote sandbox and report through the status/report/steering protocol below instead.
+EOF
+else
+HERMES_VPS_SHIP_NOTE=""
+fi
+HERMES_VPS_SHIP_NOTE=${HERMES_VPS_SHIP_NOTE%$'\n'}
+
+if [ "$HARNESS" = hermes-vps ]; then
+  SETUP_ISOLATION_AND_BRANCH=""
+else
+IFS= read -r -d '' SETUP_ISOLATION_AND_BRANCH <<EOF || true
+
+**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
+The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
+If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked: launched in primary checkout, not an isolated worktree\` to the status file and stop.
+
+1. First action: create your branch: \`git checkout -b fm/$ID\`$SETUP2
+EOF
+fi
+SETUP_ISOLATION_AND_BRANCH=${SETUP_ISOLATION_AND_BRANCH%$'\n'}
+
+# fm-ensure-agents-md.sh is a LOCAL script operating on the worktree; a
+# hermes-vps remote agent has no access to either.
+if [ "$HARNESS" = hermes-vps ]; then
+IFS= read -r -d '' PROJECT_MEMORY_SECTION <<'EOF' || true
+# Project memory
+Project-memory capture is not reachable from this harness (no local worktree access), so it is skipped.
+EOF
+else
+IFS= read -r -d '' PROJECT_MEMORY_SECTION <<EOF || true
+# Project memory
+If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
+Record only project knowledge useful to almost every future session.
+For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
+If you touch a project \`AGENTS.md\`, follow \`$FM_ROOT/bin/fm-ensure-agents-md.sh\`'s self-governance contract in the same pass.
+Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+EOF
+fi
+PROJECT_MEMORY_SECTION=${PROJECT_MEMORY_SECTION%$'\n'}
 
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -455,20 +621,16 @@ $TASK_SECTION
 $HERDR_SECTION
 
 # Setup
+$HARNESS_CONTRACT_LINE
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
-
-**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
-The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
-If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked: launched in primary checkout, not an isolated worktree\` to the status file and stop.
-
-1. First action: create your branch: \`git checkout -b fm/$ID\`$SETUP2
+$HERMES_VPS_SHIP_NOTE
+$SETUP_ISOLATION_AND_BRANCH
 
 # Rules
 $RULE1
-2. Stay inside this worktree; modify nothing outside it.
-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
-4. Report status by appending one line:
-   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
+2. $SHIP_WORKTREE_RULE
+3. $TOOLS_RULE
+4. $STATUS_REPORT_INTRO
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
    would act on (setup done, bug reproduced, fix implemented, validation passed) and the
@@ -489,27 +651,11 @@ $RULE1
 $ASK_USER_BLOCK
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
-7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs; only firstmate
-   manages the daemon.
-   Before you append \`blocked:\` about the pipeline, run \`no-mistakes daemon status\` and
-   \`no-mistakes axi status\`. If the daemon socket refuses connections or is missing, append
-   \`blocked: {the daemon error}\` and stop even when the local run record still says running or
-   fixing, because that record can be stale after the daemon exits. A run record failed with a
-   daemon error is also a real block.
-   Only after ruling out socket refusal, if the run is still running or fixing, reattach and keep
-   going. A drive-call error, timeout, slow read, or generic unreachability is NOT a daemon error:
-   the daemon accepts \`respond\` immediately and runs the round in the background, so a killed or
-   timed-out call was only waiting for a read while the run kept working.
+7. $DAEMON_RULE
 
 $INBOX_SECTION
 
-# Project memory
-If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
-Record only project knowledge useful to almost every future session.
-For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
-If you touch a project \`AGENTS.md\`, follow \`$FM_ROOT/bin/fm-ensure-agents-md.sh\`'s self-governance contract in the same pass.
-Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+$PROJECT_MEMORY_SECTION
 
 $DOD
 EOF

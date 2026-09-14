@@ -13,7 +13,14 @@
 #   instructions and the recorded task delivery cannot drift apart; a brief
 #   scaffolded before that line existed warns once and launches on the flag. A
 #   ship or scout spawn also refuses leftover `{TASK}` / `{FIRSTMATE_SPEC}`
-#   placeholders, an empty Task, or an incomplete pair of Task subsections.
+#   placeholders, an empty Task, or an incomplete pair of Task subsections. Every
+#   ship or scout spawn also reads the brief's recorded "Harness contract:
+#   harness=<harness>" line and REFUSES a launch where exactly one side is
+#   hermes-vps (the only harness whose brief content differs), comparing against
+#   the FINAL resolved harness - explicit --harness, crew-dispatch.json's forced
+#   value, or the config/crew-harness standing default - not only an explicit
+#   flag, so the worker's hermes-vps-specific instructions and its actual
+#   dispatch transport cannot drift apart.
 #   Every ship or scout spawn renders `launch-brief.md`; for a no-mistakes ship
 #   it also carries the current `--intent` contract and the extracted captain
 #   intent. A legacy mixed Task is accepted there only under bin/fm-dod-lib.sh's
@@ -283,6 +290,15 @@
 #     __ROVOBIN__   resolved, rovo-verified executable for a rovo launch
 #     __AGYBIN__    resolved, agy-verified executable for an agy launch
 #     __HERMESBIN__ resolved, hermes-verified executable for a hermes launch
+#     __HERMESVPSSTATUSFILE__ absolute path to state/<task-id>.status, passed to the
+#                  hermes-vps bridge so it - not the remote VPS agent, which cannot
+#                  reach this path - is the one process that ever appends to it
+#     __HERMESVPSREPORTFILE__ absolute path to data/<task-id>/report.md, passed to the
+#                  hermes-vps bridge for the same reason
+#     __HERMESVPSINBOXDIR__ absolute path to state/<task-id>.inbox, passed to the
+#                  hermes-vps bridge so it polls and delivers steering messages the
+#                  remote agent cannot read itself (.agents/skills/harness-adapters/
+#                  references/harness/hermes-vps.md "Status, report, and steering")
 # Verified per-harness turn-end hooks are installed automatically where enabled; some live outside the worktree.
 # Kimi uses one surgically installed Firstmate region in $HOME/.kimi-code/config.toml,
 # a firstmate-owned global hook and registry, and a gitignored per-task pointer.
@@ -1770,7 +1786,13 @@ launch_template() {
     # and hermes-vps.md's "Known limitation" for what that means for a task
     # that needs local repo access). No model/effort flag exists for this
     # transport (record-and-omit, matching hermes/kimi below).
-    hermes-vps) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESVPSBRIDGE__ --cwd __WORKTREE__' ;;
+    # __HERMESVPSSTATUSFILE__/__HERMESVPSREPORTFILE__/__HERMESVPSINBOXDIR__ arm
+    # the bridge's own local status/report/steering protocol (the bridge's
+    # header comment and hermes-vps.md's "Status, report, and steering" own
+    # the contract) - the remote VPS agent has no path back to this Mac's
+    # filesystem at all, so the bridge, which runs locally, is the one
+    # process that ever touches these paths on its behalf.
+    hermes-vps) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESVPSBRIDGE__ --cwd __WORKTREE__ --status-file __HERMESVPSSTATUSFILE__ --report-file __HERMESVPSREPORTFILE__ --inbox-dir __HERMESVPSINBOXDIR__' ;;
     *) return 1 ;;
   esac
 }
@@ -2239,6 +2261,12 @@ case "$LAUNCH" in
     # search like every resolve_*_binary above (there is no vendor binary to
     # find - see the hermes-vps launch_template case).
     LAUNCH=${LAUNCH//__HERMESVPSBRIDGE__/$(shell_quote "$FM_ROOT/bin/fm-hermes-vps-bridge.sh")}
+    # Arm the bridge's own local status/report/inbox protocol with this
+    # task's real local paths - the remote VPS agent cannot resolve these
+    # itself (module docstring of bin/fm-hermes-vps-bridge.py).
+    LAUNCH=${LAUNCH//__HERMESVPSSTATUSFILE__/$(shell_quote "$STATE/$ID.status")}
+    LAUNCH=${LAUNCH//__HERMESVPSREPORTFILE__/$(shell_quote "$DATA/$ID/report.md")}
+    LAUNCH=${LAUNCH//__HERMESVPSINBOXDIR__/$(shell_quote "$STATE/$ID.inbox")}
     ;;
 esac
 
@@ -2553,6 +2581,29 @@ if [ "$KIND" = ship ]; then
   if [ -n "$STANDING_MODE" ] && [ "$STANDING_MODE" != no-mistakes-prod-only ] \
      && [ "$(delivery_rigor_rank "$MODE")" -lt "$(delivery_rigor_rank "$STANDING_MODE")" ]; then
     echo "notice: $ID ships mode=$MODE while the standing posture for $PROJ_NAME is $STANDING_MODE - less rigor than the captain's standing posture; proceed only on a current explicit captain instruction or an intake judgment you can state" >&2
+  fi
+fi
+
+# Brief/spawn harness agreement, checked the same way as the mode contract above.
+# fm-brief.sh records "Harness contract: harness=<harness>" only when --harness was
+# passed explicitly (an omitted/default harness renders identical brief content for
+# every harness except hermes-vps), so the check below compares the single bucket
+# that actually changes brief content - whether hermes-vps applies - rather than raw
+# harness-name equality, which would falsely flag two different ordinary harnesses
+# (e.g. brief scaffolded plain, spawned with --harness claude) as a mismatch. It
+# compares against the FINAL resolved $HARNESS (set above from the explicit
+# --harness, crew-dispatch.json's forced explicit value, or the config/crew-harness
+# standing default), not the raw --harness argument alone, so a standing default of
+# hermes-vps can't silently launch a worker whose brief was scaffolded without it.
+if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
+  BRIEF_HARNESS=$(sed -n 's/^Harness contract: harness=\(.*\)$/\1/p' "$BRIEF" | head -n 1)
+  BRIEF_IS_HERMES_VPS=0
+  [ "$BRIEF_HARNESS" = hermes-vps ] && BRIEF_IS_HERMES_VPS=1
+  SPAWN_IS_HERMES_VPS=0
+  [ "$HARNESS" = hermes-vps ] && SPAWN_IS_HERMES_VPS=1
+  if [ "$BRIEF_IS_HERMES_VPS" -ne "$SPAWN_IS_HERMES_VPS" ]; then
+    echo "error: harness mismatch for $ID: the brief was scaffolded with harness=${BRIEF_HARNESS:-<none>} but this spawn resolved harness=$HARNESS; hermes-vps changes the brief's setup/status/report instructions, so this would launch a worker whose brief and actual transport disagree - correct --harness (or the config/crew-harness standing default) or re-scaffold the brief with the matching --harness" >&2
+    exit 1
   fi
 fi
 
