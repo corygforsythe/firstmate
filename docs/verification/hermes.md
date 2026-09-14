@@ -292,13 +292,44 @@ ok - config: fm-hermes-ws.sh fills missing env from $FM_HOME/.env, env still win
 Run 2026-09-14 (macOS arm64, Python 3.13.12).
 This proves the HTTP auth calls, the RFC 6455 handshake and framing, JSON-RPC id matching, event-notification handling, and the `dispatch` completion predicate all work correctly against a real socket speaking the documented wire protocol.
 
-### What remains unverified
+### Live verification against the real VPS
 
-This client has NOT been run against the real VPS or a real Hermes install of any version - only against the offline stub above.
-Two things stand between this and a genuine live verification matching this record's own bar (a real dispatch, a real turn, real output):
+Run 2026-09-14, `FM_HERMES_WS_BASE_URL=http://vps.tail8bdd14.ts.net:9119`, credentials from `$FM_HOME/.env`, Hermes Agent v0.21.2 (`gateway_mode: multiplex`, model `claude-opus-5 (anthropic)`).
+`bin/fm-hermes-ws.py` defaults `Origin` to the base URL's own origin; the real gated connect succeeded on that default with no override needed, so `FM_HERMES_WS_ORIGIN` stays available but unexercised.
 
-1. **The captain's VPS login credentials**, per the open decision on `state/hermes-vps-gateway.status` - not present in any file this task can read, and not guessed or fabricated.
-2. **The `Origin` header on a real gated (non-loopback) connection is unconfirmed.** `scripts/iso-certify.py`'s `WSClient` sets `Origin` to `http://127.0.0.1:<port>` for its loopback-only scratch instance, matching `hermes_cli/web_server.py`'s CORS `allow_origin_regex` (`localhost`/`127.0.0.1` only); whether the gated remote path enforces that same regex on the WS upgrade specifically, or checks Origin at all, was not established by reading `_ws_auth_reason`/the WS accept path in the time this task had.
-   `bin/fm-hermes-ws.py` defaults `Origin` to the real base URL's own origin (the honest choice for a non-loopback connection) and exposes `FM_HERMES_WS_ORIGIN` to override it if a real gated connect is rejected on this header.
+Every primitive round-tripped for real:
 
-Re-run `bash tests/fm-hermes-ws.test.sh` after any change to the client or the stub, and record a real VPS `dispatch` transcript here once the credential and Origin questions above are resolved.
+```
+$ bin/fm-hermes-ws.sh dispatch /tmp/fm-hermes-ws-live-verify \
+    "Use your terminal tool to run: pwd && cat marker.txt. Then reply with exactly the terminal output and nothing else." 120
+{"count": 4, "messages": [
+  {"role": "user", "text": "Use your terminal tool to run: pwd && cat marker.txt. ..."},
+  {"role": "tool", "name": "terminal", "args": {"command": "pwd && cat marker.txt"}},
+  {"role": "assistant", "text": "/\ncat: marker.txt: No such file or directory"}]}
+# real tool call, real streamed completion, session created/submitted/read/closed
+# over one dispatch call, end to end, in ~4s.
+
+$ bin/fm-hermes-ws.sh status "$SID"
+{"output": "Hermes TUI Status\n\n...\nAgent Running: No"}
+# and, mid-turn, on a real `sleep 20` submit:
+{"output": "...\nTitle: Run sleep 20 then echo DONE_SLEEP\n...\nAgent Running: Yes"}
+
+$ bin/fm-hermes-ws.sh steer "$SID" "Actually, stop and just reply with the word ACK."
+{"status": "queued", "text": "Actually, stop and just reply with the word ACK."}
+
+$ bin/fm-hermes-ws.sh interrupt "$SID"
+{"status": "interrupted"}
+
+$ bin/fm-hermes-ws.sh close "$SID"
+{"closed": true}
+```
+
+`session.status`'s literal `Agent Running: Yes`/`Agent Running: No` line and `session.steer`/`session.interrupt`'s real, structural (non-key) responses are exactly what `data/hermes-serve-verify/report.md` predicted from a local scratch instance - confirmed here against the captain's real deployment instead.
+This is the safety-relevant fact this whole transport exists to deliver: unlike the pane-based `hermes --cli` adapter (`../../../.agents/skills/harness-adapters/references/harness/hermes.md`'s "Interrupt: no safe key exists" - Ctrl+C kills the whole session, Escape is a no-op), `session.interrupt` here is a real RPC method with a real, distinct, non-destructive result.
+
+**One real, live-verified finding that changes a claim in the earlier scout report**: `session.create`'s `cwd` param was NOT honored on this VPS deployment.
+`session.create({"cwd": "/tmp/fm-hermes-ws-live-verify"})` returned `"info": {"cwd": "/", ...}`, and the dispatched turn's own `terminal` tool call confirmed it (`pwd` printed `/`, and `cat marker.txt` - a file that genuinely exists at the requested cwd - failed `No such file or directory`).
+`data/hermes-serve-verify/report.md`'s local scratch-instance test found solid `cwd` pinning for the `terminal` tool specifically; this VPS, on a materially newer version (v0.21.2 vs. that test's v0.16.0) and in `multiplex` gateway mode, does not reproduce that on the same tool.
+Not re-diagnosed further here (out of this task's scope), but load-bearing for any future fleet-dispatch wiring: **do not assume `cwd` pins a crewmate's working directory on this transport** without re-confirming it on the specific deployment/version in use; a follow-up wiring task needs its own answer for worktree confinement here; the file-tool "no confinement at all" finding for the pane-based adapter (same skill reference doc) is a separate, already-documented fact and is not contradicted by this.
+
+Re-run `bash tests/fm-hermes-ws.test.sh` after any change to the client or the stub; re-run a live `dispatch` after any Hermes upgrade on either the client's assumptions or the VPS's version, since the wire protocol, `cwd` handling, and the rendered `session.status` text are all vendor-controlled surfaces.
