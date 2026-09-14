@@ -42,9 +42,9 @@
 #   fm-interrupt     the legacy Claude fm-send --key Escape idle event
 #   fm-recovery      a documented recovery reset after relaunch
 # Classifier-only sources (never written into a record):
-#   endpoint-gone, herdr-native, grok-regex, rovo-regex, agy-regex, muse-session-log,
-#   cursor-transcript, missing, malformed, gen-mismatch, source-mismatch,
-#   kimi-unverified, codex-unverified, capture-failed, no-target
+#   endpoint-gone, herdr-native, grok-regex, rovo-regex, agy-regex, hermes-regex,
+#   muse-session-log, cursor-transcript, missing, malformed, gen-mismatch,
+#   source-mismatch, kimi-unverified, codex-unverified, capture-failed, no-target
 #
 # Classification (fm_busy_classify): busy | idle | unknown | dead, always
 # with the producing source as the second token. Precedence:
@@ -57,12 +57,14 @@
 #      Grok/Rovo/AGY temporary regex fallbacks classify a grok, rovo, or agy
 #      task from its rendered tail, then unknown missing
 #   5. malformed, stale, or untrusted records -> unknown, never a fallback
-# Grok, Rovo, and AGY are the ONLY rendered-text classifications that survive the
-# redesign, because none of their structured lifecycles was credited-live-verified
-# in the approved audit (Rovo's clean ACP stopReason lives outside the TUI
-# path firstmate drives, see references/harness/rovo.md; agy 1.2.0 exposes no
-# hook surface at all, see references/harness/agy.md); each is scoped to
-# its own harness= and can never classify another adapter. The delivery
+# Grok, Rovo, AGY, and Hermes are the ONLY rendered-text classifications that
+# survive the redesign, because none of their structured lifecycles was
+# credited-live-verified in the approved audit (Rovo's clean ACP stopReason
+# lives outside the TUI path firstmate drives, see references/harness/rovo.md;
+# agy 1.2.0 exposes no hook surface at all, see references/harness/agy.md;
+# hermes's own hooks surface was not confirmed to carry a turn-granularity
+# signal, see references/harness/hermes.md); each is scoped to its own
+# harness= and can never classify another adapter. The delivery
 # guards in bin/fm-composer-lib.sh match rendered footers for submit
 # acknowledgement and away-mode supervisor injection only; neither is a
 # recorded worker state source.
@@ -852,6 +854,23 @@ fm_busy_rovo_tail_busy() {
     | grep -qiE "${FM_BUSY_ROVO_REGEX:-Rovo is thinking}"
 }
 
+# fm_busy_hermes_tail_busy: the Hermes-only temporary rendered-tail fallback.
+# Consumes the tail on stdin; 0 when hermes's busy footer hint line matches
+# (verified live, Hermes Agent v0.16.0: a busy turn prints a trailing
+# `msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel` hint line below the
+# `❯` prompt; idle prints a bare `❯` with no hint line at all). hermes has no
+# turn-end hook and no structural busy/idle signal was found (`hermes hooks`/
+# --accept-hooks exist but were not confirmed to carry one), so this
+# fallback, like rovo's, is the only source; it is never armed as a semantic
+# writer (fm_busy_sources_for_harness trusts nothing for hermes). The
+# distinguishing token `msg=interrupt` is matched rather than the whole hint
+# line so glyph/spacing drift across versions cannot silently break the
+# match. FM_BUSY_HERMES_REGEX overrides the signature.
+fm_busy_hermes_tail_busy() {
+  grep -v '^[[:space:]]*$' | tail -12 \
+    | grep -qiE "${FM_BUSY_HERMES_REGEX:-msg=interrupt}"
+}
+
 # fm_busy_agy_tail_busy: the AGY-only temporary rendered-tail fallback.
 # Consumes the tail on stdin; 0 when AGY's verified busy signature matches:
 # the `esc to cancel` token in the status row the TUI pins to the bottom of
@@ -992,6 +1011,27 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
         printf 'busy rovo-regex'
       else
         printf 'unknown rovo-regex'
+      fi
+      return 0
+      ;;
+    hermes*)
+      if [ -z "$tail40" ]; then
+        if command -v fm_backend_capture >/dev/null 2>&1; then
+          tail40=$(fm_backend_capture "$backend" "$target" 40 2>/dev/null) || {
+            printf 'unknown capture-failed'
+            return 0
+          }
+        else
+          printf 'unknown capture-failed'
+          return 0
+        fi
+      fi
+      # Best-effort like rovo: a long turn can scroll the busy marker out of
+      # the captured tail, so its absence means "can't tell," never idle.
+      if printf '%s' "$tail40" | fm_busy_hermes_tail_busy; then
+        printf 'busy hermes-regex'
+      else
+        printf 'unknown hermes-regex'
       fi
       return 0
       ;;
