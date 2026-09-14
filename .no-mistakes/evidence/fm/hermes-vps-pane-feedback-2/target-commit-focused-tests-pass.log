@@ -1,0 +1,3 @@
+ok - sending indicator: [sending...] renders on local submit before [working...] confirms the server round trip is in flight
+ok - ready marker: ❯ renders when idle and never mid-turn, reappearing once the turn completes
+ok - inbox-steer promptness: a durable fm-send.sh-style steer on an idle bridge produces [sending...] within a few seconds, cleanly separated from the ready marker, not the old ~30-60s-tied cadence

@@ -1,0 +1,2 @@
+not ok - expected the ready marker '❯ ' (glyph + trailing space, no newline), got: 0000000 ❯ ** ** 
+0000003
