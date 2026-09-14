@@ -150,8 +150,30 @@
 # (pane-typed input, brief-content delivery, inbox-polled steers), so this
 # is never printed for input that never reaches it - the doorbell line, a
 # brief pointer whose path does not exist, /exit, /interrupt (a distinct RPC
-# with its own "[interrupted]" outcome line, untouched here). Symmetrically,
-# a bare "❯" line renders once whenever the session becomes idle and ready
+# with its own "[interrupted]" outcome line, untouched here).
+#
+# A first fix attempt (PR "fix(hermes-vps): add immediate send feedback and
+# ready-for-input marker to the bridge pane") made _forward() print
+# SENDING_LINE first, which IS immediate for pane-typed
+# input - but the captain's real steering path is fm-send.sh's durable
+# inbox (AGENTS.md section 7: "Steer a worker with ordinary text through
+# fail-closed fm-send"), delivered here by poll_inbox(), never by typing
+# into this pane directly. poll_inbox() only ran once per run()'s own
+# select() loop iteration, gated by `now - self._last_inbox_poll >=
+# INBOX_POLL_INTERVAL`, and that loop iteration itself blocks inside
+# select() for up to EVENT_WAIT_TIMEOUT (30s) whenever the pane is
+# otherwise idle - so a steer landing on an idle bridge could sit unnoticed
+# for up to ~2*EVENT_WAIT_TIMEOUT before _forward() ever ran, making
+# "[sending...]" arrive tens of seconds late for the one delivery path that
+# actually matters. Live-verified against the real VPS: a steer dropped
+# into --inbox-dir on an idle bridge took 38s to produce "[sending...]".
+# INBOX_POLL_INTERVAL is now its own constant, decoupled from
+# EVENT_WAIT_TIMEOUT, and run()'s select() call uses the smaller of the two
+# as its timeout whenever --inbox-dir is armed, so an idle bridge wakes up
+# and checks the inbox on INBOX_POLL_INTERVAL's own cadence instead of
+# EVENT_WAIT_TIMEOUT's.
+#
+# A bare "❯" line renders once whenever the session becomes idle and ready
 # for a new line: after start()'s readiness banner, and after every
 # message.complete/error event resets self.busy to False. Because this is
 # an append-only scrollback, "absent while a submission is in flight" means
@@ -165,6 +187,25 @@
 # (fm_busy_hermes_vps_agent_running) never reads pane text, so neither new
 # marker can be mistaken for a busy/idle signal by anything that classifies
 # this task's state.
+#
+# A second fix in the same first attempt printed the marker as a full line
+# ("❯\n"), which left the CURSOR on a fresh, blank line below it rather than
+# beside it - it read as a label sitting over an empty line, not an inline
+# prompt a captain types into. _print_ready_marker() now prints the glyph
+# plus a trailing space with NO newline, so a real attached terminal's own
+# input echo continues on the SAME line right after it. That in turn means
+# whatever this bridge prints next is no longer guaranteed to start on a
+# fresh line the way every earlier line-buffered print could assume: the
+# ONE caller that can genuinely run right after a bare marker with nothing
+# else printed in between - poll_inbox()'s direct _forward() call, since it
+# has no typed line to be echoed first - would otherwise glue "[sending...]"
+# onto the marker's own line ("❯ [sending...]"). self._prompt_pending
+# tracks exactly this: set True only by _print_ready_marker(), cleared by
+# _echo() (the keyboard/brief-pointer path always echoes the submitted line
+# before forwarding it, so by the time _forward() runs the pane is already
+# on a fresh line and needs no help), and consulted by _forward() itself,
+# which prepends one newline exactly when nothing has cleared it since the
+# marker - i.e. only for the inbox-polled path that never calls _echo().
 import importlib.util
 import os
 import re
@@ -222,7 +263,12 @@ VALID_STATUS_STATES = frozenset(
 # brief already renders as `echo "{state}: {note}" >> status-file`.
 _STATUS_LINE_RE = re.compile(r'^([A-Za-z][A-Za-z-]*)(\s*\[key=[^\]\s]+\])?:\s*(\S.*)$')
 
-INBOX_POLL_INTERVAL = EVENT_WAIT_TIMEOUT
+# Deliberately decoupled from EVENT_WAIT_TIMEOUT (see the module docstring's
+# "Local-submit and ready-for-input rendering" section): run()'s select()
+# call uses the smaller of the two as its own timeout whenever --inbox-dir
+# is armed, so an idle bridge notices a durable steer within this cadence
+# instead of waiting up to EVENT_WAIT_TIMEOUT.
+INBOX_POLL_INTERVAL = 1.0
 
 
 def _parse_args(argv):
@@ -255,18 +301,6 @@ def _parse_args(argv):
     return cwd, status_file, report_file, inbox_dir
 
 
-def _echo(line):
-    print(f'{BULLET} {line}', flush=True)
-
-
-def _print_ready_marker():
-    """Renders once per idle transition - see the module docstring's
-    "Local-submit and ready-for-input rendering" section. Never gates
-    anything: hermes-vps busy classification is a live session.status RPC
-    (fm_busy_hermes_vps_agent_running), not pane text."""
-    print(READY_MARKER, flush=True)
-
-
 def _inbox_record_body(raw):
     """Body of one fm-task-inbox-lib.sh record: header lines, a bare "--"
     separator line, then the message text verbatim. Returns None when no
@@ -294,6 +328,27 @@ class Bridge:
         self._stdin_buf = b''
         self._turn_text_buf = ''
         self._last_inbox_poll = 0.0
+        # See the module docstring's "Local-submit and ready-for-input
+        # rendering" section: True only right after _print_ready_marker()
+        # printed the bare, newline-less marker with nothing since; cleared
+        # by _echo() (the keyboard/brief-pointer path always echoes the
+        # submitted line first) and consulted by _forward() itself.
+        self._prompt_pending = False
+
+    def _echo(self, line):
+        print(f'{BULLET} {line}', flush=True)
+        self._prompt_pending = False
+
+    def _print_ready_marker(self):
+        """Renders once per idle transition - see the module docstring's
+        "Local-submit and ready-for-input rendering" section. Never gates
+        anything: hermes-vps busy classification is a live session.status
+        RPC (fm_busy_hermes_vps_agent_running), not pane text. No trailing
+        newline: a real attached terminal's own input echo continues on
+        this same line, so the marker reads as an inline prompt rather than
+        a label over an empty line below it."""
+        print(f'{READY_MARKER} ', end='', flush=True)
+        self._prompt_pending = True
 
     def start(self):
         created = self.session.rpc('session.create', {'cwd': self.cwd})
@@ -301,7 +356,7 @@ class Bridge:
         if not self.session_id:
             raise HermesWsError(f'session.create returned no session_id: {created}')
         print(f'{READY_PREFIX} session_id={self.session_id}', flush=True)
-        _print_ready_marker()
+        self._print_ready_marker()
 
     def _forward(self, text):
         """Submit or steer <text> depending on the last-observed turn state.
@@ -314,8 +369,14 @@ class Bridge:
         submission path shares, so it is the earliest point-in-time local
         signal available without inventing a second one per caller - see the
         module docstring's "Local-submit and ready-for-input rendering"
-        section for why this is distinct from message.start's "[working...]"."""
-        print(SENDING_LINE, flush=True)
+        section for why this is distinct from message.start's "[working...]".
+        Prepends a newline when self._prompt_pending is still set: only the
+        inbox-polled path can reach here with the bare ready marker as the
+        last thing printed (every other caller echoes the line first), and
+        without this SENDING_LINE would glue onto the marker's own line."""
+        prefix = '\n' if self._prompt_pending else ''
+        self._prompt_pending = False
+        print(f'{prefix}{SENDING_LINE}', flush=True)
         try:
             method = 'session.steer' if self.busy else 'prompt.submit'
             self.session.rpc(method, {'session_id': self.session_id, 'text': text})
@@ -480,7 +541,7 @@ class Bridge:
             path = line[len(BRIEF_POINTER_PREFIX):-len(BRIEF_POINTER_SUFFIX)]
             if os.path.isfile(path):
                 self.brief_delivered = True
-                _echo(line)
+                self._echo(line)
                 try:
                     with open(path, 'r', encoding='utf-8') as fh:
                         content = fh.read()
@@ -514,7 +575,7 @@ class Bridge:
                     return
             print('[interrupted]', flush=True)
             return
-        _echo(line)
+        self._echo(line)
         self._forward(line)
 
     def handle_event(self, envelope):
@@ -560,7 +621,7 @@ class Bridge:
             text = self._turn_text_buf or (data.get('text') or '')
             if text:
                 self._process_turn_text(text)
-            _print_ready_marker()
+            self._print_ready_marker()
         elif etype == 'tool.start':
             name = data.get('name', '?')
             context = data.get('context', '')
@@ -573,7 +634,7 @@ class Bridge:
             self.busy = False
             message = data.get('message', envelope)
             print(f'\n[error] {message}', flush=True)
-            _print_ready_marker()
+            self._print_ready_marker()
 
     def shutdown(self):
         if self._shutdown:
@@ -621,8 +682,17 @@ class Bridge:
                 self._last_inbox_poll = now
                 self.poll_inbox()
             raw_sock = self.session._sock._sock  # same-process bridge; not crossing a public API boundary
+            # A shorter select() timeout whenever --inbox-dir is armed: an
+            # idle bridge otherwise only wakes to re-check the clock above
+            # every EVENT_WAIT_TIMEOUT (30s), which is also the longest a
+            # durable steer sitting in the inbox could go unnoticed - see
+            # the module docstring's "Local-submit and ready-for-input
+            # rendering" section.
+            select_timeout = (
+                min(EVENT_WAIT_TIMEOUT, INBOX_POLL_INTERVAL) if self.inbox_dir else EVENT_WAIT_TIMEOUT
+            )
             try:
-                readable, _, _ = select.select([self._stdin_fd, raw_sock], [], [], EVENT_WAIT_TIMEOUT)
+                readable, _, _ = select.select([self._stdin_fd, raw_sock], [], [], select_timeout)
             except (OSError, ValueError):
                 if self.reconnect():
                     continue
