@@ -1,0 +1,264 @@
+From d8491f40a40071f1fc3749b19dff6158997be78d Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Mon, 14 Sep 2026 15:16:10 -0500
+Subject: [PATCH 21/24] Render a working indicator in the hermes-vps pane
+ during in-flight turns
+
+The pane has no composer or spinner, so a slow-but-genuinely-working turn
+looked identical to a dead session. Print a bare [working...] line on
+message.start, the earliest signal the existing event stream offers.
+---
+ .../references/harness/hermes-vps.md          |  8 +-
+ bin/fm-hermes-vps-bridge.py                   | 15 ++-
+ docs/verification/hermes.md                   | 29 ++++++
+ tests/fixtures/fm-hermes-ws-stub-server.py    | 22 +++++
+ tests/fm-hermes-vps-bridge.test.sh            | 94 +++++++++++++++++++
+ 5 files changed, 166 insertions(+), 2 deletions(-)
+
+diff --git a/.agents/skills/harness-adapters/references/harness/hermes-vps.md b/.agents/skills/harness-adapters/references/harness/hermes-vps.md
+index 96246b7..aa0f715 100644
+--- a/.agents/skills/harness-adapters/references/harness/hermes-vps.md
++++ b/.agents/skills/harness-adapters/references/harness/hermes-vps.md
+@@ -52,9 +52,15 @@ If the pointer's path is NOT locally readable, the bridge never echoes that line
+ 
+ ## Rendering
+ 
+-The bridge renders a grounded subset of the real Hermes event vocabulary (read directly from the installed Hermes source, `tui_gateway/server.py`, not inferred): `message.delta` (streamed text), `message.complete` (a `[turn <status>]` marker), `tool.start`/`tool.complete` (a one-line summary each), and `error`.
++The bridge renders a grounded subset of the real Hermes event vocabulary (read directly from the installed Hermes source, `tui_gateway/server.py`, not inferred): `message.start` (a bare `[working...]` line, see "Working indicator" below), `message.delta` (streamed text), `message.complete` (a `[turn <status>]` marker), `tool.start`/`tool.complete` (a one-line summary each), and `error`.
+ Every other event type (`reasoning.available`, `subagent.*`, `tool.generating`, todo updates) is deliberately not rendered - an initial pane-rendering scope, not a wire-protocol gap.
+ 
++### Working indicator
++
++The pane has no composer, spinner, or busy state of any kind (see "Composer" above), so a genuinely working but slow turn - one whose first `message.delta` or `tool.start` is many seconds out, with no vendor "typing" signal on this transport - was indistinguishable from a dead session.
++The bridge now prints a bare `[working...]` line on every `message.start`, the earliest point-in-time signal the event stream offers without adding a new polling loop; it is a pane log line like every other rendered marker, never cleared in place, and the turn's own later `message.delta`/`tool.start`/`[turn <status>]` lines are what tell the reader the wait ended.
++Live-verified (offline, no VPS credentials in a task worktree - see `docs/verification/hermes.md`'s "hermes-vps: working indicator" section) with a stub-driven multi-second delay standing in for a real slow turn (e.g. a `sleep`-based VPS command): `[working...]` renders immediately after submission, nothing else renders during the delay, and the eventual content plus `[turn complete]` land once the response arrives.
++
+ ## Status, report, and steering: bridged locally, not filesystem access
+ 
+ The remote VPS agent has no path back to this Mac's filesystem at all (see "Known limitation" below), so it cannot append `state/<id>.status`, write `data/<id>/report.md`, or read `state/<id>.inbox/` the way every other harness's crewmate does directly.
+diff --git a/bin/fm-hermes-vps-bridge.py b/bin/fm-hermes-vps-bridge.py
+index f07951a..22fac58 100755
+--- a/bin/fm-hermes-vps-bridge.py
++++ b/bin/fm-hermes-vps-bridge.py
+@@ -129,7 +129,11 @@
+ # carries {"tool_id", "name", "summary"|"result", ...}. Every other event
+ # type (reasoning.available, subagent.*, tool.generating, todo updates) is
+ # deliberately not rendered - an initial pane-rendering scope, not a
+-# wire-protocol gap.
++# wire-protocol gap. message.start itself carries no payload but now prints
++# a bare "[working...]" line (see handle_event) so a slow turn - one whose
++# first message.delta/tool.start is many seconds out - reads as in flight
++# rather than dead; this is the only rendering this bridge adds beyond the
++# real event stream.
+ import importlib.util
+ import os
+ import re
+@@ -472,6 +476,15 @@ class Bridge:
+         if etype == 'message.start':
+             self.busy = True
+             self._turn_text_buf = ''
++            # Visibility fix: the pane is a scrolling event-rendered log with
++            # no composer/spinner, so a real turn that takes many seconds
++            # before its first message.delta or tool.start (no vendor
++            # "typing" signal exists on this transport) rendered nothing at
++            # all, indistinguishable from a dead session. message.start
++            # already fires as soon as the server accepts the turn, so this
++            # is the earliest point-in-time signal available without adding
++            # a new polling loop.
++            print('[working...]', flush=True)
+         elif etype == 'message.delta':
+             text = data.get('text', '')
+             if text:
+diff --git a/docs/verification/hermes.md b/docs/verification/hermes.md
+index 37b1045..1dd1097 100644
+--- a/docs/verification/hermes.md
++++ b/docs/verification/hermes.md
+@@ -498,3 +498,32 @@ Pinned by `tests/fm-hermes-ws.test.sh`'s `test_dead_connection_fails_closed_not_
+ ### Honest status: root cause not confirmed by reproduction
+ 
+ This is a real, serious, and now-fixed robustness gap, and it is consistent with the captain's report (a connection gone stale in the time between dispatch and typing would previously crash the bridge with no visible pane signal before the captain even started typing, or mid-delivery of his line, matching "no response, no visible change"). It is **not**, however, a confirmed match: no reproduction attempt - through any path reachable via the Herdr pane API - ever produced the captain's exact failure, with or without this defect present. The pane-focus/GUI-routing hypothesis above also remains untested by anything but indirect evidence. Anyone re-investigating a future recurrence of "typed a line, pressed Enter, nothing happened" on `hermes-vps` should check first whether the pane crashed to a bare shell prompt (this defect's old signature, now fixed) versus whether the pane is still showing the bridge's own idle state (points back toward the pane-focus/GUI-routing gap this investigation could not rule in or out).
++
++A follow-up re-test found a THIRD explanation, distinct from both hypotheses above: a genuinely working but slow turn rendered nothing at all in the pane while it was in flight, indistinguishable from either failure mode above by a captain watching the pane - see "hermes-vps: working indicator for a slow in-flight turn" below.
++
++## hermes-vps: working indicator for a slow in-flight turn
++
++Fixed 2026-09-14, following a captain re-test of the pane after the fix above: a line typed directly into a live `hermes-vps` pane eventually got a real response, but the pane showed nothing at all while it was in flight - only the eventual content, with no way to tell a slow-but-working turn apart from a dead one in the meantime. This is a third, independent explanation alongside the two in the section above, not a contradiction of either: the pane genuinely had no busy/spinner/composer state of any kind (`../../.agents/skills/harness-adapters/references/harness/hermes-vps.md`'s "Composer" row already documented this as a known gap before this fix).
++
++**Fix**: `bin/fm-hermes-vps-bridge.py`'s `handle_event` now prints a bare `[working...]` line on every `message.start` event - the earliest point-in-time signal the existing event stream offers, so no new polling loop was added. `message.start` already fired unconditionally at the top of every turn (used internally to set `self.busy = True` and reset the per-turn text buffer) but was never itself rendered before this fix; only `message.delta`/`tool.start`/`message.complete`/`error` were.
++
++**Offline verification (no VPS credentials in this task's worktree)**: `tests/fixtures/fm-hermes-ws-stub-server.py` gained a `STUB_DELAY:<seconds>:<text>` `prompt.submit` trigger that sleeps server-side, real wall-clock time, between sending `message.start` and sending the delayed `message.delta`/`message.complete` - a stand-in for genuine slow-turn latency (e.g. a `sleep`-based VPS command) without slowing the suite down for real. `tests/fm-hermes-vps-bridge.test.sh`'s `test_bridge_renders_working_indicator_before_slow_response` drives the real bridge subprocess against this over a real loopback socket (never a background-`cat`-drained log file - see the test's own comment on why that specific technique is unsound for a timing assertion) and asserts, from the bridge's own stdout, that `[working...]` renders immediately after the delivery-confirmation bullet and that at least 2 of the stub's 4 configured delay seconds elapse before the delayed content itself renders:
++
++```
++$ bash tests/fm-hermes-vps-bridge.test.sh
++...
++ok - working indicator: [working...] renders immediately on message.start and nothing else renders until the delayed response lands
++```
++
++Also confirmed directly against the real bridge subprocess and stub, outside the test harness, with wall-clock timestamps on every rendered line (macOS arm64, Python 3.13.12):
++
++```
++[0.16s] READY: Hermes VPS bridge ready. session_id=test-session-1
++[0.16s] LINE: ● STUB_DELAY:4:slow reply landed
++[0.16s] LINE: [working...]
++[4.19s] LINE: slow reply landed
++[4.20s] LINE: [turn complete]
++```
++
++`[working...]` rendered within 0.02s of the delivery bullet, and the delayed content landed only once the stub's real 4-second sleep elapsed - proving the indicator is driven by `message.start` itself, not by anything that could coincide with the delayed content.
++No VPS credentials exist in a dispatched task's own worktree (only in the running firstmate home's gitignored `.env`, per `bin/fm-hermes-ws-env-lib.sh`), so this fix has not yet been re-confirmed against the real VPS; re-run against a live `hermes-vps` pane submitting a genuinely slow command (e.g. `sleep 10`) the next time one is available, and update this section with that result.
+diff --git a/tests/fixtures/fm-hermes-ws-stub-server.py b/tests/fixtures/fm-hermes-ws-stub-server.py
+index f6f6cac..85755d8 100755
+--- a/tests/fixtures/fm-hermes-ws-stub-server.py
++++ b/tests/fixtures/fm-hermes-ws-stub-server.py
+@@ -30,6 +30,7 @@ import secrets
+ import struct
+ import sys
+ import threading
++import time
+ 
+ _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+ PORT, USERNAME, PASSWORD, STATIC_TOKEN = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+@@ -232,6 +233,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
+                              'params': {'type': 'error', 'payload': {'message': 'stub turn error'}}}))
+                     elif 'TRIGGER_HANG' in text:
+                         pass  # never send message.complete/error: the client must time out
++                    elif text.startswith('STUB_DELAY:'):
++                        # Stands in for a real slow turn (e.g. a sleep-based
++                        # VPS command) without actually sleeping the test
++                        # suite for real VPS-scale latency: sleeps a small,
++                        # test-controlled number of seconds AFTER
++                        # message.start (already sent above) and BEFORE any
++                        # further event, so a caller can assert its own
++                        # working/busy indicator renders promptly on
++                        # message.start and nothing else renders until this
++                        # delay elapses. Payload shape:
++                        # "STUB_DELAY:<seconds>:<echoed text>".
++                        _, _, rest = text.partition(':')
++                        delay_str, _, echoed = rest.partition(':')
++                        time.sleep(float(delay_str))
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'message.delta', 'payload': {'text': echoed}}}))
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'message.complete',
++                                        'payload': {'text': echoed, 'status': 'complete'}}}))
+                     elif text.startswith('STUB_ECHO:'):
+                         # Lets a test control the turn's real content, streamed as
+                         # a delta exactly like the real server does (embedded
+diff --git a/tests/fm-hermes-vps-bridge.test.sh b/tests/fm-hermes-vps-bridge.test.sh
+index d056377..673693a 100644
+--- a/tests/fm-hermes-vps-bridge.test.sh
++++ b/tests/fm-hermes-vps-bridge.test.sh
+@@ -45,6 +45,14 @@
+ #      the remote agent could never act on. The stub server's STUB_ECHO:
+ #      prefix (tests/fixtures/fm-hermes-ws-stub-server.py) is what lets these
+ #      tests control message.complete's own final text over the real socket.
++#   9. Working indicator (the fix for a genuinely working but slow turn
++#      being indistinguishable from a dead one, since the pane has no
++#      composer/spinner): a bare "[working...]" line renders promptly on
++#      message.start, before any delta/tool content, and nothing else
++#      renders until the turn's real response lands - proven with the
++#      stub's STUB_DELAY: prefix, which sleeps server-side between
++#      message.start and the rest of the turn to stand in for real slow
++#      latency (e.g. a sleep-based VPS command) without slowing this suite.
+ set -u
+ 
+ # shellcheck source=tests/lib.sh
+@@ -762,6 +770,90 @@ test_bridge_suppresses_inbox_doorbell_line() {
+   pass "the inbox doorbell line is recognized and swallowed locally, never forwarded as chat text the remote agent cannot act on"
+ }
+ 
++# --- 9. working indicator on a slow turn -------------------------------------
++
++test_bridge_renders_working_indicator_before_slow_response() {
++  # Captain-reported gap: the pane is a scrolling event-rendered log with no
++  # composer/spinner (references/harness/hermes-vps.md's "Composer" row), so
++  # a genuinely working but slow turn - real VPS latency, or e.g. a
++  # sleep-based command - rendered NOTHING at all until it eventually
++  # completed, indistinguishable from a dead session. STUB_DELAY stands in
++  # for that real latency without slowing this suite down for real: it
++  # sleeps server-side AFTER message.start (already sent unconditionally by
++  # the stub) and BEFORE any further event.
++  #
++  # Reads directly off the bridge's own stdout fifo (like
++  # test_bridge_lifecycle_over_real_socket), never a background `cat`
++  # redirected into a file: cat's stdout is block-buffered once redirected
++  # to a regular file, so a few-byte "[working...]" line can sit in that
++  # buffer unflushed for an arbitrary time - exactly the kind of
++  # test-only timing illusion this test exists to rule out for real.
++  local port rpc_log line
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc-working.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  local in_fifo="$TMP_ROOT/bridge-working.in" out_fifo="$TMP_ROOT/bridge-working.out"
++  rm -f "$in_fifo" "$out_fifo"
++  mkfifo "$in_fifo" "$out_fifo"
++  exec 3<>"$in_fifo"
++  exec 4<>"$out_fifo"
++  env -i PATH="$PATH" \
++    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
++    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
++    python3 "$BRIDGE" --cwd /tmp/some-worktree \
++      <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-working.err" &
++  BRIDGE_PID=$!
++  line=$(read_line_timeout 4 10)
++  case "$line" in
++    'Hermes VPS bridge ready.'*) ;;
++    *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-working.err" 2>/dev/null))" ;;
++  esac
++
++  printf 'STUB_DELAY:4:slow reply landed\n' >&3
++  line=$(read_line_timeout 4 10)
++  case "$line" in
++    "● STUB_DELAY:4:slow reply landed") ;;
++    *) fail "expected the delivery-confirmation bullet for the submitted line, got: $line" ;;
++  esac
++
++  line=$(read_line_timeout 4 10)
++  [ "$line" = '[working...]' ] \
++    || fail "expected a [working...] indicator to render promptly on message.start, got: $line"
++  local t_indicator
++  t_indicator=$(date +%s)
++
++  # A bounded "nothing arrives within N seconds" race is inherently
++  # flaky under real scheduling jitter (a loaded machine can stall the
++  # reader briefly with no bearing on whether the SERVER actually
++  # delayed). Measuring elapsed wall time between the indicator and the
++  # delayed content instead proves the same fact without racing against
++  # it: a slow reader only INCREASES the measured gap, it can never
++  # shrink it, so this assertion cannot spuriously fail under load the
++  # way a tight timeout-races-content check can.
++  line=$(read_line_timeout 4 15)
++  [ "$line" = 'slow reply landed' ] \
++    || fail "expected the delayed content once the stub's delay elapsed, got: $line"
++  local t_content elapsed
++  t_content=$(date +%s)
++  elapsed=$((t_content - t_indicator))
++  [ "$elapsed" -ge 2 ] \
++    || fail "expected at least 2s between [working...] and the delayed content (stub delay is 4s), only $elapsed s elapsed - the indicator likely rendered late instead of promptly on message.start"
++
++  line=$(read_line_timeout 4 10)
++  [ "$line" = '[turn complete]' ] \
++    || fail "expected a [turn complete] marker once the delayed response landed, got: $line"
++
++  printf '/exit\n' >&3
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
++  BRIDGE_PID=""
++  exec 3>&- 4>&-
++  stop_stub
++  pass "working indicator: [working...] renders immediately on message.start and nothing else renders until the delayed response lands"
++}
++
+ test_bridge_identity_functions
+ test_agent_process_classify_recognizes_bridge
+ test_busy_hermes_vps_agent_running_parses_status
+@@ -783,3 +875,5 @@ test_bridge_preserves_inbox_order_on_forward_failure
+ stop_bridge
+ test_bridge_suppresses_inbox_doorbell_line
+ stop_bridge
++test_bridge_renders_working_indicator_before_slow_response
++stop_bridge

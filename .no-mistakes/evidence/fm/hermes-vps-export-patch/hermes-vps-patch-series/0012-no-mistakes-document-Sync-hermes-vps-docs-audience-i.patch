@@ -1,0 +1,210 @@
+From 0cda4d389c1a82bb30d166672d156ce99241ef41 Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Sun, 13 Sep 2026 22:24:23 -0500
+Subject: [PATCH 12/24] no-mistakes(document): Sync hermes-vps docs: audience
+ inventory, missing-brief and SIGHUP invariants
+
+---
+ .../references/harness/hermes-vps.md          |   3 +-
+ docs/documentation-audiences.json             |   4 +
+ docs/verification/hermes.md                   |   6 +-
+ tests/fm-hermes-vps-bridge.test.sh            | 123 ++++++++++++++++++
+ 4 files changed, 132 insertions(+), 4 deletions(-)
+
+diff --git a/.agents/skills/harness-adapters/references/harness/hermes-vps.md b/.agents/skills/harness-adapters/references/harness/hermes-vps.md
+index c668f8d..0447aef 100644
+--- a/.agents/skills/harness-adapters/references/harness/hermes-vps.md
++++ b/.agents/skills/harness-adapters/references/harness/hermes-vps.md
+@@ -19,7 +19,7 @@ The pane's foreground process is always this bridge (a python script), never the
+ | Credentials | `FM_HERMES_WS_BASE_URL` plus either `FM_HERMES_WS_TOKEN` or `FM_HERMES_WS_USER`/`FM_HERMES_WS_PASS`, resolved from `$FM_HOME/.env` by `../../../../bin/fm-hermes-ws-env-lib.sh` (shared with `fm-hermes-ws.sh`) - never in a launch command, brief, or status line. |
+ | Models | None. `session.create`'s own RPC signature carries no model or effort param, so both axes are record-and-omit in task metadata, same contract as bare hermes/kimi. |
+ | Busy state | Live and structural, not rendered: `../../../../bin/fm-busy-lib.sh`'s `fm_busy_hermes_vps_agent_running` pulls `session.status`'s own literal `Agent Running: Yes`/`Agent Running: No` line over a fresh RPC call each time it is asked - a strictly better signal than bare hermes's rendered-tail fallback, at the cost of one WS round trip (including gated-mode auth) per poll. |
+-| Exit command | `/exit`, delivered the ordinary text-submit way. The bridge recognizes this exact line locally, calls the real `session.close` RPC to retire the server-side session, then exits the local process - it is never forwarded to the model. |
++| Exit command | `/exit`, delivered the ordinary text-submit way. The bridge recognizes this exact line locally, calls the real `session.close` RPC to retire the server-side session, then exits the local process - it is never forwarded to the model. The bridge traps SIGTERM, SIGINT, and SIGHUP identically and runs this same `session.close` shutdown on any of them, not just on `/exit` - a post-readiness spawn failure that tears the pane down (`hermes_vps_spawn_fail`'s `tmux kill-window`, which delivers SIGHUP) still closes the VPS session instead of orphaning it; `tests/fm-hermes-vps-bridge.test.sh`'s `test_bridge_closes_session_on_sighup` pins this. |
+ | Interrupt | **A real, verified RPC** (`session.interrupt`), unlike bare hermes's "no safe key exists" gap. `../../../../bin/fm-control-lib.sh`'s `fm_control_interrupt_via_text` names the literal line `/interrupt`, delivered through the ordinary text-submit pane mechanic (not a named key - this transport has no composer for `Escape`/`Ctrl+C` to act on); the bridge recognizes it locally and calls the RPC instead of forwarding it as chat. `fm-control.sh interrupt\|exit\|relaunch` all work normally. |
+ | Skill invocation | Not applicable - crewmate/scout only. |
+ | Autonomy | Whatever the VPS's own Hermes deployment is configured with; the bridge passes no autonomy flag of its own. |
+@@ -48,6 +48,7 @@ A VPS-hosted Hermes session cannot: it has no access to this machine's filesyste
+ So the bridge - which DOES run locally - special-cases exactly the FIRST line it receives: if it matches that literal pointer shape and the path is locally readable, the bridge reads the file itself and forwards the file's own CONTENT to the VPS session via `prompt.submit`, instead of the sentence about it.
+ Every later line (an ordinary steer) is forwarded verbatim, unexamined.
+ Delivery confirmation mirrors bare hermes's own convention: the bridge echoes every line it forwards with a leading `●` (the same bullet hermes itself prepends to an accepted, submitted message), so `hermes_vps_wait_for_delivery` can grep this pane's plain-text capture for that literal marker exactly like bare hermes's gate does.
++If the pointer's path is NOT locally readable, the bridge never echoes that line at all - it prints a local `brief not found` diagnostic and forwards nothing, so the delivery gate's marker grep finds nothing and `hermes_vps_spawn_fail` correctly times the launch out instead of a false CONFIRMED; `tests/fm-hermes-vps-bridge.test.sh`'s `test_bridge_missing_brief_never_reports_false_delivery` pins this.
+ 
+ ## Rendering
+ 
+diff --git a/docs/documentation-audiences.json b/docs/documentation-audiences.json
+index c5c89ed..aa4f7ec 100644
+--- a/docs/documentation-audiences.json
++++ b/docs/documentation-audiences.json
+@@ -204,6 +204,10 @@
+       "path": ".agents/skills/harness-adapters/references/harness/hermes.md",
+       "audience": "agent-runtime"
+     },
++    {
++      "path": ".agents/skills/harness-adapters/references/harness/hermes-vps.md",
++      "audience": "agent-runtime"
++    },
+     {
+       "path": ".agents/skills/harness-adapters/references/harness/kimi.md",
+       "audience": "agent-runtime"
+diff --git a/docs/verification/hermes.md b/docs/verification/hermes.md
+index 9bbbb4f..ad80061 100644
+--- a/docs/verification/hermes.md
++++ b/docs/verification/hermes.md
+@@ -364,10 +364,9 @@ Two real, load-bearing bugs were found and fixed only by driving the bridge agai
+ 
+ ### Brief delivery: content, not a pointer
+ 
+-Every other launch-then-send harness (kimi/rovo/hermes) receives `Read the brief at <path> and follow it exactly.` and opens that path itself.
+-A VPS-hosted Hermes session cannot: it runs on a different machine with no access to this one's filesystem.
+-The bridge - which does run locally - special-cases exactly the first line it receives matching that shape: it reads the file itself and forwards its CONTENT via `prompt.submit`, echoing the original pointer line with a leading `●` (matching bare hermes's own accepted-message convention) so `bin/fm-spawn.sh`'s delivery gate can grep for the identical marker.
++`../../.agents/skills/harness-adapters/references/harness/hermes-vps.md`'s "Brief delivery" section owns the mechanism, including the missing-brief-path invariant added after review.
+ Live-verified: `bin/fm-spawn.sh hvfinal <project> --scout --harness hermes-vps` against a real VPS session correctly delivered a brief whose `## Captain's intent` instructed `pwd && echo HERMES_VPS_LIVE_VERIFY_MARKER`; the VPS agent ran it via its own `terminal` tool and replied with `/` and `HERMES_VPS_LIVE_VERIFY_MARKER` exactly.
++The missing-brief-path fix described there is pinned by a portable regression in `tests/fm-hermes-vps-bridge.test.sh` (`test_bridge_missing_brief_never_reports_false_delivery`) rather than by further live-VPS evidence, since it is a local-process behavior that does not depend on the real gateway.
+ 
+ ### Fleet wiring landed
+ 
+@@ -405,6 +404,7 @@ fm-hermes-ws.py: session.status: {'code': 4001, 'message': 'session not found'}
+ ```
+ 
+ Every VPS session this task created (via the bridge directly, via `fm-spawn.sh`, and via ad hoc `fm-hermes-ws.sh` probes) was independently confirmed closed or already-gone by the end of the task - `session.close`/`session.interrupt`/`session.status` against a stale id consistently answered `session not found` rather than ever leaving a live orphan.
++That guarantee did not originally extend to a post-readiness spawn failure, since `hermes_vps_spawn_fail`'s pane teardown delivers SIGHUP rather than SIGTERM/SIGINT and the bridge did not yet trap it; the bridge now traps SIGHUP identically (`../../.agents/skills/harness-adapters/references/harness/hermes-vps.md`'s "Exit command" row owns the current fact), pinned by `tests/fm-hermes-vps-bridge.test.sh`'s `test_bridge_closes_session_on_sighup`.
+ 
+ ### Herdr pane visibility
+ 
+diff --git a/tests/fm-hermes-vps-bridge.test.sh b/tests/fm-hermes-vps-bridge.test.sh
+index b93742c..9d8a8c2 100644
+--- a/tests/fm-hermes-vps-bridge.test.sh
++++ b/tests/fm-hermes-vps-bridge.test.sh
+@@ -301,8 +301,131 @@ Do the real work."
+   pass "bridge lifecycle: readiness, brief-content delivery, event rendering, /interrupt, and /exit all round-trip over a real socket"
+ }
+ 
++test_bridge_missing_brief_never_reports_false_delivery() {
++  # Regression for the false-delivery finding: when the brief pointer names a
++  # path that does not exist, the bridge must NOT echo the pointer sentence
++  # back with a leading bullet, because bin/fm-spawn.sh's
++  # hermes_vps_delivery_is_confirmed (bin/fm-spawn.sh:3424) treats any pane
++  # line matching `^●[[:space:]]*Read the brief at` as proof the brief was
++  # delivered. Echoing it here would mark the task CONFIRMED/dispatched while
++  # the VPS agent never received real brief content, so the real delivery
++  # gate must instead see nothing and eventually time out.
++  local port rpc_log missing_path line
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc-missing-brief.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  missing_path="$TMP_ROOT/does-not-exist-$$.md"
++  rm -f "$missing_path"
++
++  local in_fifo out_fifo
++  in_fifo="$TMP_ROOT/bridge-missing.in"
++  out_fifo="$TMP_ROOT/bridge-missing.out"
++  rm -f "$in_fifo" "$out_fifo"
++  mkfifo "$in_fifo" "$out_fifo"
++  exec 3<>"$in_fifo"
++  exec 4<>"$out_fifo"
++
++  env -i PATH="$PATH" \
++    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
++    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
++    python3 "$BRIDGE" --cwd /tmp/some-worktree <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-missing.err" &
++  BRIDGE_PID=$!
++
++  line=$(read_line_timeout 4 10)
++  case "$line" in
++    'Hermes VPS bridge ready. session_id='*) ;;
++    *) fail "expected the readiness banner, got: $line" ;;
++  esac
++
++  printf 'Read the brief at %s and follow it exactly.\n' "$missing_path" >&3
++  line=$(read_line_timeout 4 10)
++  case "$line" in
++    '●'*) fail "the bridge echoed a bullet-prefixed line for an unreadable brief, which fm-spawn.sh's hermes_vps_delivery_is_confirmed would treat as CONFIRMED delivery: $line" ;;
++    *'brief not found'*) ;;
++    *) fail "expected a 'brief not found' diagnostic for a missing brief path, got: $line" ;;
++  esac
++
++  if grep -q '"method": "prompt.submit"' "$rpc_log" 2>/dev/null; then
++    fail "the bridge sent a real prompt.submit RPC for a brief path that does not exist"
++  fi
++
++  printf '/exit\n' >&3
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do
++    sleep 0.1
++    waited=$((waited + 1))
++  done
++  kill -0 "$BRIDGE_PID" 2>/dev/null && fail "the bridge process did not exit after /exit"
++  BRIDGE_PID=""
++  exec 3>&- 4>&-
++  stop_stub
++
++  pass "missing brief: the bridge reports a diagnostic instead of echoing the delivery-confirmation bullet, and never forwards the pointer sentence as a submitted message"
++}
++
++test_bridge_closes_session_on_sighup() {
++  # Regression for the SIGHUP-leaks-session finding: bin/fm-spawn.sh's
++  # hermes_vps_spawn_fail (bin/fm-spawn.sh:~3440) tears the tmux window down
++  # via rovo_endpoint_cleanup on any post-readiness launch failure, and
++  # bin/backends/tmux.sh's `tmux kill-window` delivers SIGHUP to the bridge's
++  # foreground process group. Before this fix, Python's default SIGHUP
++  # disposition killed the process immediately, bypassing bridge.shutdown()
++  # (and its real session.close RPC) entirely and orphaning a live VPS
++  # session. This proves SIGHUP now runs the same clean-shutdown path SIGTERM
++  # already used.
++  local port rpc_log line
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc-sighup.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  local in_fifo out_fifo
++  in_fifo="$TMP_ROOT/bridge-sighup.in"
++  out_fifo="$TMP_ROOT/bridge-sighup.out"
++  rm -f "$in_fifo" "$out_fifo"
++  mkfifo "$in_fifo" "$out_fifo"
++  exec 3<>"$in_fifo"
++  exec 4<>"$out_fifo"
++
++  env -i PATH="$PATH" \
++    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
++    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
++    python3 "$BRIDGE" --cwd /tmp/some-worktree <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-sighup.err" &
++  BRIDGE_PID=$!
++
++  line=$(read_line_timeout 4 10)
++  case "$line" in
++    'Hermes VPS bridge ready. session_id='*) ;;
++    *) fail "expected the readiness banner, got: $line" ;;
++  esac
++
++  kill -HUP "$BRIDGE_PID"
++
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do
++    sleep 0.1
++    waited=$((waited + 1))
++  done
++  kill -0 "$BRIDGE_PID" 2>/dev/null && fail "the bridge process did not exit after SIGHUP"
++  BRIDGE_PID=""
++  exec 3>&- 4>&-
++
++  if ! grep -q '"method": "session.close"' "$rpc_log" 2>/dev/null; then
++    fail "the bridge never sent a real session.close RPC when killed with SIGHUP"
++  fi
++
++  stop_stub
++  pass "SIGHUP: the bridge runs the same clean-shutdown path as SIGTERM, sending a real session.close RPC before exiting"
++}
++
+ test_bridge_identity_functions
+ test_agent_process_classify_recognizes_bridge
+ test_busy_hermes_vps_agent_running_parses_status
+ test_bridge_lifecycle_over_real_socket
+ stop_bridge
++test_bridge_missing_brief_never_reports_false_delivery
++stop_bridge
++test_bridge_closes_session_on_sighup
++stop_bridge

@@ -1,0 +1,232 @@
+From e6f23baf5edb2681857f3c4ee4da3a5705aec32f Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Mon, 14 Sep 2026 13:04:16 -0500
+Subject: [PATCH 18/24] Fix uncaught socket exceptions that could crash the
+ hermes-vps bridge silently
+
+_WSSocket wrote/read the raw socket directly with no exception
+translation, so a real connection failure (dropped VPS connectivity,
+a reset, an SSL error) raised an unwrapped OSError instead of
+HermesWsError. Every caller up the stack (rpc, Bridge._forward,
+Bridge.run's main loop, main()) only ever handled HermesWsError, so
+the exception crashed the whole bridge process uncaught - no
+write_status_line() call, no blocked: signal, exactly the silent
+failure mode this bridge exists to prevent.
+
+Route every raw socket write/read through new _send()/_recv() helpers
+that translate OSError to HermesWsError, matching what every caller
+already expected. Live-verified the crash against a refused
+connection before the fix and confirmed the new regression test
+catches it.
+
+Investigated after a captain report that typing directly into a live
+hermes-vps pane and pressing Enter produced no response. Extensive
+falsification testing (character-by-character keystroke delivery, a
+literal embedded CR with no LF, bulk paste + separate Enter) could not
+reproduce that exact failure through any interactive path reachable
+via the pane API - all round-tripped correctly through the live VPS.
+This fix addresses a real, independently-found defect consistent with
+the report (a stale connection crashing the bridge with no visible
+pane signal), but the root cause of the captain's specific report is
+not confirmed; see docs/verification/hermes.md for the full
+investigation trail and what remains open.
+---
+ bin/fm-hermes-ws.py         | 53 ++++++++++++++++++++++++++-----------
+ docs/verification/hermes.md | 30 +++++++++++++++++++++
+ tests/fm-hermes-ws.test.sh  | 28 ++++++++++++++++++++
+ 3 files changed, 96 insertions(+), 15 deletions(-)
+
+diff --git a/bin/fm-hermes-ws.py b/bin/fm-hermes-ws.py
+index e2d6fcb..9d60354 100755
+--- a/bin/fm-hermes-ws.py
++++ b/bin/fm-hermes-ws.py
+@@ -229,11 +229,14 @@ class _WSSocket:
+         use_tls = parts.scheme in ('https', 'wss')
+         host = parts.hostname
+         port = parts.port or (443 if use_tls else 80)
+-        raw = socket.create_connection((host, port), timeout=timeout)
+-        if use_tls:
+-            ctx = ssl.create_default_context()
+-            raw = ctx.wrap_socket(raw, server_hostname=host)
+-        raw.settimeout(timeout)
++        try:
++            raw = socket.create_connection((host, port), timeout=timeout)
++            if use_tls:
++                ctx = ssl.create_default_context()
++                raw = ctx.wrap_socket(raw, server_hostname=host)
++            raw.settimeout(timeout)
++        except OSError as exc:
++            raise HermesWsError(f'connection error while connecting: {exc}') from exc
+         self._sock = raw
+         self._buf = b''
+         key = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
+@@ -250,7 +253,7 @@ class _WSSocket:
+             f'Origin: {origin}',
+             '', '',
+         ]
+-        self._sock.sendall('\r\n'.join(request_lines).encode('ascii'))
++        self._send('\r\n'.join(request_lines).encode('ascii'))
+         status_line, headers = self._read_http_response_head()
+         if ' 101 ' not in f' {status_line} ':
+             raise HermesWsError(f'WebSocket upgrade refused: {status_line.strip()}')
+@@ -259,9 +262,32 @@ class _WSSocket:
+         if accept != expected:
+             raise HermesWsError('WebSocket upgrade response failed the Sec-WebSocket-Accept check')
+ 
++    def _send(self, data):
++        """Every raw socket write funnels through here so a dead or reset
++        connection (BrokenPipeError, ConnectionResetError, a bare
++        socket.timeout, an ssl.SSLError - none of which are HermesWsError)
++        can never escape as an unwrapped exception. Uncaught, one of those
++        would propagate straight through rpc() -> Bridge._forward() (which
++        only catches HermesWsError) and out of Bridge.run()'s main loop,
++        which has no handler around handle_input_line() either - crashing
++        the whole bridge process with a bare traceback and, critically, no
++        write_status_line() call, silently ending the crewmate exactly the
++        way this bridge exists to prevent (module docstring's "Status/
++        report/inbox protocol")."""
++        try:
++            self._sock.sendall(data)
++        except OSError as exc:
++            raise HermesWsError(f'connection error while sending: {exc}') from exc
++
++    def _recv(self, nbytes):
++        try:
++            return self._sock.recv(nbytes)
++        except OSError as exc:
++            raise HermesWsError(f'connection error while receiving: {exc}') from exc
++
+     def _recv_exact(self, n):
+         while len(self._buf) < n:
+-            chunk = self._sock.recv(max(4096, n - len(self._buf)))
++            chunk = self._recv(max(4096, n - len(self._buf)))
+             if not chunk:
+                 raise HermesWsError('connection closed before the expected bytes arrived')
+             self._buf += chunk
+@@ -271,7 +297,7 @@ class _WSSocket:
+     def _read_http_response_head(self):
+         head = b''
+         while b'\r\n\r\n' not in head:
+-            chunk = self._sock.recv(4096)
++            chunk = self._recv(4096)
+             if not chunk:
+                 raise HermesWsError('connection closed during the HTTP upgrade handshake')
+             head += chunk
+@@ -302,7 +328,7 @@ class _WSSocket:
+         mask = secrets.token_bytes(4)
+         header += mask
+         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+-        self._sock.sendall(bytes(header) + masked)
++        self._send(bytes(header) + masked)
+ 
+     def _recv_frame(self):
+         b0, b1 = self._recv_exact(2)
+@@ -331,10 +357,7 @@ class _WSSocket:
+             if remaining <= 0:
+                 raise HermesWsError('timed out waiting for a WebSocket message')
+             self._sock.settimeout(remaining)
+-            try:
+-                fin, opcode, payload = self._recv_frame()
+-            except socket.timeout as exc:
+-                raise HermesWsError('timed out waiting for a WebSocket message') from exc
++            fin, opcode, payload = self._recv_frame()
+             if opcode == _OPCODE_PING:
+                 self._send_control(_OPCODE_PONG, payload)
+                 continue
+@@ -356,12 +379,12 @@ class _WSSocket:
+         mask = secrets.token_bytes(4)
+         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+         header = bytes([0x80 | opcode, 0x80 | len(payload)]) + mask
+-        self._sock.sendall(header + masked)
++        self._send(header + masked)
+ 
+     def close(self):
+         try:
+             self._send_control(_OPCODE_CLOSE, b'')
+-        except OSError:
++        except HermesWsError:
+             pass
+         try:
+             self._sock.close()
+diff --git a/docs/verification/hermes.md b/docs/verification/hermes.md
+index 8eb6bfc..67963c2 100644
+--- a/docs/verification/hermes.md
++++ b/docs/verification/hermes.md
+@@ -468,3 +468,33 @@ The opening `working: starting verification` line is conspicuously ABSENT from t
+ Status, report, and steering are now solved.
+ `session.create`'s `cwd` still is not honored, so a `hermes-vps` crewmate still cannot read or edit a task's local git worktree, run `git`, or drive the no-mistakes pipeline - only VPS-local sandbox work and this fleet-visibility wiring are proven use cases.
+ Do not dispatch a ship task onto it that needs local repo access; `hermes-vps.md`'s "Known limitation" owns this for future dispatch decisions.
++
++## hermes-vps: typed pane input investigation - one real defect found and fixed, root cause not confirmed
++
++Investigated 2026-09-14 after a captain report: typed a line directly into a live `hermes-vps` pane and pressed Enter, and observed no response and no visible change.
++
++### Hypotheses tested and falsified by direct live reproduction
++
++Against a real, already-running `hermes-vps` bridge pane (`hermes-vps-live-verify-2`, the same pane type and session shape the captain used), every interactive-input path constructible through Herdr's pane API succeeded with a real VPS round trip:
++
++1. **Bulk paste (`herdr pane send-text`) with no trailing Enter, then a separate `herdr pane send-keys Enter`.** Works (this was Firstmate's own earlier partial repro).
++2. **Individual per-character key events (`herdr pane send-keys` one letter at a time) ending in a real logical `Enter` key event** - the closest reproduction of physical typing available without a physical keyboard. Works, with a real completed VPS turn (`echo QQQENTERDIVERGENCEQQQ` round-tripped correctly).
++3. **A literal embedded carriage return (`\r`, no `\n`) sent as part of one `send-text` payload, with no separate Enter call at all** - the direct test of a `\r`-vs-`\n` line-ending mismatch theory. Works; the VPS agent itself confirmed the text "arrived intact, no mangling, no stray CR artifacts."
++
++These three results directly falsify "the bridge's `select()`/`os.read()`/line-splitting logic" (module docstring's own suspect) as an unqualified root cause: every keystroke-pacing and line-termination shape reachable through Herdr's pane input primitives is handled correctly by the code as shipped.
++
++The "Herdr's own key routing for a composer-less foreground process" theory was also weakened, not strengthened: `bin/backends/herdr.sh`/`docs/herdr-backend.md` confirm every crewmate pane on every harness (composer or not) is spawned with `--no-focus`, so lack of auto-focus is universal, not hermes-vps-specific - and the SAME composer-less `hermes-vps-live-verify-2` pane shows an earlier real captain-typed exchange (`is it going to work?` / `pwd`) that worked, in this same episode. A pane-focus explanation cannot be ruled out (real GUI keyboard/mouse focus was not, and could not be, exercised from this investigation), but it is not the well-evidenced, falsification-surviving explanation the code-level hypotheses were.
++
++### Real defect found by reading the code, not by reproduction: unwrapped socket exceptions can crash the bridge uncaught
++
++`bin/fm-hermes-ws.py`'s `_WSSocket` wrote and read the raw socket directly (`self._sock.sendall(...)`, `self._sock.recv(...)`) in `__init__`, `send_text`, `_send_control`, `_recv_exact`, and `_read_http_response_head`, with no exception translation. A genuine connection failure - dropped VPS connectivity, a laptop sleep/wake, a network roam, anything that raises a raw `OSError` subclass (`ConnectionResetError`, `BrokenPipeError`, `ssl.SSLError`, a bare `socket.timeout`) rather than the module's own `HermesWsError` - propagated straight through `HermesWsSession.rpc()` (no wrapping) into `Bridge._forward()`'s `except HermesWsError` (which does not match a raw `OSError`), through `Bridge.run()`'s main loop (no handler around `handle_input_line()`), and out of `main()` (`except HermesWsError` only) as an **uncaught Python exception** - crashing the whole bridge process with a bare traceback, no `write_status_line()` call, and no `blocked:` signal. This is exactly the silent-failure mode the bridge's own status/report protocol exists to prevent (see "hermes-vps: local status/report/steering protocol" above).
++
++Live-verified with a real dead connection: `bin/fm-hermes-ws.sh create <cwd>` against a refused port crashed with an uncaught `ConnectionRefusedError` traceback before the fix, confirmed by directly reverting the fix and re-running the CLI.
++
++**Fix**: `_WSSocket` now routes every raw socket write through `_send()` and every raw socket read through `_recv()`, both of which catch `OSError` (covers `ConnectionResetError`, `BrokenPipeError`, `ssl.SSLError`, and `socket.timeout`, an `OSError` subclass since Python 3.3) and re-raise as `HermesWsError`; the initial `socket.create_connection`/`ctx.wrap_socket` in `__init__` are wrapped the same way. Every existing caller (`HermesWsSession.rpc()`, `Bridge._forward()`, `Bridge.reconnect()`, `main()`) already only ever handled `HermesWsError`, so no caller-side change was needed - the fix closes the gap between what those handlers expected and what the raw socket layer could actually raise.
++
++Pinned by `tests/fm-hermes-ws.test.sh`'s `test_dead_connection_fails_closed_not_uncaught`: a refused connection now fails closed through the same `fm-hermes-ws.py: ...` message every other failure mode already used, never an uncaught traceback. Confirmed live that this test fails (reproduces the uncaught traceback) against the pre-fix code and passes against the fix.
++
++### Honest status: root cause not confirmed by reproduction
++
++This is a real, serious, and now-fixed robustness gap, and it is consistent with the captain's report (a connection gone stale in the time between dispatch and typing would previously crash the bridge with no visible pane signal before the captain even started typing, or mid-delivery of his line, matching "no response, no visible change"). It is **not**, however, a confirmed match: no reproduction attempt - through any path reachable via the Herdr pane API - ever produced the captain's exact failure, with or without this defect present. The pane-focus/GUI-routing hypothesis above also remains untested by anything but indirect evidence. Anyone re-investigating a future recurrence of "typed a line, pressed Enter, nothing happened" on `hermes-vps` should check first whether the pane crashed to a bare shell prompt (this defect's old signature, now fixed) versus whether the pane is still showing the bridge's own idle state (points back toward the pane-focus/GUI-routing gap this investigation could not rule in or out).
+diff --git a/tests/fm-hermes-ws.test.sh b/tests/fm-hermes-ws.test.sh
+index 40ab1e5..cde926c 100755
+--- a/tests/fm-hermes-ws.test.sh
++++ b/tests/fm-hermes-ws.test.sh
+@@ -253,6 +253,33 @@ test_missing_base_url_fails_closed() {
+   pass "config: a missing FM_HERMES_WS_BASE_URL fails closed by name, no guessed connection"
+ }
+ 
++test_dead_connection_fails_closed_not_uncaught() {
++  # A refused connection (nothing listening on the port) raises a raw
++  # ConnectionRefusedError/OSError from socket.create_connection() inside
++  # _WSSocket.__init__ - not HermesWsError. Before the fix, main()'s
++  # `except HermesWsError` never caught it: the client crashed with an
++  # uncaught Python traceback instead of the clean
++  # "fm-hermes-ws.py: ..." message every other failure mode prints. The
++  # same unwrapped-OSError gap existed on every other raw socket call
++  # (send_text/_recv_exact/_read_http_response_head), all now routed
++  # through _WSSocket._send()/_recv(), which this pins for the
++  # connection-establishment case - the one deterministically reproducible
++  # without racing a live peer's TCP state.
++  local port rc out
++  port=$(free_port)
++  rc=0
++  out=$(token_env "$port" "$WRAPPER" create /tmp/dead-connection 2>&1) || rc=$?
++  [ "$rc" -ne 0 ] || fail "a refused connection must fail closed, but the client exited 0"
++  case "$out" in
++    *Traceback*) fail "a refused connection crashed with an uncaught traceback instead of failing closed, got: $out" ;;
++  esac
++  case "$out" in
++    "fm-hermes-ws.py:"*) ;;
++    *) fail "a refused connection did not print the client's own clean error prefix, got: $out" ;;
++  esac
++  pass "connection error: a refused connection fails closed through the same HermesWsError path as every other failure, never an uncaught traceback"
++}
++
+ test_env_file_credentials_are_read() {
+   local port out home
+   port=$(free_port)
+@@ -281,4 +308,5 @@ test_dispatch_surfaces_a_turn_error
+ test_dispatch_closes_session_on_turn_error
+ test_dispatch_closes_session_on_timeout
+ test_missing_base_url_fails_closed
++test_dead_connection_fails_closed_not_uncaught
+ test_env_file_credentials_are_read

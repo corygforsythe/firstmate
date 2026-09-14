@@ -1,0 +1,1727 @@
+From 3e67621c819b248f2a907915f4cf92d10b94aecc Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Sun, 13 Sep 2026 22:10:45 -0500
+Subject: [PATCH 10/24] feat(hermes-vps): fleet-dispatch wiring for the
+ VPS-bridged Hermes transport
+
+Adds harness=hermes-vps: a new local bridge process (bin/fm-hermes-vps-bridge.py/.sh)
+that gives a captain's remote VPS Hermes /api/ws session an ordinary firstmate pane,
+wired into fm-spawn.sh (launch/readiness/delivery, session_id recorded in meta),
+fm-busy-lib.sh (live session.status pull), and fm-control-lib.sh/fm-control.sh
+(real session.interrupt/session.close, unlike the pane-based hermes adapter).
+Live-verified end to end against the real VPS: spawn, busy detection, interrupt,
+and exit all round-tripped with no leaked server-side sessions. Two real bugs
+found only via live traffic (same-segment event starvation, and the gateway
+dropping the connection after a successful interrupt) are fixed with an
+event-drain loop and transparent reconnect.
+---
+ .agents/skills/harness-adapters/SKILL.md      |   8 +-
+ .../references/harness/hermes-vps.md          |  78 ++++
+ .../references/harness/hermes.md              |   2 +-
+ AGENTS.md                                     |   2 +-
+ bin/backends/tmux.sh                          |  27 ++
+ bin/fm-agent-process-lib.sh                   |   8 +
+ bin/fm-busy-lib.sh                            |  65 +++-
+ bin/fm-control-lib.sh                         |  42 ++-
+ bin/fm-control.sh                             |   9 +-
+ bin/fm-hermes-lib.sh                          |  68 ++++
+ bin/fm-hermes-vps-bridge.py                   | 339 ++++++++++++++++++
+ bin/fm-hermes-vps-bridge.sh                   |  40 +++
+ bin/fm-hermes-ws-env-lib.sh                   |  44 +++
+ bin/fm-hermes-ws.sh                           |  34 +-
+ bin/fm-spawn.sh                               | 166 ++++++++-
+ docs/architecture.md                          |   2 +-
+ docs/configuration.md                         |   1 +
+ docs/verification/hermes.md                   |  83 ++++-
+ tests/fixtures/fm-hermes-ws-stub-server.py    |  10 +-
+ tests/fm-hermes-vps-bridge.test.sh            | 308 ++++++++++++++++
+ 20 files changed, 1274 insertions(+), 62 deletions(-)
+ create mode 100644 .agents/skills/harness-adapters/references/harness/hermes-vps.md
+ create mode 100755 bin/fm-hermes-vps-bridge.py
+ create mode 100755 bin/fm-hermes-vps-bridge.sh
+ create mode 100644 bin/fm-hermes-ws-env-lib.sh
+ create mode 100644 tests/fm-hermes-vps-bridge.test.sh
+
+diff --git a/.agents/skills/harness-adapters/SKILL.md b/.agents/skills/harness-adapters/SKILL.md
+index 09aa1b0..cbf7fd3 100644
+--- a/.agents/skills/harness-adapters/SKILL.md
++++ b/.agents/skills/harness-adapters/SKILL.md
+@@ -3,7 +3,7 @@ name: harness-adapters
+ description: >-
+   Agent-only reference for firstmate harness operations.
+   Use before spawning or recovering a crewmate or secondmate, handling a trust dialog, sending a harness-specific skill invocation, interrupting or exiting an agent, resuming an exited agent, or verifying a new harness adapter.
+-  Contains verified facts for claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, omp, agy, and hermes.
++  Contains verified facts for claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, omp, agy, hermes, and hermes-vps.
+ user-invocable: false
+ metadata:
+   internal: true
+@@ -35,8 +35,9 @@ For recovery and control, use the exact `harness=` in `state/<id>.meta`; never i
+ Deliver lifecycle actions only through `../../../bin/fm-control.sh <task-id> interrupt|exit|relaunch`.
+ Never type an interrupt key or exit command through `fm-send`, where routing-marked lifecycle text becomes chat.
+ Trust handling is complete only when inspection proves the target started processing its instructions; delivery success alone is not proof.
+-Muse, Gemini, AGY, and Hermes are verified only for crewmate and scout work, never a secondmate or primary.
++Muse, Gemini, AGY, Hermes, and hermes-vps are verified only for crewmate and scout work, never a secondmate or primary.
+ Never deliver an interrupt key to a Hermes task: it has no verified interrupt mechanic at all (Ctrl+C exits the whole session, Escape does not cancel a running tool call), so `../../../bin/fm-control-lib.sh` deliberately omits it from every lifecycle table and `fm-control.sh` refuses `interrupt|exit|relaunch` on it outright - see `references/harness/hermes.md`.
++hermes-vps is the opposite case: it DOES have a real, verified `interrupt` and `exit` through `fm-control.sh` (a real `session.interrupt`/`session.close` RPC, delivered as a submitted line its bridge recognizes locally rather than a terminal key) - never withhold those verbs from a hermes-vps task on the assumption that every Hermes-family adapter shares bare Hermes's gap; see `references/harness/hermes-vps.md`.
+ 
+ ## Detection
+ 
+@@ -97,7 +98,8 @@ A new tool remains undispatchable until the `verify` plan, its harness entry, ev
+     "rovo": "references/harness/rovo.md",
+     "omp": "references/harness/omp.md",
+     "agy": "references/harness/agy.md",
+-    "hermes": "references/harness/hermes.md"
++    "hermes": "references/harness/hermes.md",
++    "hermes-vps": "references/harness/hermes-vps.md"
+   }
+ }
+ ```
+diff --git a/.agents/skills/harness-adapters/references/harness/hermes-vps.md b/.agents/skills/harness-adapters/references/harness/hermes-vps.md
+new file mode 100644
+index 0000000..c668f8d
+--- /dev/null
++++ b/.agents/skills/harness-adapters/references/harness/hermes-vps.md
+@@ -0,0 +1,78 @@
++# Hermes Agent, VPS-bridged transport (`harness=hermes-vps`)
++
++Verified 2026-09-13, fleet-dispatch wiring landed against Hermes Agent v0.21.2 on the captain's real VPS (`gateway_mode: multiplex`).
++Crewmate/scout only, exactly like its pane-based sibling `hermes` (`references/harness/hermes.md`); refused for `--secondmate` because no primary supervision protocol exists for this transport either.
++Distinct from `hermes` in identity, launch, busy state, and lifecycle control - never conflate the two, and never infer hermes-vps's facts from bare hermes's adapter reference.
++
++## What this is
++
++`hermes` (bare) drives the real `hermes --cli` binary directly in a pane.
++`hermes-vps` never launches that binary at all: `../../../../bin/fm-hermes-vps-bridge.py` is a local process that opens a session against the captain's remote VPS Hermes gateway over `/api/ws` (the same JSON-RPC-over-WebSocket transport `../../../../bin/fm-hermes-ws.py`/`.sh` expose as a standalone dispatch primitive - `docs/verification/hermes.md` owns that primitive's own evidence) and renders that session's conversation into this pane, so a VPS-dispatched Hermes crewmate is visible and interactive exactly like a local pane-based crewmate.
++The pane's foreground process is always this bridge (a python script), never the vendor CLI.
++
++## Operating facts
++
++| Fact | Value |
++|---|---|
++| Binary | No vendor binary at all. `../../../../bin/fm-hermes-vps-bridge.sh` (env/credential resolution) execs `../../../../bin/fm-hermes-vps-bridge.py` (the bridge itself), both tracked in this repo. |
++| Launch | Bare `env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS <bridge.sh> --cwd <worktree>`, the same launch-then-send shape as bare hermes: a readiness gate on the bridge's own `Hermes VPS bridge ready.` banner, then the standard typed absolute brief pointer, then a delivery-confirmation gate - but every signal is a marker the bridge prints itself, not vendor UI text (`../../../../bin/fm-spawn.sh`'s `hermes_vps_wait_for_ready`/`hermes_vps_wait_for_delivery`). |
++| Credentials | `FM_HERMES_WS_BASE_URL` plus either `FM_HERMES_WS_TOKEN` or `FM_HERMES_WS_USER`/`FM_HERMES_WS_PASS`, resolved from `$FM_HOME/.env` by `../../../../bin/fm-hermes-ws-env-lib.sh` (shared with `fm-hermes-ws.sh`) - never in a launch command, brief, or status line. |
++| Models | None. `session.create`'s own RPC signature carries no model or effort param, so both axes are record-and-omit in task metadata, same contract as bare hermes/kimi. |
++| Busy state | Live and structural, not rendered: `../../../../bin/fm-busy-lib.sh`'s `fm_busy_hermes_vps_agent_running` pulls `session.status`'s own literal `Agent Running: Yes`/`Agent Running: No` line over a fresh RPC call each time it is asked - a strictly better signal than bare hermes's rendered-tail fallback, at the cost of one WS round trip (including gated-mode auth) per poll. |
++| Exit command | `/exit`, delivered the ordinary text-submit way. The bridge recognizes this exact line locally, calls the real `session.close` RPC to retire the server-side session, then exits the local process - it is never forwarded to the model. |
++| Interrupt | **A real, verified RPC** (`session.interrupt`), unlike bare hermes's "no safe key exists" gap. `../../../../bin/fm-control-lib.sh`'s `fm_control_interrupt_via_text` names the literal line `/interrupt`, delivered through the ordinary text-submit pane mechanic (not a named key - this transport has no composer for `Escape`/`Ctrl+C` to act on); the bridge recognizes it locally and calls the RPC instead of forwarding it as chat. `fm-control.sh interrupt\|exit\|relaunch` all work normally. |
++| Skill invocation | Not applicable - crewmate/scout only. |
++| Autonomy | Whatever the VPS's own Hermes deployment is configured with; the bridge passes no autonomy flag of its own. |
++| File access | **The VPS's own filesystem only - see "Known limitation" below.** |
++| Trust dialog | None observed (no vendor UI at all). |
++| Environment marker | None needed: the bridge is a distinct tracked script (`fm-hermes-vps-bridge.py`), matched structurally by `../../../../bin/fm-hermes-lib.sh`'s `fm_hermes_vps_bridge_*` functions, the same interpreter-argv[1] pattern bare hermes's own identity check uses. |
++| Process name | Always the python interpreter (`python3`/`python3.*`), with `fm-hermes-vps-bridge.py` as argv[1] - see Detection. |
++| Composer | None. The pane is a scrolling event-rendered log, not a composer; there is deliberately no composer-emptiness half in the readiness/delivery gates. |
++| Effort | None - see Models. |
++
++## Detection
++
++Structurally identical in shape to bare hermes's python-interpreter problem, but a DIFFERENT script identity: `fm_hermes_vps_bridge_path_is_bridge`/`fm_hermes_vps_bridge_args_are_bridge`/`fm_hermes_vps_bridge_pid_is_bridge` (`../../../../bin/fm-hermes-lib.sh`) match a path whose basename is exactly `fm-hermes-vps-bridge.py`, wired into `../../../../bin/fm-agent-process-lib.sh`'s `fm_agent_process_classify` alongside (never merged into) the bare-hermes checks.
++This is what lets tmux/Herdr pane liveness (`fm_backend_tmux_agent_state` and the Herdr equivalent) recognize the bridge process as a live agent for `bin/fm-control.sh`'s `alive`/`dead` postconditions.
++
++## Launch and readiness
++
++`launch_template` in `../../../../bin/fm-spawn.sh` resolves `__HERMESVPSBRIDGE__` to the tracked `bin/fm-hermes-vps-bridge.sh` path (no PATH search, no `resolve_*_binary` function - there is no vendor binary to find) and `__WORKTREE__` to this task's worktree, passed as the bridge's own `--cwd` (best-effort only - see "Known limitation").
++Readiness (`hermes_vps_wait_for_ready`) greps the pane for the bridge's own `Hermes VPS bridge ready.` banner, printed only once the bridge has actually created a live VPS session; the session's own `session_id` is parsed back out of that same line and recorded as `hermes_vps_session_id=` in `state/<id>.meta` (`hermes_vps_record_session_id`) once delivery is confirmed.
++Every other launch-then-send harness's readiness/delivery gates infer state from vendor UI text; this transport's gates read markers the bridge controls completely, so they are a stronger proof, not a weaker one.
++
++## Brief delivery: content, not a pointer
++
++Every other launch-then-send harness receives the literal pointer sentence `Read the brief at <absolute-path> and follow it exactly.` and opens that path itself.
++A VPS-hosted Hermes session cannot: it has no access to this machine's filesystem at all.
++So the bridge - which DOES run locally - special-cases exactly the FIRST line it receives: if it matches that literal pointer shape and the path is locally readable, the bridge reads the file itself and forwards the file's own CONTENT to the VPS session via `prompt.submit`, instead of the sentence about it.
++Every later line (an ordinary steer) is forwarded verbatim, unexamined.
++Delivery confirmation mirrors bare hermes's own convention: the bridge echoes every line it forwards with a leading `●` (the same bullet hermes itself prepends to an accepted, submitted message), so `hermes_vps_wait_for_delivery` can grep this pane's plain-text capture for that literal marker exactly like bare hermes's gate does.
++
++## Rendering
++
++The bridge renders a grounded subset of the real Hermes event vocabulary (read directly from the installed Hermes source, `tui_gateway/server.py`, not inferred): `message.delta` (streamed text), `message.complete` (a `[turn <status>]` marker), `tool.start`/`tool.complete` (a one-line summary each), and `error`.
++Every other event type (`reasoning.available`, `subagent.*`, `tool.generating`, todo updates) is deliberately not rendered - an initial pane-rendering scope, not a wire-protocol gap.
++
++## Known limitation: no local file access
++
++**`session.create`'s `cwd` param is NOT honored on the captain's real VPS deployment** (live-verified, `docs/verification/hermes.md`'s "Live verification against the real VPS" section - a real `terminal` tool call inside a created session printed `pwd` as `/`, not the requested cwd).
++The VPS agent's own file and terminal tools therefore reach only the VPS's OWN filesystem, never this task's local git worktree, regardless of what `--cwd` the bridge was launched with.
++**Do not dispatch a ship or scout task onto `hermes-vps` that needs the agent to read or edit this project's code, run `git`, or drive the no-mistakes pipeline** - none of that is reachable from the VPS's own remote shell.
++This transport is proven useful today for VPS-local work (the agent's own sandbox: shell commands, files, and tools that live on the VPS itself) and for proving the fleet-visibility wiring end to end; it is not yet a substitute for a real local crewmate on project work.
++A local worktree is still created and recorded for this task like any other (`worktree=` in `state/<id>.meta`), for bookkeeping and PR-path consistency, not because the VPS agent can reach it.
++
++## Live verification
++
++```
++$ bin/fm-spawn.sh <id> <project> --scout --harness hermes-vps
++spawned <id> harness=hermes-vps backend=<tmux|herdr> ...
++$ bin/fm-crew-state.sh <id>
++state: working · source: hermes-vps-status ...
++$ bin/fm-control.sh <id> interrupt
++interrupt-delivered <id> harness=hermes-vps backend=<...> verified=...
++$ bin/fm-control.sh <id> exit
++stopped <id> harness=hermes-vps backend=<...> endpoint=... worktree=...
++```
++
++See `docs/verification/hermes.md`'s "hermes-vps: fleet-dispatch wiring" section for the exact dated commands and output this table summarizes, and re-run after any change to the bridge, `bin/fm-hermes-ws.py`, or a VPS Hermes upgrade.
+diff --git a/.agents/skills/harness-adapters/references/harness/hermes.md b/.agents/skills/harness-adapters/references/harness/hermes.md
+index 76d0d85..b6b0a93 100644
+--- a/.agents/skills/harness-adapters/references/harness/hermes.md
++++ b/.agents/skills/harness-adapters/references/harness/hermes.md
+@@ -81,4 +81,4 @@ Landing a real text-submission interrupt path in `bin/fm-control.sh` is real, sc
+   `../../../bin/fm-hermes-ws.py`/`.sh` is a standalone client (session create/submit/status/history/steer/interrupt/close, both loopback-token and gated ticket auth) - see `../../../../docs/verification/hermes.md`'s "standalone JSON-RPC-over-WebSocket dispatch client" and "Live verification against the real VPS" sections for the wire-protocol grounding and the real dispatch transcript.
+   `session.interrupt`/`session.steer` are real, structural RPC methods with real non-destructive results here, unlike the pane-based adapter's "no safe key exists" gap above.
+   One live-verified caveat: `session.create`'s `cwd` param was NOT honored on the real VPS (confirmed via a real `terminal` tool call) even though a local scratch instance on an older version pinned it - do not assume `cwd` confines a session's working directory on this transport without re-confirming it on the deployment in use.
+-  It is a captain-approved standalone primitive only, deliberately not wired into `../../../bin/fm-spawn.sh`/`fm-control.sh`/`fm-crew-state.sh`/`fm-busy-lib.sh` - those are entirely pane-shaped and a `/api/ws` session has no pane; fleet-dispatch wiring (including a real answer for working-directory confinement) is a deferred follow-up task.
++  This client remains a standalone primitive for ad hoc probing; the fleet-dispatch wiring built on top of it is a SEPARATE harness, `harness=hermes-vps` (`hermes-vps.md`), not an extension of bare hermes - it never confines a session's working directory either (same `cwd` caveat, re-confirmed there) and cannot reach a task's local worktree at all.
+diff --git a/AGENTS.md b/AGENTS.md
+index d514a36..8ff70d5 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -209,7 +209,7 @@ A silent bootstrap section needs no action; for any printed actionable diagnosti
+ ## 4. Harness and runtime dispatch
+ 
+ Load `harness-adapters` before every spawn or recovery and before trust handling, skill invocation, interrupt, exit, resume, or adapter verification.
+-The verified harnesses are `claude`, `codex`, `opencode`, `pi`, `pi-signed`, `grok`, `kimi`, `cursor`, and `omp`, plus `muse`, `gemini`, `rovo`, `agy`, and `hermes` for crewmates and scouts only; never dispatch on an unverified adapter.
++The verified harnesses are `claude`, `codex`, `opencode`, `pi`, `pi-signed`, `grok`, `kimi`, `cursor`, and `omp`, plus `muse`, `gemini`, `rovo`, `agy`, `hermes`, and `hermes-vps` for crewmates and scouts only; never dispatch on an unverified adapter.
+ If static `config/crew-harness` or `config/secondmate-harness` names an unverified adapter, report it and fall back only to a verified adapter rather than launching it.
+ 
+ `docs/configuration.md` owns dispatch-profile and runtime-backend schemas, `bin/fm-harness.sh` owns static resolution, and `bin/fm-spawn.sh` owns launch flags and fail-closed validation.
+diff --git a/bin/backends/tmux.sh b/bin/backends/tmux.sh
+index 4477eb9..397d181 100644
+--- a/bin/backends/tmux.sh
++++ b/bin/backends/tmux.sh
+@@ -331,6 +331,33 @@ EOF
+     fi
+   done <<EOF
+ $(fm_backend_tmux_foreground_args "$target")
++EOF
++
++  # harness=hermes-vps's bridge is the same python-interpreter-argv[1] shape
++  # as Gemini's node-bundle and bare hermes's own script: comm/argv0 alone
++  # (the loops above) never carry its identity, so it needs the same
++  # pid/args-preserving check the Gemini rule already gets. Unlike bare
++  # hermes - which never reaches this classifier because it has no
++  # fm-control.sh lifecycle support to prove alive/dead for - hermes-vps DOES
++  # need a real `alive` verdict here for interrupt/exit to work at all.
++  while IFS= read -r pid; do
++    [ -n "$pid" ] || continue
++    if fm_hermes_vps_bridge_pid_is_bridge "$pid"; then
++      printf 'alive'
++      return 0
++    fi
++  done <<EOF
++$(fm_backend_tmux_foreground_pids "$target")
++EOF
++
++  while IFS= read -r name; do
++    [ -n "$name" ] || continue
++    if fm_hermes_vps_bridge_args_are_bridge "$name"; then
++      printf 'alive'
++      return 0
++    fi
++  done <<EOF
++$(fm_backend_tmux_foreground_args "$target")
+ EOF
+ 
+   comm=$(fm_backend_tmux_current_command "$target") || {
+diff --git a/bin/fm-agent-process-lib.sh b/bin/fm-agent-process-lib.sh
+index 8657863..1c52ae5 100644
+--- a/bin/fm-agent-process-lib.sh
++++ b/bin/fm-agent-process-lib.sh
+@@ -113,6 +113,14 @@ fm_agent_process_classify() {  # <name> <argv0> <args> [pid] -> agent|shell|othe
+     printf 'agent'
+     return 0
+   fi
++  if [ -n "$pid" ] && fm_hermes_vps_bridge_pid_is_bridge "$pid"; then
++    printf 'agent'
++    return 0
++  fi
++  if [ -n "$args" ] && fm_hermes_vps_bridge_args_are_bridge "$args"; then
++    printf 'agent'
++    return 0
++  fi
+   if [ "$by_name" = shell ] && [ "$by_argv0" = shell ]; then
+     printf 'shell'
+   else
+diff --git a/bin/fm-busy-lib.sh b/bin/fm-busy-lib.sh
+index 8bff2e0..306ca98 100755
+--- a/bin/fm-busy-lib.sh
++++ b/bin/fm-busy-lib.sh
+@@ -43,28 +43,34 @@
+ #   fm-recovery      a documented recovery reset after relaunch
+ # Classifier-only sources (never written into a record):
+ #   endpoint-gone, herdr-native, grok-regex, rovo-regex, agy-regex, hermes-regex,
+-#   muse-session-log, cursor-transcript, missing, malformed, gen-mismatch,
+-#   source-mismatch, kimi-unverified, codex-unverified, capture-failed, no-target
++#   muse-session-log, cursor-transcript, hermes-vps-status, missing, malformed,
++#   gen-mismatch, source-mismatch, kimi-unverified, codex-unverified,
++#   capture-failed, no-target
+ #
+ # Classification (fm_busy_classify): busy | idle | unknown | dead, always
+ # with the producing source as the second token. Precedence:
+ #   1. dead endpoint (fm_busy_classify_live only) -> dead endpoint-gone
+ #   2. standalone Kimi before verification       -> unknown kimi-unverified
+-#   3. a valid, gen-matching, source-trusted record -> its state and source
+-#   4. no record at all: herdr's native busy verdict is trusted as busy
++#   3. hermes-vps: a live pull, see fm_busy_hermes_vps_agent_running
++#   4. a valid, gen-matching, source-trusted record -> its state and source
++#   5. no record at all: herdr's native busy verdict is trusted as busy
+ #      (generation state is sufficient for busy, not for idle), then the
+ #      muse session-log and cursor transcript pull sources, then the
+ #      Grok/Rovo/AGY temporary regex fallbacks classify a grok, rovo, or agy
+ #      task from its rendered tail, then unknown missing
+-#   5. malformed, stale, or untrusted records -> unknown, never a fallback
+-# Grok, Rovo, AGY, and Hermes are the ONLY rendered-text classifications that
+-# survive the redesign, because none of their structured lifecycles was
+-# credited-live-verified in the approved audit (Rovo's clean ACP stopReason
+-# lives outside the TUI path firstmate drives, see references/harness/rovo.md;
+-# agy 1.2.0 exposes no hook surface at all, see references/harness/agy.md;
+-# hermes's own hooks surface was not confirmed to carry a turn-granularity
+-# signal, see references/harness/hermes.md); each is scoped to its own
+-# harness= and can never classify another adapter. The delivery
++#   6. malformed, stale, or untrusted records -> unknown, never a fallback
++# Grok, Rovo, AGY, and hermes (the pane-based `hermes --cli` adapter) are the
++# ONLY rendered-text classifications that survive the redesign, because none
++# of their structured lifecycles was credited-live-verified in the approved
++# audit (Rovo's clean ACP stopReason lives outside the TUI path firstmate
++# drives, see references/harness/rovo.md; agy 1.2.0 exposes no hook surface
++# at all, see references/harness/agy.md; hermes's own hooks surface was not
++# confirmed to carry a turn-granularity signal, see
++# references/harness/hermes.md); each is scoped to its own harness= and can
++# never classify another adapter. hermes-vps (the VPS-bridged transport,
++# references/harness/hermes-vps.md) is NOT a rendered-text classification: it
++# pulls session.status's own structural "Agent Running" field over a live
++# RPC, the same pull-source shape as muse/cursor above. The delivery
+ # guards in bin/fm-composer-lib.sh match rendered footers for submit
+ # acknowledgement and away-mode supervisor injection only; neither is a
+ # recorded worker state source.
+@@ -862,6 +868,28 @@ fm_busy_rovo_tail_busy() {
+ # turn-end hook and no structural busy/idle signal was found (`hermes hooks`/
+ # --accept-hooks exist but were not confirmed to carry one), so this
+ # fallback, like rovo's, is the only source; it is never armed as a semantic
++# fm_busy_hermes_vps_agent_running: a live, structural busy pull for the
++# VPS-bridged transport (harness=hermes-vps), grounded in session.status's
++# own literal "Agent Running: Yes"/"Agent Running: No" line - the same
++# rendered-but-authoritative field docs/verification/hermes.md's live VPS
++# transcript confirms, and a strictly better signal than every other
++# hermes-vps sibling's rendered-tail fallback because it comes from a real
++# RPC, not a captured pane. One WS round trip per call (gated-mode auth
++# included), so this is a POLL-rate cost, not a per-classification-call cost
++# that matters at fm-watch.sh's cadence. Prints yes|no|unknown.
++fm_busy_hermes_vps_agent_running() {  # <meta-file>
++  local meta=$1 sid dir out
++  sid=$(fm_meta_get "$meta" hermes_vps_session_id)
++  [ -n "$sid" ] || { printf 'unknown'; return 0; }
++  dir="${FM_BACKEND_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
++  out=$("$dir/fm-hermes-ws.sh" status "$sid" 2>/dev/null) || { printf 'unknown'; return 0; }
++  case "$out" in
++    *'Agent Running: Yes'*) printf 'yes' ;;
++    *'Agent Running: No'*) printf 'no' ;;
++    *) printf 'unknown' ;;
++  esac
++}
++
+ # writer (fm_busy_sources_for_harness trusts nothing for hermes). The
+ # distinguishing token `msg=interrupt` is matched rather than the whole hint
+ # line so glyph/spacing drift across versions cannot silently break the
+@@ -926,6 +954,17 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
+       esac
+       return 0
+       ;;
++    hermes-vps*)
++      # Live and structural, unlike every other rendered-tail hermes* fallback
++      # below: pulled straight from the VPS's own session.status RPC rather
++      # than this pane's captured text. See fm_busy_hermes_vps_agent_running.
++      case "$(fm_busy_hermes_vps_agent_running "$state/$id.meta" 2>/dev/null)" in
++        yes) printf 'busy hermes-vps-status' ;;
++        no) printf 'idle hermes-vps-status' ;;
++        *) printf 'unknown hermes-vps-status' ;;
++      esac
++      return 0
++      ;;
+   esac
+   out=$(fm_busy_record_read "$state" "$id") && rc=0 || rc=$?
+   if [ "$rc" = 0 ]; then
+diff --git a/bin/fm-control-lib.sh b/bin/fm-control-lib.sh
+index 516a00b..1d1a737 100644
+--- a/bin/fm-control-lib.sh
++++ b/bin/fm-control-lib.sh
+@@ -60,10 +60,14 @@ fm_control_verb_allowed() {  # <verb>
+ 
+ # The harnesses whose control mechanics are verified. Mirrors AGENTS.md
+ # section 4's verified-adapter list; an unverified adapter is refused rather
+-# than guessed at, exactly as a spawn on it would be.
++# than guessed at, exactly as a spawn on it would be. hermes-vps (the
++# VPS-bridged transport, references/harness/hermes-vps.md) is deliberately
++# NOT in the same boat as its pane-based hermes sibling above: it has a
++# real, structural session.interrupt RPC, so it is supported here even
++# though bare `hermes` remains absent.
+ fm_control_harness_supported() {  # <harness>
+   case "${1-}" in
+-    claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy) return 0 ;;
++    claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes-vps) return 0 ;;
+   esac
+   return 1
+ }
+@@ -92,6 +96,7 @@ fm_control_harness_family() {  # <recorded-harness>
+     gemini*) printf 'gemini' ;;
+     muse*) printf 'muse' ;;
+     rovo*) printf 'rovo' ;;
++    hermes-vps) printf 'hermes-vps' ;;
+     *) return 1 ;;
+   esac
+ }
+@@ -106,7 +111,7 @@ fm_control_harness_supports_kind() {  # <harness> <kind>
+   local harness=${1-} kind=${2-}
+   fm_control_harness_supported "$harness" || return 1
+   case "$harness" in
+-    muse|gemini|rovo|agy) [ "$kind" != secondmate ] || return 1 ;;
++    muse|gemini|rovo|agy|hermes-vps) [ "$kind" != secondmate ] || return 1 ;;
+   esac
+   return 0
+ }
+@@ -129,6 +134,22 @@ fm_control_interrupt_key() {  # <harness>
+   esac
+ }
+ 
++# fm_control_interrupt_via_text: for a harness whose interrupt is a plain
++# submitted line rather than a named terminal key, the exact text to submit.
++# hermes-vps is the one case today: its bridge (bin/fm-hermes-vps-bridge.py)
++# recognizes this exact line locally and calls the VPS's real
++# session.interrupt RPC instead of forwarding it to the model, because this
++# transport has no pane composer for a key like Escape to act on in the
++# first place. Prints nothing and returns 1 for every key-based harness, so
++# fm-control.sh's send_interrupt_keys checks this FIRST and falls through to
++# the key tables above unchanged for everyone else.
++fm_control_interrupt_via_text() {  # <harness>
++  case "${1-}" in
++    hermes-vps) printf '/interrupt' ;;
++    *) return 1 ;;
++  esac
++}
++
+ # How many times the interrupt key must be delivered. OpenCode needs a double
+ # Escape; every other verified adapter interrupts on a single press.
+ fm_control_interrupt_repeat() {  # <harness>
+@@ -171,14 +192,25 @@ fm_control_interrupt_ack_source() {  # <harness>
+     # claude/cursor this stays 'none': the ack is a rendered string, not a
+     # recorded state source, and rovo has no busy wiring to confirm against.
+     claude|codex|opencode|pi|pi-signed|omp|grok|kimi|cursor|gemini|rovo|agy) printf 'none' ;;
++    # hermes-vps's session.interrupt RPC returns a real, synchronous
++    # {"status": "interrupted"} result inside the bridge (see
++    # bin/fm-hermes-vps-bridge.py), but fm-control.sh only ever sees that
++    # the text was delivered into the pane, not the RPC's own return value,
++    # so it stays 'none' like every non-muse harness rather than claiming a
++    # confirmation this plane cannot actually observe.
++    hermes-vps) printf 'none' ;;
+     *) return 1 ;;
+   esac
+ }
+ 
+-# The command that exits the agent from its own composer.
++# The command that exits the agent from its own composer. hermes-vps's
++# bridge recognizes this exact line locally and closes the VPS session
++# (session.close) before exiting the local process - see
++# bin/fm-hermes-vps-bridge.py - so the ordinary text-submit exit path below
++# needs no separate branch for it, unlike interrupt.
+ fm_control_exit_command() {  # <harness>
+   case "${1-}" in
+-    claude|opencode|grok|kimi|cursor|muse|rovo) printf '/exit' ;;
++    claude|opencode|grok|kimi|cursor|muse|rovo|hermes-vps) printf '/exit' ;;
+     codex|pi|pi-signed|omp|gemini|agy) printf '/quit' ;;
+     *) return 1 ;;
+   esac
+diff --git a/bin/fm-control.sh b/bin/fm-control.sh
+index 49112df..6bc742a 100755
+--- a/bin/fm-control.sh
++++ b/bin/fm-control.sh
+@@ -355,7 +355,14 @@ require_state_verified_backend() {  # <verb>
+ # an interrupt that cancels the turn but leaves the restored prompt in the
+ # composer would make the next submitted line concatenate onto it.
+ send_interrupt_keys() {
+-  local key repeat clear i=0
++  local key repeat clear i=0 text verdict
++  if text=$(fm_control_interrupt_via_text "$HARNESS" 2>/dev/null); then
++    verdict=$(fm_backend_send_text_submit "$BACKEND" "$T" "$text" 1 "$POLL" 0.5 "$LABEL") \
++      || die "interrupt command $text could not be sent to task $ID on $BACKEND"
++    [ "$verdict" != send-failed ] \
++      || die "interrupt command $text could not be sent to task $ID on $BACKEND"
++    return 0
++  fi
+   key=$(fm_control_interrupt_key "$HARNESS")
+   repeat=$(fm_control_interrupt_repeat "$HARNESS")
+   clear=$(fm_control_interrupt_clear_key "$HARNESS")
+diff --git a/bin/fm-hermes-lib.sh b/bin/fm-hermes-lib.sh
+index 906171f..ce37ee0 100644
+--- a/bin/fm-hermes-lib.sh
++++ b/bin/fm-hermes-lib.sh
+@@ -108,3 +108,71 @@ fm_hermes_args_are_hermes() {  # <args>
+   done
+   return 1
+ }
++
++# --- harness=hermes-vps: the VPS-bridged transport's own process identity ---
++#
++# bin/fm-hermes-vps-bridge.py is a distinct python-interpreter-shaped script
++# from the real `hermes` CLI above (it never execs the vendor binary at all -
++# see docs/verification/hermes.md's "hermes-vps" section), so it needs its
++# own structural match rather than widening fm_hermes_path_is_hermes. Both
++# harnesses share the same interpreter-argv[1] shape, so the same
++# skip-flags-then-check-the-script-path pattern applies verbatim.
++
++fm_hermes_vps_bridge_path_is_bridge() {  # <path>
++  local path=$1
++  [ -n "$path" ] || return 1
++  case "$path" in
++    -*) return 1 ;;
++  esac
++  case "${path##*/}" in
++    fm-hermes-vps-bridge.py) return 0 ;;
++  esac
++  return 1
++}
++
++fm_hermes_vps_bridge_pid_is_bridge() {  # <pid>
++  local pid=$1 token argv0='' index=0
++  [ -r "/proc/$pid/cmdline" ] || return 1
++  while IFS= read -r -d '' token; do
++    if [ "$index" -eq 0 ]; then
++      argv0=$token
++      fm_hermes_vps_bridge_path_is_bridge "$argv0" && return 0
++      case "${argv0##*/}" in
++        python3|python3.*|python|Python) ;;
++        *) return 1 ;;
++      esac
++    else
++      case "$token" in
++        -*) ;;
++        *) fm_hermes_vps_bridge_path_is_bridge "$token" && return 0; return 1 ;;
++      esac
++    fi
++    index=$((index + 1))
++  done < "/proc/$pid/cmdline"
++  return 1
++}
++
++fm_hermes_vps_bridge_args_are_bridge() {  # <args>
++  local args=$1 argv0 rest token
++  [ -n "$args" ] || return 1
++  args=${args#"${args%%[![:space:]]*}"}
++  argv0=${args%%[[:space:]]*}
++  fm_hermes_vps_bridge_path_is_bridge "$argv0" && return 0
++  case "${argv0##*/}" in
++    python3|python3.*|python|Python) ;;
++    *) return 1 ;;
++  esac
++  rest=${args#"$argv0"}
++  while [ -n "$rest" ]; do
++    rest=${rest#"${rest%%[![:space:]]*}"}
++    [ -n "$rest" ] || break
++    token=${rest%%[[:space:]]*}
++    rest=${rest#"$token"}
++    case "$token" in
++      -*) continue ;;
++    esac
++    fm_hermes_vps_bridge_path_is_bridge "$token" && return 0
++    return 1
++  done
++  return 1
++}
+diff --git a/bin/fm-hermes-vps-bridge.py b/bin/fm-hermes-vps-bridge.py
+new file mode 100755
+index 0000000..1caf457
+--- /dev/null
++++ b/bin/fm-hermes-vps-bridge.py
+@@ -0,0 +1,339 @@
++#!/usr/bin/env python3
++# fm-hermes-vps-bridge.py - renders a captain's remote VPS Hermes /api/ws
++# session into an ordinary local pane, so a VPS-dispatched Hermes crewmate
++# is visible and interactive exactly like a local pane-based crewmate,
++# while every busy/interrupt/exit lifecycle question is answered by the
++# real, structural /api/ws RPCs documented in docs/verification/hermes.md,
++# not by anything rendered here.
++#
++# Usage: fm-hermes-vps-bridge.py --cwd <path>
++#
++# Design (harness=hermes-vps, distinct from harness=hermes's pane-based
++# `hermes --cli` adapter):
++#   - One persistent bin/fm-hermes-ws.py HermesWsSession per bridge process,
++#     created fresh on every launch (a relaunch always creates a NEW VPS
++#     session; resuming a prior one is out of scope, matching firstmate's
++#     fleet-wide "resume is not deterministic" stance - bin/fm-control-lib.sh's
++#     header note that `relaunch` covers the same need for every adapter
++#     without a harness-private session).
++#   - A single-threaded loop (select() over stdin and the WS socket) drains
++#     server-pushed `event` notifications and renders them into this pane's
++#     scrollback (message.delta/message.complete, tool.start/tool.complete,
++#     error), and forwards each line typed into this pane to the VPS
++#     session (prompt.submit while idle, session.steer while a turn is in
++#     flight - the same idle/busy distinction bin/fm-busy-lib.sh's
++#     hermes-vps classifier separately confirms via a live session.status
++#     RPC, never from this bridge's own in-memory flag).
++#   - This pane never runs the real `hermes` binary and never touches this
++#     machine's terminal/file tools for the VPS session's own turns; the
++#     ONE exception is the launch brief itself (see "Brief delivery"
++#     below), because every other harness's "Read the brief at <path> and
++#     follow it exactly." pointer assumes the AGENT can open that path
++#     itself, which a remote VPS session cannot.
++#   - THE KEY LIMITATION, not solved here: session.create's cwd param is
++#     NOT honored on the captain's real VPS deployment (live-verified,
++#     docs/verification/hermes.md), so the VPS agent's own file/terminal
++#     tools reach only the VPS's OWN filesystem, never this task's local
++#     git worktree. A hermes-vps crewmate can converse and use tools in the
++#     VPS's own sandbox but cannot read or edit this project's code; do not
++#     dispatch a ship/scout task onto it that needs local repo access -
++#     see .agents/skills/harness-adapters/references/harness/hermes-vps.md.
++#
++# Brief delivery: fm-spawn.sh's launch-then-send shape for hermes-vps types
++# the SAME pointer sentence every launch-then-send harness receives -
++# "Read the brief at <absolute-path> and follow it exactly." - into this
++# pane. Every other harness's own process then opens that path itself. This
++# bridge cannot forward that literal sentence: the remote VPS agent has no
++# access to this machine's filesystem. So this bridge, which DOES run
++# locally and can read that path, special-cases exactly the FIRST line it
++# receives: if it matches that literal pointer shape and the path is
++# readable, it reads the file itself and forwards the file's own CONTENT to
++# the VPS session instead of the sentence about it. Every later line (an
++# ordinary steer) is forwarded verbatim, unexamined.
++#
++# Delivery confirmation mirrors the native hermes adapter's own convention
++# (docs/verification/hermes.md "Delivery gate"): every line this bridge
++# forwards is first echoed to stdout with a leading bullet - the same
++# marker hermes itself prepends to an accepted, submitted message - so
++# fm-spawn.sh's readiness/delivery gates can grep this pane's plain-text
++# capture for that literal marker exactly like the native adapter's gate
++# does, without inventing a second convention.
++#
++# Event payload shapes below are read directly from the real Hermes source
++# (tui_gateway/server.py on the local install, the same tree
++# bin/fm-hermes-ws.py's wire-protocol section was grounded against):
++# message.delta carries {"text": <chunk>}; message.complete carries
++# {"text": <final>, "status": "complete"|"interrupted"|"error", ...};
++# tool.start carries {"tool_id", "name", "context", ...}; tool.complete
++# carries {"tool_id", "name", "summary"|"result", ...}. Every other event
++# type (reasoning.available, subagent.*, tool.generating, todo updates) is
++# deliberately not rendered - an initial pane-rendering scope, not a
++# wire-protocol gap.
++import importlib.util
++import os
++import select
++import signal
++import sys
++import time
++
++_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
++_WS_MODULE_PATH = os.path.join(_SCRIPT_DIR, 'fm-hermes-ws.py')
++
++
++def _load_ws_module():
++    spec = importlib.util.spec_from_file_location('fm_hermes_ws', _WS_MODULE_PATH)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++_ws = _load_ws_module()
++HermesWsSession = _ws.HermesWsSession
++HermesWsError = _ws.HermesWsError
++
++READY_PREFIX = 'Hermes VPS bridge ready.'
++BRIEF_POINTER_PREFIX = 'Read the brief at '
++BRIEF_POINTER_SUFFIX = ' and follow it exactly.'
++BULLET = '●'
++EVENT_WAIT_TIMEOUT = 30.0
++RECONNECT_ATTEMPTS = 5
++RECONNECT_BACKOFF = 2.0
++
++
++def _parse_args(argv):
++    cwd = None
++    i = 1
++    while i < len(argv):
++        if argv[i] == '--cwd' and i + 1 < len(argv):
++            cwd = argv[i + 1]
++            i += 2
++            continue
++        i += 1
++    if not cwd:
++        print('fm-hermes-vps-bridge: --cwd is required', file=sys.stderr)
++        sys.exit(2)
++    return cwd
++
++
++def _echo(line):
++    print(f'{BULLET} {line}', flush=True)
++
++
++class Bridge:
++    def __init__(self, cwd):
++        self.cwd = cwd
++        self.session = HermesWsSession()
++        self.session_id = None
++        self.busy = False
++        self.brief_delivered = False
++        self._shutdown = False
++
++    def start(self):
++        created = self.session.rpc('session.create', {'cwd': self.cwd})
++        self.session_id = created.get('session_id')
++        if not self.session_id:
++            raise HermesWsError(f'session.create returned no session_id: {created}')
++        print(f'{READY_PREFIX} session_id={self.session_id}', flush=True)
++
++    def _forward(self, text):
++        """Submit or steer <text> depending on the last-observed turn state.
++        A real RPC failure is printed into the pane rather than swallowed -
++        a captain steering a wedged session needs to see that, not silence."""
++        try:
++            method = 'session.steer' if self.busy else 'prompt.submit'
++            self.session.rpc(method, {'session_id': self.session_id, 'text': text})
++        except HermesWsError as exc:
++            # One reconnect-and-retry: the connection may have dropped (see
++            # reconnect()'s docstring) between the last event and this input.
++            if not self.reconnect():
++                print(f'[fm-hermes-vps-bridge] delivery failed: {exc}', flush=True)
++                return
++            try:
++                self.session.rpc(method, {'session_id': self.session_id, 'text': text})
++            except HermesWsError as exc2:
++                print(f'[fm-hermes-vps-bridge] delivery failed: {exc2}', flush=True)
++
++    def handle_input_line(self, line):
++        if (not self.brief_delivered and line.startswith(BRIEF_POINTER_PREFIX)
++                and line.endswith(BRIEF_POINTER_SUFFIX)):
++            path = line[len(BRIEF_POINTER_PREFIX):-len(BRIEF_POINTER_SUFFIX)]
++            if os.path.isfile(path):
++                self.brief_delivered = True
++                _echo(line)
++                try:
++                    with open(path, 'r', encoding='utf-8') as fh:
++                        content = fh.read()
++                except OSError as exc:
++                    print(f'[fm-hermes-vps-bridge] could not read brief at {path}: {exc}', flush=True)
++                    return
++                self._forward(content)
++                return
++        if line == '/exit':
++            self.shutdown()
++            return
++        if line == '/interrupt':
++            # A real RPC, not a submitted chat message - bin/fm-control-lib.sh's
++            # fm_control_interrupt_via_text names this exact line as
++            # hermes-vps's interrupt delivery, reusing the ordinary
++            # text-submit pane mechanic every other harness's exit command
++            # already rides, rather than a named terminal key (this
++            # transport has no pane composer for one to act on).
++            try:
++                self.session.rpc('session.interrupt', {'session_id': self.session_id})
++            except HermesWsError:
++                if not self.reconnect():
++                    print('[fm-hermes-vps-bridge] interrupt failed: connection lost', flush=True)
++                    return
++                try:
++                    self.session.rpc('session.interrupt', {'session_id': self.session_id})
++                except HermesWsError as exc2:
++                    print(f'[fm-hermes-vps-bridge] interrupt failed: {exc2}', flush=True)
++                    return
++            print('[interrupted]', flush=True)
++            return
++        _echo(line)
++        self._forward(line)
++
++    def handle_event(self, envelope):
++        payload = envelope.get('params') or {}
++        etype = payload.get('type')
++        data = payload.get('payload') or {}
++        if etype == 'message.start':
++            self.busy = True
++        elif etype == 'message.delta':
++            text = data.get('text', '')
++            if text:
++                sys.stdout.write(text)
++                sys.stdout.flush()
++        elif etype == 'message.complete':
++            self.busy = False
++            status = data.get('status', 'complete')
++            print(f'\n[turn {status}]', flush=True)
++        elif etype == 'tool.start':
++            name = data.get('name', '?')
++            context = data.get('context', '')
++            print(f'\n[tool start] {name} {context}'.rstrip(), flush=True)
++        elif etype == 'tool.complete':
++            name = data.get('name', '?')
++            summary = data.get('summary') or ''
++            print(f'[tool complete] {name} {summary}'.rstrip(), flush=True)
++        elif etype == 'error':
++            self.busy = False
++            message = data.get('message', envelope)
++            print(f'\n[error] {message}', flush=True)
++
++    def shutdown(self):
++        if self._shutdown:
++            return
++        self._shutdown = True
++        try:
++            self.session.rpc('session.close', {'session_id': self.session_id}, timeout=10)
++        except Exception:
++            pass
++        try:
++            self.session.close()
++        except Exception:
++            pass
++
++    def reconnect(self):
++        """Re-establish the WS connection after the server drops it.
++        Live-verified: the real VPS gateway closes the connection right
++        after a successful session.interrupt (and, presumably, on other
++        transient network hiccups), even though the session itself survives
++        and a brand-new connection can freely issue RPCs against its
++        existing session_id (also live-verified: session.status/steer/
++        interrupt/close all work from a connection that never created the
++        session - see docs/verification/hermes.md). Losing the bridge over
++        a dropped connection would silently kill an otherwise-healthy
++        crewmate task, so this replaces self.session rather than exiting."""
++        for _attempt in range(RECONNECT_ATTEMPTS):
++            try:
++                new_session = HermesWsSession()
++            except HermesWsError:
++                time.sleep(RECONNECT_BACKOFF)
++                continue
++            try:
++                self.session.close()
++            except Exception:
++                pass
++            self.session = new_session
++            print('[reconnected]', flush=True)
++            return True
++        return False
++
++    def run(self):
++        while not self._shutdown:
++            raw_sock = self.session._sock._sock  # same-process bridge; not crossing a public API boundary
++            try:
++                readable, _, _ = select.select([sys.stdin, raw_sock], [], [], EVENT_WAIT_TIMEOUT)
++            except (OSError, ValueError):
++                if self.reconnect():
++                    continue
++                break
++            if raw_sock in readable:
++                try:
++                    envelope = self.session.next_event(EVENT_WAIT_TIMEOUT)
++                except HermesWsError as exc:
++                    # select() reporting the socket readable proves activity
++                    # (a TCP-level signal such as a keepalive probe, not
++                    # necessarily an application frame), so a bare read
++                    # timeout here is not proof the connection died - only a
++                    # real protocol/close error is. Treating every timeout as
++                    # fatal would tear down a long-idle-but-healthy session
++                    # (nobody typing, no VPS activity) on nothing more than a
++                    # spurious wakeup.
++                    if 'timed out' in str(exc):
++                        continue
++                    print(f'[fm-hermes-vps-bridge] connection lost: {exc}', flush=True)
++                    if self.reconnect():
++                        continue
++                    break
++                self.handle_event(envelope)
++                # Drain any further events already sitting in this client's
++                # own read buffer: the server can (and does, e.g. every
++                # prompt.submit reply immediately followed by
++                # message.start/delta/complete) send several push frames
++                # back-to-back inside one TCP segment. select() alone would
++                # miss them here - it only reports fresh bytes at the OS
++                # socket, not messages HermesWsSession already parsed out of
++                # its own internal buffer, so without this a same-segment
++                # message.complete could sit unread until unrelated new
++                # traffic happened to arrive.
++                while True:
++                    try:
++                        envelope = self.session.next_event(0.05)
++                    except HermesWsError:
++                        break
++                    self.handle_event(envelope)
++            if sys.stdin in readable:
++                line = sys.stdin.readline()
++                if line == '':
++                    self.shutdown()
++                    break
++                self.handle_input_line(line.rstrip('\n'))
++
++
++def main(argv):
++    cwd = _parse_args(argv)
++    bridge = Bridge(cwd)
++
++    def _on_term(_signum, _frame):
++        bridge.shutdown()
++        sys.exit(0)
++
++    signal.signal(signal.SIGTERM, _on_term)
++    signal.signal(signal.SIGINT, _on_term)
++    try:
++        bridge.start()
++    except HermesWsError as exc:
++        print(f'fm-hermes-vps-bridge: {exc}', file=sys.stderr)
++        return 1
++    try:
++        bridge.run()
++    finally:
++        bridge.shutdown()
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main(sys.argv))
+diff --git a/bin/fm-hermes-vps-bridge.sh b/bin/fm-hermes-vps-bridge.sh
+new file mode 100755
+index 0000000..b15726f
+--- /dev/null
++++ b/bin/fm-hermes-vps-bridge.sh
+@@ -0,0 +1,40 @@
++#!/usr/bin/env bash
++# fm-hermes-vps-bridge.sh - thin env-resolving wrapper around
++# fm-hermes-vps-bridge.py, the long-lived local process that renders a
++# captain's remote VPS Hermes /api/ws session into an ordinary firstmate
++# pane so a VPS-dispatched Hermes crewmate shows up and behaves like any
++# other crewmate. See fm-hermes-vps-bridge.py's own header for exactly what
++# it does inside the pane, and docs/verification/hermes.md's "hermes-vps"
++# section for the live evidence this was built from.
++#
++# Usage: fm-hermes-vps-bridge.sh --cwd <path>
++#
++# Configuration and credentials are resolved the identical way
++# bin/fm-hermes-ws.sh resolves them (bin/fm-hermes-ws-env-lib.sh is the one
++# owner of that env/.env fill), so the captain's VPS login lives only in
++# $FM_HOME/.env, never in a launch command, task brief, or status line.
++
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++FM_HOME="${FM_HOME:-}"
++if [ -z "$FM_HOME" ]; then
++  FM_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
++fi
++
++# shellcheck source=bin/fm-hermes-ws-env-lib.sh
++. "$SCRIPT_DIR/fm-hermes-ws-env-lib.sh"
++fm_hermes_ws_load_env "$FM_HOME"
++
++PY="$(command -v python3 || true)"
++if [ -z "$PY" ]; then
++  echo "fm-hermes-vps-bridge: python3 required" >&2
++  exit 1
++fi
++PY_BIN="$SCRIPT_DIR/fm-hermes-vps-bridge.py"
++if [ ! -f "$PY_BIN" ]; then
++  echo "fm-hermes-vps-bridge: $PY_BIN missing" >&2
++  exit 1
++fi
++
++exec "$PY" "$PY_BIN" "$@"
+diff --git a/bin/fm-hermes-ws-env-lib.sh b/bin/fm-hermes-ws-env-lib.sh
+new file mode 100644
+index 0000000..db332b6
+--- /dev/null
++++ b/bin/fm-hermes-ws-env-lib.sh
+@@ -0,0 +1,44 @@
++#!/usr/bin/env bash
++# fm-hermes-ws-env-lib.sh - the ONE owner of FM_HERMES_WS_* environment
++# resolution, shared by every local process that needs to reach the
++# captain's VPS Hermes gateway: bin/fm-hermes-ws.sh (the one-shot RPC CLI)
++# and bin/fm-hermes-vps-bridge.sh (the long-lived fleet-dispatch bridge).
++# Extracted so the two callers can never drift on how a credential is
++# resolved or filled from $FM_HOME/.env - see bin/fm-hermes-ws.py's header
++# for the exact variable contract this fills.
++#
++# Sourced by scripts; has no side effects on source beyond defining
++# fm_hermes_ws_load_env. Never logs or echoes a credential value.
++
++# One KEY=VALUE lookup from a .env-style file: last assignment wins,
++# tolerates a leading "export ", surrounding whitespace, and one layer of
++# matching quotes. Prints nothing when the file or key is absent.
++_fm_hermes_ws_env_get() {
++  local key=$1 file=$2 line val
++  [ -f "$file" ] || return 0
++  line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -n1) || return 0
++  [ -n "$line" ] || return 0
++  val=${line#*=}
++  val=${val#"${val%%[![:space:]]*}"}
++  val=${val%"${val##*[![:space:]]}"}
++  case "$val" in
++    \"*\") val=${val#\"}; val=${val%\"} ;;
++    \'*\') val=${val#\'}; val=${val%\'} ;;
++  esac
++  printf '%s' "$val"
++}
++
++# fm_hermes_ws_load_env: export every unset FM_HERMES_WS_* variable from
++# <fm-home>/.env (env wins over .env, matching fm-mail.sh's convention).
++fm_hermes_ws_load_env() {  # <fm-home>
++  local fm_home=$1 env_file="$1/.env" var val
++  for var in FM_HERMES_WS_BASE_URL FM_HERMES_WS_TOKEN FM_HERMES_WS_USER FM_HERMES_WS_PASS \
++             FM_HERMES_WS_PROVIDER FM_HERMES_WS_ORIGIN FM_HERMES_WS_TIMEOUT; do
++    if [ -z "${!var:-}" ]; then
++      val=$(_fm_hermes_ws_env_get "$var" "$env_file")
++      if [ -n "$val" ]; then
++        export "$var=$val"
++      fi
++    fi
++  done
++}
+diff --git a/bin/fm-hermes-ws.sh b/bin/fm-hermes-ws.sh
+index 4c3947d..71e44f1 100755
+--- a/bin/fm-hermes-ws.sh
++++ b/bin/fm-hermes-ws.sh
+@@ -18,7 +18,8 @@
+ # back to the repo root when unset. Required: FM_HERMES_WS_BASE_URL, plus
+ # either FM_HERMES_WS_TOKEN (loopback/--insecure) or FM_HERMES_WS_USER +
+ # FM_HERMES_WS_PASS (gated mode) - fm-hermes-ws.py enforces this and never
+-# logs a credential.
++# logs a credential. The env/.env resolution itself is shared with
++# bin/fm-hermes-vps-bridge.sh (bin/fm-hermes-ws-env-lib.sh is the one owner).
+ 
+ set -euo pipefail
+ 
+@@ -27,35 +28,10 @@ FM_HOME="${FM_HOME:-}"
+ if [ -z "$FM_HOME" ]; then
+   FM_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+ fi
+-ENV_FILE="$FM_HOME/.env"
+ 
+-# One KEY=VALUE lookup from a .env-style file: last assignment wins,
+-# tolerates a leading "export ", surrounding whitespace, and one layer of
+-# matching quotes. Prints nothing when the file or key is absent.
+-_hermes_ws_env_get() {
+-  local key=$1 file=$2 line val
+-  [ -f "$file" ] || return 0
+-  line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -n1) || return 0
+-  [ -n "$line" ] || return 0
+-  val=${line#*=}
+-  val=${val#"${val%%[![:space:]]*}"}
+-  val=${val%"${val##*[![:space:]]}"}
+-  case "$val" in
+-    \"*\") val=${val#\"}; val=${val%\"} ;;
+-    \'*\') val=${val#\'}; val=${val%\'} ;;
+-  esac
+-  printf '%s' "$val"
+-}
+-
+-for var in FM_HERMES_WS_BASE_URL FM_HERMES_WS_TOKEN FM_HERMES_WS_USER FM_HERMES_WS_PASS \
+-           FM_HERMES_WS_PROVIDER FM_HERMES_WS_ORIGIN FM_HERMES_WS_TIMEOUT; do
+-  if [ -z "${!var:-}" ]; then
+-    val=$(_hermes_ws_env_get "$var" "$ENV_FILE")
+-    if [ -n "$val" ]; then
+-      export "$var=$val"
+-    fi
+-  fi
+-done
++# shellcheck source=bin/fm-hermes-ws-env-lib.sh
++. "$SCRIPT_DIR/fm-hermes-ws-env-lib.sh"
++fm_hermes_ws_load_env "$FM_HOME"
+ 
+ PY="$(command -v python3 || true)"
+ if [ -z "$PY" ]; then
+diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
+index 45b89ff..c3b4547 100755
+--- a/bin/fm-spawn.sh
++++ b/bin/fm-spawn.sh
+@@ -133,7 +133,7 @@
+ #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
+ #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
+ #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
+-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes)
++#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes|hermes-vps)
+ #   overrides it for this spawn (either kind). A non-flag string containing
+ #   whitespace is treated as a RAW launch command - the escape hatch for verifying
+ #   new adapters. For pi and pi-signed, fm-spawn resolves the selected executable
+@@ -1415,7 +1415,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
+   }
+ elif [ "$KIND" = secondmate ]; then
+   case "${POS[1]:-}" in
+-    ''|claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes)
++    ''|claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes|hermes-vps)
+       ARG3=${POS[1]:-}
+       ;;
+     *' '*)
+@@ -1758,6 +1758,19 @@ launch_template() {
+     # see docs/verification/hermes.md for the live evidence and the
+     # open captain decision this leaves.
+     hermes) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESBIN__ --cli --yolo __MODELFLAG__' ;;
++    # hermes-vps (the VPS-bridged transport, docs/verification/hermes.md
++    # "hermes-vps"): the pane never runs the real `hermes` binary at all - it
++    # runs bin/fm-hermes-vps-bridge.py, a local process that creates a
++    # session against the captain's remote VPS gateway
++    # (bin/fm-hermes-ws.py's /api/ws JSON-RPC client) and renders that
++    # session's conversation into this pane. __WORKTREE__ is passed as the
++    # bridge's own --cwd (best-effort only: session.create's cwd param is
++    # NOT honored on the real VPS, live-verified, so it does not confine the
++    # VPS agent's own tools to this worktree - see the bridge's own header
++    # and hermes-vps.md's "Known limitation" for what that means for a task
++    # that needs local repo access). No model/effort flag exists for this
++    # transport (record-and-omit, matching hermes/kimi below).
++    hermes-vps) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESVPSBRIDGE__ --cwd __WORKTREE__' ;;
+     *) return 1 ;;
+   esac
+ }
+@@ -1838,6 +1851,18 @@ if [ "$KIND" = secondmate ] && [ "$HARNESS" = hermes ]; then
+   exit 1
+ fi
+ 
++# hermes-vps has real control-plane mechanics (a real session.interrupt RPC,
++# unlike bare hermes above), but it shares hermes's OTHER gap: no primary
++# supervision protocol exists for it (docs/supervision-protocols/ carries no
++# hermes-vps wake protocol), and its bridge process has no turn-end hook to
++# arm one from. A secondmate is a firstmate instance that must itself be
++# supervised, so it is refused for the same reason as its pane-based
++# sibling, independent of the interrupt-support difference.
++if [ "$KIND" = secondmate ] && [ "$HARNESS" = hermes-vps ]; then
++  echo "error: hermes-vps is a verified crewmate/scout adapter only and cannot run a secondmate; it has no primary supervision protocol. Select a harness verified for secondmates." >&2
++  exit 1
++fi
++
+ case "$HARNESS" in
+   pi|pi-signed)
+     PI_BIN=$(resolve_pi_executable "$HARNESS") || {
+@@ -2154,7 +2179,10 @@ effort_flag_for_harness() {
+     # hermes exposes no effort/reasoning-level concept at all (checked against
+     # v0.16.0 --help and a grep of both hermes --help and hermes chat --help
+     # for effort/reasoning); the requested axis stays in task metadata only,
+-    # same record-and-omit contract as kimi.
++    # same record-and-omit contract as kimi. hermes-vps shares the same gap:
++    # session.create's own RPC signature carries no model or effort param
++    # (docs/verification/hermes.md), so both axes stay record-and-omit for it
++    # too - neither harness gets a case in model_flag_for_harness either.
+   esac
+ }
+ 
+@@ -2205,6 +2233,15 @@ case "$LAUNCH" in
+     ;;
+ esac
+ 
++case "$LAUNCH" in
++  *__HERMESVPSBRIDGE__*)
++    # A fixed, tracked script inside this firstmate install, not a PATH
++    # search like every resolve_*_binary above (there is no vendor binary to
++    # find - see the hermes-vps launch_template case).
++    LAUNCH=${LAUNCH//__HERMESVPSBRIDGE__/$(shell_quote "$FM_ROOT/bin/fm-hermes-vps-bridge.sh")}
++    ;;
++esac
++
+ json_escape() {
+   printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+ }
+@@ -3347,6 +3384,65 @@ hermes_spawn_fail() {  # <detail>
+   rovo_endpoint_cleanup
+ }
+ 
++# harness=hermes-vps: the VPS-bridged transport (docs/verification/hermes.md
++# "hermes-vps"). bin/fm-hermes-vps-bridge.py owns the pane, not the real
++# `hermes` binary, so its readiness/delivery signals are markers THIS bridge
++# prints itself rather than anything the vendor CLI renders - a stronger,
++# fully-controlled proof than every launch-then-send harness above, which
++# must infer readiness/delivery from vendor UI text. There is deliberately
++# no composer-emptiness half here: a scrolling event log has no composer for
++# bin/fm-composer-lib.sh to classify.
++hermes_vps_capture() {
++  fm_backend_capture "$BACKEND" "$T" 120 "$W" 2>/dev/null || true
++}
++
++hermes_vps_wait_for_ready() {
++  local pane i=0 max=${FM_HERMES_VPS_READY_POLLS:-60} interval=${FM_HERMES_VPS_POLL_INTERVAL:-0.5}
++  while [ "$i" -lt "$max" ]; do
++    pane=$(hermes_vps_capture)
++    printf '%s\n' "$pane" | grep -Fq 'Hermes VPS bridge ready.' && return 0
++    i=$((i + 1))
++    [ "$i" -ge "$max" ] || sleep "$interval"
++  done
++  return 1
++}
++
++# hermes_vps_session_id: the session_id the bridge minted via session.create,
++# read back from its own printed readiness line (never guessed, never
++# re-derived) so it can be recorded in state/<id>.meta for
++# bin/fm-busy-lib.sh's live status pull and bin/fm-control.sh's lifecycle
++# verbs to use.
++hermes_vps_session_id() {
++  local pane line
++  pane=$(hermes_vps_capture)
++  line=$(printf '%s\n' "$pane" | grep -F 'Hermes VPS bridge ready.' | tail -n1)
++  case "$line" in
++    *'session_id='*) printf '%s' "${line#*session_id=}" ;;
++  esac
++}
++
++hermes_vps_delivery_is_confirmed() {  # <plain-pane-capture>
++  local pane=$1
++  printf '%s\n' "$pane" | grep -qE '^●[[:space:]]*Read the brief at'
++}
++
++hermes_vps_wait_for_delivery() {
++  local pane i=0 max=${FM_HERMES_VPS_DELIVERY_POLLS:-40} interval=${FM_HERMES_VPS_POLL_INTERVAL:-0.5}
++  while [ "$i" -lt "$max" ]; do
++    pane=$(hermes_vps_capture)
++    hermes_vps_delivery_is_confirmed "$pane" && return 0
++    i=$((i + 1))
++    [ "$i" -ge "$max" ] || sleep "$interval"
++  done
++  return 1
++}
++
++hermes_vps_spawn_fail() {  # <detail>
++  printf 'failed: %s\n' "$1" >> "$STATE/$ID.status"
++  echo "error: $1; inspect window $T" >&2
++  rovo_endpoint_cleanup
++}
++
+ # The launch-then-confirm gates run after the task record is published, when
+ # ORCA_ABORT_CLEANUP is already cleared and neither the abort trap nor a
+ # teardown owns this endpoint yet, so a gate failure must close the launched
+@@ -4235,7 +4331,7 @@ case "$HARNESS" in
+ esac
+ LAUNCH=${LAUNCH//__WORKTREE__/$sq_worktree}
+ case "$HARNESS" in
+-  claude|codex|opencode|pi|pi-signed|grok|kimi|gemini|muse|rovo|agy|hermes)
++  claude|codex|opencode|pi|pi-signed|grok|kimi|gemini|muse|rovo|agy|hermes|hermes-vps)
+     LAUNCH="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI $LAUNCH"
+     ;;
+ esac
+@@ -4302,6 +4398,35 @@ spawn_record_traceparent() {
+   return "$status"
+ }
+ 
++# hermes_vps_record_session_id: the VPS session_id is only known once the
++# bridge's readiness line has actually been captured, well after task
++# metadata was first published (SPAWN_META_TMP/lock above), so it is folded
++# in with the same lock-then-atomic-rewrite idiom spawn_record_traceparent
++# uses for the same reason (a value discovered after publication).
++hermes_vps_record_session_id() {  # <session-id>
++  local sid=$1 meta="$STATE/$ID.meta" status=0 acquired=0
++  if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
++    SPAWN_META_LOCK=$(fm_meta_lock_path "$meta") || return 1
++    fm_lock_acquire_wait "$SPAWN_META_LOCK"
++    SPAWN_META_LOCK_HELD=1
++    acquired=1
++  fi
++  SPAWN_META_TMP="$STATE/.$ID.meta.hermesvps.${BASHPID:-$$}"
++  if [ ! -f "$meta" ] || [ ! -w "$meta" ] \
++     || ! awk -F= '$1 != "hermes_vps_session_id"' "$meta" > "$SPAWN_META_TMP" \
++     || ! printf 'hermes_vps_session_id=%s\n' "$sid" >> "$SPAWN_META_TMP" \
++     || ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$meta" "task record" "$STATE"; then
++    status=1
++    rm -f "$SPAWN_META_TMP" 2>/dev/null || true
++  fi
++  SPAWN_META_TMP=
++  if [ "$acquired" = 1 ]; then
++    fm_lock_release "$SPAWN_META_LOCK" || status=1
++    SPAWN_META_LOCK_HELD=0
++  fi
++  return "$status"
++}
++
+ # Export GOTMPDIR into the crewmate's pane shell so the agent and every child
+ # process (go build, go test, ...) inherit it. Sent before the launch command so
+ # the env is set when the agent starts; the brief sleep lets the export land.
+@@ -4431,6 +4556,39 @@ if [ "$HARNESS" = hermes ]; then
+     exit 1
+   fi
+ fi
++if [ "$HARNESS" = hermes-vps ]; then
++  if ! hermes_vps_wait_for_ready; then
++    hermes_vps_spawn_fail "hermes-vps bridge did not show a verified ready signal before brief delivery in window $T"
++    exit 1
++  fi
++  HERMES_VPS_SESSION_ID=$(hermes_vps_session_id)
++  if [ -z "$HERMES_VPS_SESSION_ID" ]; then
++    hermes_vps_spawn_fail "hermes-vps bridge's readiness line carried no session_id in window $T"
++    exit 1
++  fi
++  HERMES_VPS_POINTER="Read the brief at $BRIEF_REAL and follow it exactly."
++  HERMES_VPS_SUBMIT_RETRIES=${FM_HERMES_VPS_SUBMIT_RETRIES:-3}
++  HERMES_VPS_SUBMIT_SLEEP=${FM_HERMES_VPS_SUBMIT_SLEEP:-${FM_HERMES_VPS_POLL_INTERVAL:-0.5}}
++  HERMES_VPS_SUBMIT_SETTLE=${FM_HERMES_VPS_SUBMIT_SETTLE:-0}
++  if ! HERMES_VPS_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
++      "$BACKEND" "$T" "$HERMES_VPS_POINTER" "$HERMES_VPS_SUBMIT_RETRIES" \
++      "$HERMES_VPS_SUBMIT_SLEEP" "$HERMES_VPS_SUBMIT_SETTLE" "$W"); then
++    hermes_vps_spawn_fail "hermes-vps brief pointer could not be submitted into window $T"
++    exit 1
++  fi
++  if [ "$HERMES_VPS_SUBMIT_VERDICT" = send-failed ]; then
++    hermes_vps_spawn_fail "hermes-vps brief pointer could not be submitted into window $T"
++    exit 1
++  fi
++  if ! hermes_vps_wait_for_delivery; then
++    hermes_vps_spawn_fail "hermes-vps brief pointer delivery was not confirmed in window $T"
++    exit 1
++  fi
++  if ! hermes_vps_record_session_id "$HERMES_VPS_SESSION_ID"; then
++    hermes_vps_spawn_fail "hermes-vps session $HERMES_VPS_SESSION_ID could not be recorded in this task's durable record"
++    exit 1
++  fi
++fi
+ if [ "$HARNESS" = agy ]; then
+   if ! agy_wait_for_working; then
+     if [ "$AGY_TRUST_ANSWERED" -eq 1 ]; then
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 950dd21..edcce27 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -254,7 +254,7 @@ The session-start bootstrap step keeps valid dispatch configuration silent unles
+ When the file exists, `fm-spawn.sh` refuses crewmate and scout launches without an explicit harness, so `config/crew-harness` is only automatic when no dispatch profile file is active.
+ Secondmate launches are exempt because they resolve the secondmate harness and any optional secondmate model or effort tokens instead.
+ Unsupported effort values are still recorded in task meta when passed to `fm-spawn.sh`, but the launch template omits any effort flag that the selected harness does not accept.
+-That keeps spawn launch compatible across claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, omp, agy, and hermes while preserving the requested profile for later audit.
++That keeps spawn launch compatible across claude, codex, opencode, pi, pi-signed, grok, kimi, cursor, gemini, muse, rovo, omp, agy, hermes, and hermes-vps while preserving the requested profile for later audit.
+ 
+ ## Optional secondmates
+ 
+diff --git a/docs/configuration.md b/docs/configuration.md
+index fcff318..8ec7c46 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -316,6 +316,7 @@ gemini is likewise refused for secondmates because it has no primary supervision
+ rovo is likewise verified for crewmate and scout launches ONLY, refused for a secondmate for the same reason - no turn-end hook and no primary supervision protocol; [`docs/verification/rovo.md`](verification/rovo.md) owns that evidence, including the OAuth token's silent background refresh from a stored refresh token and both tmux and herdr pane liveness (herdr placement is verified live, with a Herdr-side agent-detection gap left open for recovery classification).
+ agy is likewise verified for crewmate and scout launches ONLY, refused for a secondmate for the same reason - no hook surface and no primary supervision protocol; [`docs/verification/agy.md`](verification/agy.md) owns that evidence, including the spawn-time worktree trust pre-registration through `bin/fm-agy-trust.sh` and Herdr's native agy pane recognition.
+ hermes is likewise verified for crewmate and scout launches ONLY, refused for a secondmate for the same reason - no hook surface and no primary supervision protocol; [`docs/verification/hermes.md`](verification/hermes.md) owns that evidence, including the `--cli` launch-then-send shape, the terminal-backend prerequisite, and why hermes carries no verified interrupt or exit-while-busy mechanic at all (Ctrl+C exits the whole session; the only safe redirect is typing new text and pressing Enter while busy).
++hermes-vps - the VPS-bridged transport that renders a captain's remote VPS Hermes `/api/ws` session into an ordinary local pane through `bin/fm-hermes-vps-bridge.py` - is likewise verified for crewmate and scout launches ONLY, refused for a secondmate because no primary supervision protocol exists for it either; unlike bare hermes it DOES have a real, verified interrupt (`session.interrupt`) and exit (its bridge's own `/exit` command, which closes the VPS session before exiting); [`docs/verification/hermes.md`](verification/hermes.md) owns that evidence, including the load-bearing limitation that the VPS does not honor `session.create`'s `cwd`, so this transport cannot read or edit a task's local git worktree.
+ New harnesses get verified through a supervised trial task before joining the set.
+ The verified adapter evidence - each harness's busy-state source, interrupt and exit behavior, skill-invocation syntax, and per-harness quirks - lives in the skill tree rooted at [`.agents/skills/harness-adapters/SKILL.md`](../.agents/skills/harness-adapters/SKILL.md).
+ The executable interrupt and exit mechanics live in [`bin/fm-control-lib.sh`](../bin/fm-control-lib.sh), and [`docs/agent-control.md`](agent-control.md) owns their lifecycle-control architecture.
+diff --git a/docs/verification/hermes.md b/docs/verification/hermes.md
+index 74795e9..9bbbb4f 100644
+--- a/docs/verification/hermes.md
++++ b/docs/verification/hermes.md
+@@ -258,8 +258,9 @@ Until that credential is supplied, this flow is verified by source and by the tw
+ 
+ ## `bin/fm-hermes-ws.py`/`.sh`: a standalone JSON-RPC-over-WebSocket dispatch client, offline-verified
+ 
+-Per the captain's decision on `state/hermes-vps-gateway.status`, this is a standalone dispatch primitive only - it is deliberately NOT wired into `bin/fm-spawn.sh`, `bin/fm-control.sh`, `bin/fm-crew-state.sh`, or `bin/fm-busy-lib.sh`, since those are entirely pane/text-capture-shaped (`fm_backend_capture`, `fm_backend_composer_state`, `fm_backend_send_key`, ...) and a `/api/ws` session has no pane at all.
+-Fleet-dispatch wiring is deferred to a follow-up task once this primitive is proven live.
++Per the captain's decision on `state/hermes-vps-gateway.status`, this landed first as a standalone dispatch primitive, deliberately NOT wired into `bin/fm-spawn.sh`, `bin/fm-control.sh`, `bin/fm-crew-state.sh`, or `bin/fm-busy-lib.sh` at the time, since those are entirely pane/text-capture-shaped (`fm_backend_capture`, `fm_backend_composer_state`, `fm_backend_send_key`, ...) and a `/api/ws` session has no pane at all.
++The fleet-dispatch follow-up landed once this primitive was proven live: see "hermes-vps: fleet-dispatch wiring" below for `harness=hermes-vps`, the bridge that gives a `/api/ws` session an ordinary pane, and its own live evidence.
++This client and wrapper remain the standalone dispatch primitive underneath that harness, and stay usable directly for ad hoc probing exactly as documented here.
+ 
+ The client (`bin/fm-hermes-ws.py`, stdlib-only Python - no third-party dependency, matching `bin/fm-mail.py`'s existing no-dependency stance rather than the real Hermes reference client's `pip install websockets`) implements, from scratch: the RFC 6455 client handshake and masked text-frame framing, the gated-mode `password-login -> cookie -> ws-ticket -> ?ticket=` flow above (loopback/`--insecure` mode uses a static `?token=` instead, via `FM_HERMES_WS_TOKEN`), and id-matched JSON-RPC request/response over the connection, draining the server's `gateway.ready` notification on connect.
+ `bin/fm-hermes-ws.sh` is a thin wrapper resolving `FM_HERMES_WS_*` configuration from the environment, filling gaps from `$FM_HOME/.env` (env wins), matching `fm-mail.sh`'s convention - the captain's VPS login credentials belong in `$FM_HOME/.env` as `FM_HERMES_WS_USER`/`FM_HERMES_WS_PASS`, the same already-gitignored, already-documented file that holds mail-plane credentials, never in a task brief, status line, or report.
+@@ -337,3 +338,81 @@ This is the safety-relevant fact this whole transport exists to deliver: unlike
+ Not re-diagnosed further here (out of this task's scope), but load-bearing for any future fleet-dispatch wiring: **do not assume `cwd` pins a crewmate's working directory on this transport** without re-confirming it on the specific deployment/version in use; a follow-up wiring task needs its own answer for worktree confinement here; the file-tool "no confinement at all" finding for the pane-based adapter (same skill reference doc) is a separate, already-documented fact and is not contradicted by this.
+ 
+ Re-run `bash tests/fm-hermes-ws.test.sh` after any change to the client or the stub; re-run a live `dispatch` after any Hermes upgrade on either the client's assumptions or the VPS's version, since the wire protocol, `cwd` handling, and the rendered `session.status` text are all vendor-controlled surfaces.
++
++## hermes-vps: fleet-dispatch wiring, live-verified end to end
++
++Verified 2026-09-14 against the same real VPS (Hermes Agent v0.21.2, `gateway_mode: multiplex`).
++This section is the evidence record for `harness=hermes-vps`; `../../.agents/skills/harness-adapters/references/harness/hermes-vps.md` owns the operating facts.
++
++### Design decision: a harness, not a backend
++
++The prior task's brief left open whether the VPS transport should be a new `--backend` value or a harness variant.
++This task chose **a new harness** (`hermes-vps`), selected exactly like any other adapter (`bin/fm-spawn.sh --harness hermes-vps`), running on whichever ordinary session-provider backend the task already uses (tmux, verified below; herdr, verified live in this task's required isolated lab session - see "Herdr pane visibility").
++Reasoning: firstmate's `--backend` axis (tmux/herdr/zellij/orca/cmux) answers "which session-provider hosts this task's local pane," and a VPS-bridged Hermes session still needs an ordinary LOCAL pane to be visible in a Herdr workspace exactly as this task's brief required - only the pane's own foreground *process* differs (a bridge script instead of a real agent CLI), which is precisely what the harness axis already exists to select.
++Treating it as a backend would have meant reimplementing every pane primitive (`fm_backend_capture`, `_send_key`, `_send_text_submit`, ...) for a target that is not a pane at all, when the actual local presentation IS an ordinary pane.
++
++### The bridge: `bin/fm-hermes-vps-bridge.py`/`.sh`
++
++A new local process, tracked in this repo, that a normal `hermes-vps` task pane runs instead of the real `hermes` binary.
++It opens one `bin/fm-hermes-ws.py` `HermesWsSession`, creates a session, and single-threads a `select()` loop over stdin and the WS socket for the rest of the task's life: server-pushed events (`message.delta`/`message.complete`/`tool.start`/`tool.complete`/`error`, read directly from the installed Hermes source's `tui_gateway/server.py` `_emit()` payload shapes) render into the pane; typed lines forward to the session (`prompt.submit` while idle, `session.steer` while busy).
++`bin/fm-hermes-ws-env-lib.sh` factors the `FM_HERMES_WS_*`/`.env` resolution out of `bin/fm-hermes-ws.sh` so the bridge shares it verbatim rather than duplicating it - re-run `bash tests/fm-hermes-ws.test.sh` after touching that shared file, since it is the same credential path the standalone client depends on.
++
++Two real, load-bearing bugs were found and fixed only by driving the bridge against the real VPS (a stub server could not have caught either, since both depend on genuine network timing):
++
++1. **Same-segment event starvation.** The server answers `prompt.submit` with its RPC result immediately followed by `message.start`/`message.delta`/`message.complete` in rapid succession, often arriving in the client's read buffer together. `select()` on the raw socket only reports fresh OS-level bytes, not messages `HermesWsSession` already parsed into its own internal buffer, so relying on `select()` alone left later events in that burst unread until unrelated later traffic happened to arrive. Fixed by draining every already-buffered event in a tight non-blocking loop after each `select()`-triggered read.
++2. **The gateway drops the connection after a successful interrupt.** Live-reproduced twice, independently, with and without an in-flight tool call: `session.interrupt` returns its own successful RPC result, the turn correctly reports `message.complete` with `status: "interrupted"`, and then the server closes the WebSocket outright (`the gateway closed the WebSocket connection`). The session itself survives - a fresh connection can immediately query `session.status`/`session.steer`/etc. against the same `session_id` - so this is a connection-lifecycle quirk, not a session-lifecycle one. The bridge now reconnects transparently (`Bridge.reconnect()`, bounded retries) on any dropped connection, including this one, rather than exiting and silently killing an otherwise-healthy crewmate task. Confirmed live: interrupt a long text generation, watch the connection drop and the bridge print `[reconnected]`, then submit a fresh prompt on the SAME session and get a normal reply, then `/exit` and confirm the session closes cleanly.
++
++### Brief delivery: content, not a pointer
++
++Every other launch-then-send harness (kimi/rovo/hermes) receives `Read the brief at <path> and follow it exactly.` and opens that path itself.
++A VPS-hosted Hermes session cannot: it runs on a different machine with no access to this one's filesystem.
++The bridge - which does run locally - special-cases exactly the first line it receives matching that shape: it reads the file itself and forwards its CONTENT via `prompt.submit`, echoing the original pointer line with a leading `●` (matching bare hermes's own accepted-message convention) so `bin/fm-spawn.sh`'s delivery gate can grep for the identical marker.
++Live-verified: `bin/fm-spawn.sh hvfinal <project> --scout --harness hermes-vps` against a real VPS session correctly delivered a brief whose `## Captain's intent` instructed `pwd && echo HERMES_VPS_LIVE_VERIFY_MARKER`; the VPS agent ran it via its own `terminal` tool and replied with `/` and `HERMES_VPS_LIVE_VERIFY_MARKER` exactly.
++
++### Fleet wiring landed
++
++- `bin/fm-spawn.sh`: `hermes-vps` launch template (`env -u ... bin/fm-hermes-vps-bridge.sh --cwd <worktree>`), its own readiness/delivery gates (`hermes_vps_wait_for_ready`/`_wait_for_delivery`, keyed on the bridge's own printed markers rather than vendor UI text), and `hermes_vps_record_session_id` folding the VPS `session_id` into `state/<id>.meta` as `hermes_vps_session_id=` once delivery is confirmed - the field a captain or firstmate reads to tell at a glance that a task is VPS-bridged rather than pane-based `hermes`. Record-and-omit for model/effort, matching bare hermes (no such RPC param exists).
++- `bin/fm-busy-lib.sh`: `fm_busy_hermes_vps_agent_running` pulls `session.status`'s literal `Agent Running: Yes`/`Agent Running: No` line over a fresh RPC each time it is asked - live-verified busy during a real `sleep 60` tool call and idle once it completed.
++- `bin/fm-control-lib.sh`/`bin/fm-control.sh`: `hermes-vps` is control-plane supported (unlike bare hermes). `fm_control_interrupt_via_text` names the literal line `/interrupt`, delivered through the ordinary text-submit pane mechanic (this transport has no composer for a named key to act on); the bridge recognizes it locally and calls the real `session.interrupt` RPC. `/exit` reuses the existing text-submit exit path unchanged - the bridge recognizes it locally too, closes the VPS session, and exits.
++- `bin/fm-agent-process-lib.sh`/`bin/fm-hermes-lib.sh`: `fm_hermes_vps_bridge_path_is_bridge`/`_args_are_bridge`/`_pid_is_bridge` give the bridge's python-interpreter-argv[1] shape its own structural identity (distinct from bare hermes's), wired into `fm_agent_process_classify`.
++- `bin/backends/tmux.sh`: `fm_backend_tmux_agent_state` needed a NEW pid/args-based check for the bridge, mirroring the existing Gemini one - its foreground-comm/argv0 loops alone never carry a python-interpreter-shaped identity. **This exposed a pre-existing, separate gap for bare hermes**: `fm_backend_tmux_agent_state` has no hermes pid/args check either, so a bare-hermes pane would also read `ambiguous` there today - untested and inert only because bare hermes is deliberately absent from `fm_control_harness_supported` and never reaches this function through `fm-control.sh`. Flagged here rather than silently fixed, since it is a bare-hermes gap outside this task's scope.
++
++### Live fleet-dispatch runs (dated evidence)
++
++Driven through the real, unmodified `bin/fm-spawn.sh`/`bin/fm-control.sh`/`bin/fm-crew-state.sh` against an isolated scratch firstmate home and an isolated tmux server (never the shared production fleet or its real `data/`/`state/`), with `FM_HERMES_WS_*` credentials read from the real running firstmate home's `.env` exactly as `bin/fm-hermes-ws.py` documents - never copied into the scratch home or any other file.
++
++```
++$ bin/fm-spawn.sh hvfinal <project> --scout --harness hermes-vps
++spawned hvfinal harness=hermes-vps kind=scout window=firstmate:fm-hvfinal worktree=.../2/firstmate
++# state/hvfinal.meta: harness=hermes-vps, hermes_vps_session_id=eae406ed
++# pane: readiness banner -> brief delivered -> real terminal tool call -> "/" and
++# HERMES_VPS_LIVE_VERIFY_MARKER -> [turn complete]
++
++$ bin/fm-crew-state.sh hvlast    # mid sleep-60 tool call
++state: working · source: pane · harness busy (hermes-vps-status)
++
++$ bin/fm-control.sh hvlast interrupt
++interrupt-delivered hvlast harness=hermes-vps backend=tmux verified=agent-alive cancel=unconfirmed
++# pane: /interrupt -> [interrupted] -> [tool complete] terminal -> [turn interrupted]
++
++$ bin/fm-control.sh hvlast exit
++stopped hvlast harness=hermes-vps backend=tmux endpoint=firstmate:fm-hvlast worktree=.../2/firstmate
++# pane foreground command back to zsh; bridge process gone
++
++$ bin/fm-hermes-ws.sh status 14556083   # the exited task's own VPS session
++fm-hermes-ws.py: session.status: {'code': 4001, 'message': 'session not found'}
++# confirmed: no leaked server-side session after fm-control.sh exit
++```
++
++Every VPS session this task created (via the bridge directly, via `fm-spawn.sh`, and via ad hoc `fm-hermes-ws.sh` probes) was independently confirmed closed or already-gone by the end of the task - `session.close`/`session.interrupt`/`session.status` against a stale id consistently answered `session not found` rather than ever leaving a live orphan.
++
++### Herdr pane visibility
++
++Confirmed live, inside this task's required isolated Herdr lab session (`bin/fm-herdr-lab.sh`), that a `--backend herdr --harness hermes-vps` spawn places the bridge in an ordinary Herdr-managed pane, indistinguishable in the workspace from any other crewmate pane: the same readiness banner, brief delivery, streamed conversation, and `fm-control.sh interrupt`/`exit` behavior as the tmux run above, since `bin/backends/herdr.sh`'s own agent-process classifier already calls the shared `fm_agent_process_classify` (no herdr-specific gap, unlike tmux's - see above).
++
++### Known limitation: no local file or repo access
++
++**`session.create`'s `cwd` param is still not honored** on this VPS (same finding as above, re-confirmed here): the VPS agent's own tools reach only the VPS's own filesystem.
++Live-verified concretely during this task's own dispatch gate test: given a brief referencing macOS paths under `/private/tmp/...` and `/Users/coryforsythe/...`, the VPS agent (a real Linux host, `6.8.0-139-generic`, home `/home/coryforsythe`) correctly reported those paths do not exist there and that `/` is not writable, and wrote its own report to the only location it could reach.
++**A `hermes-vps` crewmate cannot read or edit a task's local git worktree, run `git`, or drive the no-mistakes pipeline** - it is proven useful for VPS-local work and for this fleet-visibility wiring itself, not yet as a substitute for a real local crewmate on project work.
++Do not dispatch a ship task onto it that needs local repo access; `hermes-vps.md`'s "Known limitation" owns this for future dispatch decisions.
+diff --git a/tests/fixtures/fm-hermes-ws-stub-server.py b/tests/fixtures/fm-hermes-ws-stub-server.py
+index 8f68529..79e8e8a 100755
+--- a/tests/fixtures/fm-hermes-ws-stub-server.py
++++ b/tests/fixtures/fm-hermes-ws-stub-server.py
+@@ -207,9 +207,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
+                 text = params.get('text', '')
+                 _send_text(self.wfile, json.dumps(
+                     {'jsonrpc': '2.0', 'method': 'event', 'params': {'type': 'message.start'}}))
++                # Nested under "payload", matching the real server's _emit()
++                # shape (tui_gateway/server.py: params = {"type": event,
++                # "session_id": sid}; params["payload"] = payload when given) -
++                # confirmed by reading that source directly rather than
++                # inferred from this stub's own pre-existing (flatter) shape.
+                 _send_text(self.wfile, json.dumps(
+                     {'jsonrpc': '2.0', 'method': 'event',
+-                     'params': {'type': 'message.delta', 'text': 'stub'}}))
++                     'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
+                 if 'TRIGGER_ERROR' in text:
+                     _send_text(self.wfile, json.dumps(
+                         {'jsonrpc': '2.0', 'method': 'event',
+@@ -219,7 +224,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
+                 else:
+                     _send_text(self.wfile, json.dumps(
+                         {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'message.complete', 'text': 'stub reply'}}))
++                         'params': {'type': 'message.complete',
++                                    'payload': {'text': 'stub reply', 'status': 'complete'}}}))
+             elif method == 'session.status':
+                 _send_text(self.wfile, _rpc_result(req_id, {'agent_running': False}))
+             elif method == 'session.history':
+diff --git a/tests/fm-hermes-vps-bridge.test.sh b/tests/fm-hermes-vps-bridge.test.sh
+new file mode 100644
+index 0000000..b93742c
+--- /dev/null
++++ b/tests/fm-hermes-vps-bridge.test.sh
+@@ -0,0 +1,308 @@
++#!/usr/bin/env bash
++# Behavior tests for harness=hermes-vps: bin/fm-hermes-vps-bridge.py (the
++# local process that renders a captain's remote VPS Hermes /api/ws session
++# into an ordinary firstmate pane) and the fleet-wiring pieces that depend on
++# it - bin/fm-hermes-lib.sh's bridge process identity, its wiring into
++# bin/fm-agent-process-lib.sh's fm_agent_process_classify, and
++# bin/fm-busy-lib.sh's live status-pull classifier.
++#
++# Offline and portable, exactly like tests/fm-hermes-ws.test.sh: the real
++# bridge script runs as a real subprocess against the same
++# tests/fixtures/fm-hermes-ws-stub-server.py double over a real loopback
++# socket, so this proves actual behavior rather than asserting it from
++# static text. What is pinned here:
++#   1. Bridge process identity (fm_hermes_vps_bridge_path_is_bridge/
++#      args_are_bridge/pid_is_bridge) matches the bridge's own
++#      interpreter-argv[1] shape and nothing else, and
++#      fm_agent_process_classify recognizes it as `agent` so tmux/Herdr pane
++#      liveness proves this harness alive/dead the same way every other
++#      harness does.
++#   2. fm_busy_hermes_vps_agent_running parses session.status's literal
++#      "Agent Running: Yes"/"Agent Running: No" line, never anything else.
++#   3. The bridge's readiness banner only prints once a real VPS session
++#      exists, and carries that session's real session_id.
++#   4. Brief delivery: the bridge reads a LOCAL file itself and forwards its
++#      CONTENT (not the pointer sentence) as prompt.submit, because a remote
++#      VPS session cannot open a local path - and echoes the pointer line
++#      with a leading bullet exactly once, for fm-spawn.sh's delivery gate.
++#   5. Server-pushed events (message.start/delta/complete) are rendered into
++#      the bridge's own stdout in real time.
++#   6. /exit sends a real session.close RPC (proven via the stub's RPC log,
++#      not just the client's exit code) and then the process exits.
++#   7. /interrupt sends a real session.interrupt RPC and never reaches the
++#      model as a submitted message.
++set -u
++
++# shellcheck source=tests/lib.sh
++. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
++
++command -v python3 >/dev/null 2>&1 || { echo "skip: python3 not found"; exit 0; }
++
++BRIDGE="$ROOT/bin/fm-hermes-vps-bridge.py"
++STUB="$ROOT/tests/fixtures/fm-hermes-ws-stub-server.py"
++TMP_ROOT=$(fm_test_tmproot fm-hermes-vps-bridge)
++
++STUB_TOKEN="probetoken"
++STUB_PID=""
++
++free_port() {
++  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
++}
++
++start_stub() {
++  local port=$1 rpc_log=${2:-}
++  python3 "$STUB" "$port" unused unused "$STUB_TOKEN" "$rpc_log" \
++    >"$TMP_ROOT/stub.out" 2>"$TMP_ROOT/stub.err" &
++  STUB_PID=$!
++  local tries=0
++  while [ "$tries" -lt 100 ]; do
++    if python3 -c "
++import socket, sys
++s = socket.socket()
++s.settimeout(0.2)
++try:
++    s.connect(('127.0.0.1', $port))
++except OSError:
++    sys.exit(1)
++sys.exit(0)
++" 2>/dev/null; then
++      return 0
++    fi
++    tries=$((tries + 1))
++    sleep 0.05
++  done
++  fail "stub server on port $port never accepted a connection"
++}
++
++stop_stub() {
++  if [ -n "$STUB_PID" ]; then
++    kill "$STUB_PID" >/dev/null 2>&1 || true
++    wait "$STUB_PID" 2>/dev/null || true
++    STUB_PID=""
++  fi
++}
++trap stop_stub EXIT
++
++# read_line_timeout <fd> <seconds> -> prints the line or fails the test.
++read_line_timeout() {
++  local fd=$1 secs=$2 line
++  if ! IFS= read -r -t "$secs" -u "$fd" line; then
++    fail "timed out waiting for a line from the bridge"
++  fi
++  printf '%s' "$line"
++}
++
++# --- 1. process identity -----------------------------------------------------
++
++test_bridge_identity_functions() {
++  # shellcheck source=bin/fm-hermes-lib.sh
++  . "$ROOT/bin/fm-hermes-lib.sh"
++
++  fm_hermes_vps_bridge_path_is_bridge "$ROOT/bin/fm-hermes-vps-bridge.py" \
++    || fail "the real bridge path did not match its own identity check"
++  fm_hermes_vps_bridge_path_is_bridge "$ROOT/bin/fm-hermes-ws.py" \
++    && fail "the standalone WS client must NOT match the bridge's identity check"
++  fm_hermes_vps_bridge_path_is_bridge "/some/other/dir/hermes" \
++    && fail "an unrelated path named hermes must not match the bridge's identity check"
++
++  fm_hermes_vps_bridge_args_are_bridge "/usr/bin/python3 $ROOT/bin/fm-hermes-vps-bridge.py --cwd /tmp/x" \
++    || fail "python3 <bridge path> ... did not match args_are_bridge"
++  fm_hermes_vps_bridge_args_are_bridge "/usr/bin/python3 $ROOT/bin/fm-hermes-ws.py dispatch /tmp/x hi" \
++    && fail "the standalone WS client's argv must NOT match the bridge's args check"
++  fm_hermes_vps_bridge_args_are_bridge "/bin/zsh -c foo" \
++    && fail "an unrelated shell command must not match the bridge's args check"
++
++  pass "identity: fm_hermes_vps_bridge_path_is_bridge/args_are_bridge match only the real bridge script"
++}
++
++test_agent_process_classify_recognizes_bridge() {
++  # shellcheck source=bin/fm-session-lock-lib.sh
++  . "$ROOT/bin/fm-session-lock-lib.sh"
++  # shellcheck source=bin/fm-gemini-lib.sh
++  . "$ROOT/bin/fm-gemini-lib.sh"
++  # shellcheck source=bin/fm-hermes-lib.sh
++  . "$ROOT/bin/fm-hermes-lib.sh"
++  # shellcheck source=bin/fm-cursor-lib.sh
++  [ -f "$ROOT/bin/fm-cursor-lib.sh" ] && . "$ROOT/bin/fm-cursor-lib.sh"
++  # shellcheck source=bin/fm-agent-process-lib.sh
++  . "$ROOT/bin/fm-agent-process-lib.sh"
++
++  local verdict
++  verdict=$(fm_agent_process_classify python3 '' "/usr/bin/python3 $ROOT/bin/fm-hermes-vps-bridge.py --cwd /tmp/x")
++  [ "$verdict" = agent ] || fail "fm_agent_process_classify did not classify the bridge's argv as 'agent', got: $verdict"
++
++  pass "fm_agent_process_classify recognizes the bridge's interpreter-argv[1] shape as an agent"
++}
++
++# --- 2. busy-lib live status pull --------------------------------------------
++
++test_busy_hermes_vps_agent_running_parses_status() {
++  local fakebin
++  fakebin="$TMP_ROOT/busy-fakebin"
++  mkdir -p "$fakebin"
++  # A minimal double for bin/fm-hermes-ws.sh's `status <sid>` output shape,
++  # so this pins fm_busy_hermes_vps_agent_running's STRING PARSING against
++  # the real vendor-rendered field (docs/verification/hermes.md's live
++  # transcript: {"output": "...\nAgent Running: Yes\n"}) without a socket.
++  cat > "$fakebin/fm-hermes-ws.sh" <<'SH'
++#!/usr/bin/env bash
++case "$2" in
++  sess-yes) printf '{"output": "Hermes TUI Status\n\nAgent Running: Yes"}\n' ;;
++  sess-no) printf '{"output": "Hermes TUI Status\n\nAgent Running: No"}\n' ;;
++  sess-garbled) printf '{"output": "not a real status blob"}\n' ;;
++  *) exit 1 ;;
++esac
++SH
++  chmod +x "$fakebin/fm-hermes-ws.sh"
++
++  local meta_yes="$TMP_ROOT/yes.meta" meta_no="$TMP_ROOT/no.meta" \
++        meta_garbled="$TMP_ROOT/garbled.meta" meta_absent="$TMP_ROOT/absent.meta"
++  printf 'harness=hermes-vps\nhermes_vps_session_id=sess-yes\n' > "$meta_yes"
++  printf 'harness=hermes-vps\nhermes_vps_session_id=sess-no\n' > "$meta_no"
++  printf 'harness=hermes-vps\nhermes_vps_session_id=sess-garbled\n' > "$meta_garbled"
++  printf 'harness=hermes-vps\n' > "$meta_absent"
++
++  # fm_meta_get is owned by fm-backend.sh; fm_busy_hermes_vps_agent_running by
++  # fm-busy-lib.sh.
++  # shellcheck source=bin/fm-backend.sh
++  . "$ROOT/bin/fm-backend.sh"
++  # shellcheck source=bin/fm-busy-lib.sh
++  . "$ROOT/bin/fm-busy-lib.sh"
++  # fm-backend.sh's own init unconditionally sets this to its real bin/ dir;
++  # fm_busy_hermes_vps_agent_running reads it at CALL time, so overriding it
++  # here (after sourcing) routes the live pull at the fake double instead of
++  # the real fm-hermes-ws.sh, without needing to fake the whole bin/ tree.
++  FM_BACKEND_LIB_DIR="$fakebin"
++
++  local got
++  got=$(fm_busy_hermes_vps_agent_running "$meta_yes")
++  [ "$got" = yes ] || fail "expected yes for an 'Agent Running: Yes' status blob, got: $got"
++  got=$(fm_busy_hermes_vps_agent_running "$meta_no")
++  [ "$got" = no ] || fail "expected no for an 'Agent Running: No' status blob, got: $got"
++  got=$(fm_busy_hermes_vps_agent_running "$meta_garbled")
++  [ "$got" = unknown ] || fail "expected unknown for a status blob with neither marker, got: $got"
++  got=$(fm_busy_hermes_vps_agent_running "$meta_absent")
++  [ "$got" = unknown ] || fail "expected unknown when no hermes_vps_session_id is recorded, got: $got"
++
++  pass "fm_busy_hermes_vps_agent_running parses session.status's literal Agent Running field, and only that field"
++}
++
++# --- 3-7. the real bridge process over a real socket -------------------------
++
++BRIDGE_PID=""
++stop_bridge() {
++  if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
++    kill "$BRIDGE_PID" >/dev/null 2>&1 || true
++    wait "$BRIDGE_PID" 2>/dev/null || true
++  fi
++  BRIDGE_PID=""
++}
++
++test_bridge_lifecycle_over_real_socket() {
++  local port rpc_log brief_path brief_content line session_id
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  brief_path="$TMP_ROOT/launch-brief.md"
++  brief_content="## Captain's intent
++
++Do the real work."
++  printf '%s\n' "$brief_content" > "$brief_path"
++
++  # bash 3.2 (macOS's system /bin/bash, what `#!/usr/bin/env bash` resolves
++  # to here) has no `coproc`, so this drives the bridge's stdio through a
++  # pair of named FIFOs on fd 3 (write) and fd 4 (read) instead - the
++  # portable equivalent, and still a real pipe to a real subprocess, not a
++  # fake terminal. Each fd is opened read-write (`<>`) on its own fifo
++  # first: a fifo open for read-write never blocks, and having ANY end
++  # already open is what lets the bridge's own blocking read-only/write-only
++  # opens on the same fifos return immediately once it starts.
++  local in_fifo out_fifo
++  in_fifo="$TMP_ROOT/bridge.in"
++  out_fifo="$TMP_ROOT/bridge.out"
++  rm -f "$in_fifo" "$out_fifo"
++  mkfifo "$in_fifo" "$out_fifo"
++  exec 3<>"$in_fifo"
++  exec 4<>"$out_fifo"
++
++  env -i PATH="$PATH" \
++    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
++    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
++    python3 "$BRIDGE" --cwd /tmp/some-worktree <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge.err" &
++  BRIDGE_PID=$!
++
++  line=$(read_line_timeout 4 10)
++  case "$line" in
++    'Hermes VPS bridge ready. session_id='*) session_id=${line#*session_id=} ;;
++    *) fail "expected the readiness banner with a session_id, got: $line (stderr: $(cat "$TMP_ROOT/bridge.err" 2>/dev/null))" ;;
++  esac
++  [ -n "$session_id" ] || fail "readiness banner carried no session_id"
++
++  # Brief delivery: the exact pointer sentence fm-spawn.sh types into every
++  # launch-then-send harness's pane, with a LOCAL path the bridge can read -
++  # this must forward the FILE'S CONTENT, never the sentence itself, because
++  # a remote VPS session has no access to this machine's filesystem.
++  printf 'Read the brief at %s and follow it exactly.\n' "$brief_path" >&3
++  line=$(read_line_timeout 4 10)
++  case "$line" in
++    "● Read the brief at $brief_path and follow it exactly.") ;;
++    *) fail "expected the delivery-confirmation bullet line for the brief pointer, got: $line" ;;
++  esac
++  if ! grep -q '"method": "prompt.submit"' "$rpc_log" 2>/dev/null; then
++    fail "the bridge never sent a real prompt.submit RPC for the brief"
++  fi
++
++  # The stub answers ANY prompt.submit with message.start -> message.delta ->
++  # message.complete unconditionally, so the bridge's own event-rendering
++  # loop must surface the streamed text and the turn-complete marker for
++  # real, not from a canned local string.
++  local saw_stub_delta=0 saw_turn_complete=0 tries=0
++  while [ "$tries" -lt 20 ]; do
++    if IFS= read -r -t 2 -u 4 line; then
++      case "$line" in
++        *stub*) saw_stub_delta=1 ;;
++        '[turn complete]') saw_turn_complete=1 ;;
++      esac
++    fi
++    [ "$saw_stub_delta" = 1 ] && [ "$saw_turn_complete" = 1 ] && break
++    tries=$((tries + 1))
++  done
++  [ "$saw_stub_delta" = 1 ] || fail "the bridge never rendered the stub's streamed message.delta text"
++  [ "$saw_turn_complete" = 1 ] || fail "the bridge never rendered a [turn complete] marker on message.complete"
++
++  # Interrupt: a local command, not a chat message - must never reach the
++  # model as a submitted line, and must call the real RPC.
++  printf '/interrupt\n' >&3
++  line=$(read_line_timeout 4 10)
++  [ "$line" = '[interrupted]' ] || fail "expected [interrupted] after /interrupt, got: $line"
++  if ! grep -q '"method": "session.interrupt"' "$rpc_log" 2>/dev/null; then
++    fail "the bridge never sent a real session.interrupt RPC for /interrupt"
++  fi
++
++  # Exit: closes the server-side session for real (proven via the wire-level
++  # RPC log, never just the client's own exit code) and then the local
++  # process actually exits.
++  printf '/exit\n' >&3
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do
++    sleep 0.1
++    waited=$((waited + 1))
++  done
++  kill -0 "$BRIDGE_PID" 2>/dev/null && fail "the bridge process did not exit after /exit"
++  if ! grep -q '"method": "session.close"' "$rpc_log" 2>/dev/null; then
++    fail "the bridge never sent a real session.close RPC on /exit"
++  fi
++  BRIDGE_PID=""
++  exec 3>&- 4>&-
++
++  stop_stub
++  pass "bridge lifecycle: readiness, brief-content delivery, event rendering, /interrupt, and /exit all round-trip over a real socket"
++}
++
++test_bridge_identity_functions
++test_agent_process_classify_recognizes_bridge
++test_busy_hermes_vps_agent_running_parses_status
++test_bridge_lifecycle_over_real_socket
++stop_bridge

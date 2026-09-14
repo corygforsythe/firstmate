@@ -1,0 +1,26 @@
+From 3646ad054d64cdceba3b730e9dbb99ef8b7e694c Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Mon, 14 Sep 2026 18:23:31 -0500
+Subject: [PATCH 24/24] fix(hermes-vps): genericize captain-specific hostname
+ in env-var comment
+
+The FM_HERMES_WS_BASE_URL contract comment used the real captain VPS
+hostname as its "e.g." example; other forks sharing this code should
+see a clearly generic placeholder instead.
+---
+ bin/fm-hermes-ws.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/bin/fm-hermes-ws.py b/bin/fm-hermes-ws.py
+index e304f84..918de4c 100755
+--- a/bin/fm-hermes-ws.py
++++ b/bin/fm-hermes-ws.py
+@@ -33,7 +33,7 @@
+ # through argv, so a secret never appears in argv, a status line, or a
+ # process listing (the same contract as FM_MAIL_USER/FM_MAIL_PASS in
+ # fm-mail.py):
+-#   FM_HERMES_WS_BASE_URL   Required. e.g. http://vps.tail8bdd14.ts.net:9119
++#   FM_HERMES_WS_BASE_URL   Required. e.g. http://your-vps-host:9119
+ #   FM_HERMES_WS_TOKEN      Loopback/--insecure static session token
+ #                            (?token=). Mutually exclusive with USER/PASS.
+ #   FM_HERMES_WS_USER       Gated-mode username (POST /auth/password-login).

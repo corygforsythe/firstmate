@@ -1,0 +1,1204 @@
+From 91ea934f28a472d8d561796ee497c1ba0d8ac704 Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Sun, 13 Sep 2026 20:11:14 -0500
+Subject: [PATCH 06/24] feat(bin): standalone JSON-RPC-over-WebSocket client
+ for the hermes /api/ws gateway
+
+Per the captain's decision on state/hermes-vps-gateway.status: build the
+standalone dispatch primitive now and defer fleet-dispatch wiring
+(fm-spawn/fm-control/fm-crew-state/fm-busy-lib) to a follow-up task,
+since those are entirely pane-shaped and a /api/ws session has no pane.
+
+bin/fm-hermes-ws.py is a stdlib-only Python client (no third-party
+dependency, matching fm-mail.py's existing stance) implementing the RFC
+6455 handshake/framing from scratch, both loopback-token and gated
+password-login -> cookie -> ws-ticket auth, and every session RPC named
+in the brief (create/submit/status/history/steer/interrupt/close) plus a
+dispatch convenience for smoke-testing. bin/fm-hermes-ws.sh resolves
+FM_HERMES_WS_* config from the environment or $FM_HOME/.env, matching
+fm-mail.sh's convention.
+
+The wire protocol is grounded in the real v0.21.2 upstream source
+(tui_gateway/ws.py, scripts/iso-certify.py's real first-party client),
+not the earlier scout report's paraphrase. tests/fm-hermes-ws.test.sh
+and its independently-written stub server (tests/fixtures/) prove the
+client end to end over a real socket, offline. Not yet run against the
+real VPS or any real Hermes install - still blocked on the captain's VPS
+login credentials and an unconfirmed Origin-header requirement in gated
+mode; see docs/verification/hermes.md.
+---
+ .../references/harness/hermes.md              |   3 +-
+ bin/fm-hermes-ws.py                           | 546 ++++++++++++++++++
+ bin/fm-hermes-ws.sh                           |  71 +++
+ docs/verification/hermes.md                   |  47 ++
+ tests/fixtures/fm-hermes-ws-stub-server.py    | 221 +++++++
+ tests/fm-hermes-ws.test.sh                    | 235 ++++++++
+ 6 files changed, 1122 insertions(+), 1 deletion(-)
+ create mode 100755 bin/fm-hermes-ws.py
+ create mode 100755 bin/fm-hermes-ws.sh
+ create mode 100755 tests/fixtures/fm-hermes-ws-stub-server.py
+ create mode 100755 tests/fm-hermes-ws.test.sh
+
+diff --git a/.agents/skills/harness-adapters/references/harness/hermes.md b/.agents/skills/harness-adapters/references/harness/hermes.md
+index 61d811c..b663ade 100644
+--- a/.agents/skills/harness-adapters/references/harness/hermes.md
++++ b/.agents/skills/harness-adapters/references/harness/hermes.md
+@@ -78,4 +78,5 @@ Landing a real text-submission interrupt path in `bin/fm-control.sh` is real, sc
+ - **`hermes hooks`/`--accept-hooks`** were not deep-dived; a turn-granularity or busy/idle-granularity structural signal may exist and would be a strictly better busy source than the rendered-tail fallback if confirmed.
+ - **`claude-sonnet-5` model-registry gap**: a model present in the account's own returned catalog (via the `model_not_available_for_integrator` error body) still failed with a *different* error (`model_not_supported`) when passed verbatim as `-m claude-sonnet-5`; it may need a provider-qualified form. Not blocking (this task's live verification used `gpt-4o`/`gpt-4.1`, both of which work verbatim), so left as a known gap rather than solved speculatively.
+ - **`hermes serve`/`/api/ws` JSON-RPC transport**: a materially better transport than tmux/`--cli` exists (`data/hermes-serve-verify/report.md`).
+-  The VPS gated-mode ticket-auth flow itself is now resolved by source (`POST /auth/password-login` -> session cookies -> `POST /api/auth/ws-ticket` -> 30s single-use `?ticket=`), see `../../../../docs/verification/hermes.md`'s "VPS `/api/ws` gated-mode auth" section, but exercising it needs the captain's actual VPS login credentials, which no task has been given, and landing a dispatch client still needs a captain decision on whether it fits the existing pane-shaped `fm-backend.sh` family or needs a parallel non-pane dispatch mode - deliberately not built speculatively in this task.
++  `../../../bin/fm-hermes-ws.py`/`.sh` is a standalone client for it (session create/submit/status/history/steer/interrupt/close, both loopback-token and gated ticket auth), offline-verified against a from-scratch stub server (`tests/fm-hermes-ws.test.sh`) but NOT yet run against the real VPS or any real Hermes install - see `../../../../docs/verification/hermes.md`'s "standalone JSON-RPC-over-WebSocket dispatch client" section for the wire-protocol grounding and the two things (the captain's VPS credentials, an unconfirmed `Origin`-header requirement) still blocking that.
++  It is a captain-approved standalone primitive only, deliberately not wired into `../../../bin/fm-spawn.sh`/`fm-control.sh`/`fm-crew-state.sh`/`fm-busy-lib.sh` - those are entirely pane-shaped and a `/api/ws` session has no pane; fleet-dispatch wiring is a deferred follow-up task.
+diff --git a/bin/fm-hermes-ws.py b/bin/fm-hermes-ws.py
+new file mode 100755
+index 0000000..b2e7650
+--- /dev/null
++++ b/bin/fm-hermes-ws.py
+@@ -0,0 +1,546 @@
++#!/usr/bin/env python3
++# fm-hermes-ws.py - JSON-RPC-over-WebSocket client for a Hermes Agent
++# dashboard/serve gateway's /api/ws session API.
++#
++# Standalone dispatch primitive only: no fm-spawn.sh/fm-control.sh/
++# fm-crew-state.sh/fm-busy-lib.sh wiring. See docs/verification/hermes.md
++# ("VPS /api/ws gated-mode auth" and the section documenting this client)
++# for the source evidence this was built from and what remains
++# live-unverified.
++#
++# Subcommands (each opens one WS connection, runs its RPC, closes):
++#   create <cwd>                     -> {"session_id": ...}
++#   submit <session_id> <text|->     -> the prompt.submit RPC result
++#   status <session_id>              -> the session.status RPC result
++#   history <session_id>             -> the session.history RPC result
++#   steer <session_id> <text|->      -> the session.steer RPC result
++#   interrupt <session_id>           -> the session.interrupt RPC result
++#   close <session_id>               -> the session.close RPC result
++#   dispatch <cwd> <text|-> [secs]   -> create + submit + wait for
++#                                        message.complete/error (default
++#                                        300s budget), then session.history
++#                                        and session.close; prints the final
++#                                        history JSON. Smoke-test/live-verify
++#                                        convenience, not a fleet primitive.
++# "-" for a text argument reads it from stdin, matching fm-mail.py's
++# send <to> <subject> <body|-> convention.
++#
++# All configuration and credentials arrive through the environment, never
++# through argv, so a secret never appears in argv, a status line, or a
++# process listing (the same contract as FM_MAIL_USER/FM_MAIL_PASS in
++# fm-mail.py):
++#   FM_HERMES_WS_BASE_URL   Required. e.g. http://vps.tail8bdd14.ts.net:9119
++#   FM_HERMES_WS_TOKEN      Loopback/--insecure static session token
++#                            (?token=). Mutually exclusive with USER/PASS.
++#   FM_HERMES_WS_USER       Gated-mode username (POST /auth/password-login).
++#   FM_HERMES_WS_PASS       Gated-mode password.
++#   FM_HERMES_WS_PROVIDER   Gated-mode provider name. Default "basic" - the
++#                            only provider the captain's VPS registers
++#                            (confirmed live: GET /api/auth/providers).
++#   FM_HERMES_WS_ORIGIN     Origin header override. Default derived from
++#                            FM_HERMES_WS_BASE_URL. hermes_cli/web_server.py's
++#                            CORS middleware allow_origin_regex only matches
++#                            localhost/127.0.0.1 origins on the loopback dev
++#                            path; whether the gated remote path enforces the
++#                            same regex on the WS upgrade specifically is
++#                            unconfirmed - override this if a real gated
++#                            connect is rejected on Origin.
++#   FM_HERMES_WS_TIMEOUT    Seconds for the initial connect/handshake, each
++#                            RPC round trip, and each HTTP auth call.
++#                            Default 20.
++#
++# Wire protocol (grounded in the real Hermes Agent source, not the vendor's
++# published docs - none exist for this endpoint): tui_gateway/ws.py's
++# handle_ws reuses tui_gateway.server.dispatch verbatim, so /api/ws speaks
++# the identical JSON-RPC 2.0 shape as Hermes's own stdio gateway
++# (tui_gateway/entry.py), one JSON object per WebSocket text frame (or
++# newline-delimited within one frame - a real Hermes client,
++# evals/liveness/ws_orphan_reconnect.py, splits received frame text on
++# newlines defensively; this client does too). A request is
++# {"jsonrpc":"2.0","id":<str>,"method":<str>,"params":{...}}; a response is
++# matched by "id" and carries "result" or "error"; a push notification has
++# no "id" and always uses method "event", with the real event name in
++# params.type (confirmed: tui_gateway/ws.py sends
++# {"method":"event","params":{"type":"gateway.ready",...}} immediately after
++# accept). scripts/iso-certify.py's WSClient - a real first-party Hermes
++# client for this exact endpoint - is this script's direct structural model:
++# drain the gateway.ready event first, then id-matched request/response,
++# and treat a submitted turn as done only on a "message.complete" event
++# (or failed on "error", with the message at params.payload.message) -
++# never on an earlier event, which can arrive mid-turn.
++import base64
++import hashlib
++import http.client
++import json
++import os
++import secrets
++import socket
++import ssl
++import struct
++import sys
++import time
++from urllib.parse import urlsplit, urlencode
++
++_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
++_OPCODE_CONT = 0x0
++_OPCODE_TEXT = 0x1
++_OPCODE_CLOSE = 0x8
++_OPCODE_PING = 0x9
++_OPCODE_PONG = 0xA
++
++
++class HermesWsError(Exception):
++    """A config, auth, protocol, or RPC-level failure. The message is safe to
++    print: no code path here ever interpolates a credential into it."""
++
++
++def _env_timeout():
++    raw = os.environ.get('FM_HERMES_WS_TIMEOUT', '20')
++    try:
++        value = float(raw)
++    except (TypeError, ValueError):
++        value = 20.0
++    return value if value > 0 else 20.0
++
++
++TIMEOUT = _env_timeout()
++
++
++def _base_url():
++    url = os.environ.get('FM_HERMES_WS_BASE_URL', '')
++    if not url:
++        raise HermesWsError('FM_HERMES_WS_BASE_URL is required')
++    return url.rstrip('/')
++
++
++def _origin(parts):
++    override = os.environ.get('FM_HERMES_WS_ORIGIN', '')
++    if override:
++        return override
++    return f"{parts.scheme}://{parts.netloc}"
++
++
++def _read_text_arg(raw):
++    """A CLI text argument, or stdin's full content when raw is exactly "-"."""
++    if raw == '-':
++        return sys.stdin.read()
++    return raw
++
++
++# --- Gated-mode auth: POST /auth/password-login -> cookies -> POST
++# --- /api/auth/ws-ticket -> a 30s single-use ticket (ws_tickets.py's
++# --- TTL_SECONDS). Loopback/--insecure mode skips this entirely and uses a
++# --- static FM_HERMES_WS_TOKEN instead.
++
++def _http_connection(parts):
++    if parts.scheme == 'https':
++        return http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=TIMEOUT)
++    return http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=TIMEOUT)
++
++
++def _cookie_header(set_cookie_headers):
++    """Fold every Set-Cookie response header's name=value pair (attributes
++    like Path/HttpOnly/Max-Age/SameSite/Secure dropped) into one Cookie
++    request header."""
++    pairs = []
++    for raw in set_cookie_headers:
++        first = raw.split(';', 1)[0].strip()
++        if '=' in first:
++            pairs.append(first)
++    return '; '.join(pairs)
++
++
++def _password_login(parts):
++    """Returns the Cookie header value for the session cookies
++    /auth/password-login sets on success."""
++    user = os.environ.get('FM_HERMES_WS_USER', '')
++    password = os.environ.get('FM_HERMES_WS_PASS', '')
++    provider = os.environ.get('FM_HERMES_WS_PROVIDER', 'basic')
++    if not user or not password:
++        raise HermesWsError(
++            'FM_HERMES_WS_USER and FM_HERMES_WS_PASS are required in gated mode '
++            '(no FM_HERMES_WS_TOKEN set)')
++    body = json.dumps({'provider': provider, 'username': user, 'password': password, 'next': ''})
++    conn = _http_connection(parts)
++    try:
++        conn.request('POST', '/auth/password-login', body=body,
++                      headers={'Content-Type': 'application/json'})
++        resp = conn.getresponse()
++        payload = resp.read()
++        if resp.status != 200:
++            raise HermesWsError(f'/auth/password-login: HTTP {resp.status}')
++        cookie_header = _cookie_header(resp.msg.get_all('Set-Cookie') or [])
++        if not cookie_header:
++            raise HermesWsError('/auth/password-login: no session cookies in the response')
++        try:
++            ok = json.loads(payload.decode('utf-8')).get('ok')
++        except (ValueError, UnicodeDecodeError):
++            ok = None
++        if ok is not True:
++            raise HermesWsError('/auth/password-login: response did not confirm ok:true')
++        return cookie_header
++    finally:
++        conn.close()
++
++
++def _mint_ticket(parts, cookie_header):
++    conn = _http_connection(parts)
++    try:
++        conn.request('POST', '/api/auth/ws-ticket', body=b'', headers={'Cookie': cookie_header})
++        resp = conn.getresponse()
++        payload = resp.read()
++        if resp.status != 200:
++            raise HermesWsError(f'/api/auth/ws-ticket: HTTP {resp.status}')
++        data = json.loads(payload.decode('utf-8'))
++        ticket = data.get('ticket')
++        if not ticket:
++            raise HermesWsError('/api/auth/ws-ticket: response had no ticket')
++        return ticket
++    finally:
++        conn.close()
++
++
++def _ws_auth_param(parts):
++    """Returns the (name, value) query-param pair to append to the /api/ws
++    URL: a static token in loopback/--insecure mode, or a freshly minted
++    30s single-use ticket in gated mode. Mint a new one per connection -
++    consume_ticket() is single-use server-side."""
++    token = os.environ.get('FM_HERMES_WS_TOKEN', '')
++    if token:
++        return ('token', token)
++    cookie_header = _password_login(parts)
++    ticket = _mint_ticket(parts, cookie_header)
++    return ('ticket', ticket)
++
++
++# --- Minimal RFC 6455 client: handshake + text-frame send/recv. Stdlib
++# --- only, deliberately: this repo's other python helpers (fm-mail.py)
++# --- take the same no-third-party-dependency stance, and the reference
++# --- Hermes client script (scripts/iso-certify.py) needs `pip install
++# --- websockets`, a dependency this repo has no reason to take on for one
++# --- client.
++
++class _WSSocket:
++    def __init__(self, parts, origin, timeout):
++        use_tls = parts.scheme in ('https', 'wss')
++        host = parts.hostname
++        port = parts.port or (443 if use_tls else 80)
++        raw = socket.create_connection((host, port), timeout=timeout)
++        if use_tls:
++            ctx = ssl.create_default_context()
++            raw = ctx.wrap_socket(raw, server_hostname=host)
++        raw.settimeout(timeout)
++        self._sock = raw
++        self._buf = b''
++        key = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
++        path = parts.path or '/'
++        if parts.query:
++            path = f'{path}?{parts.query}'
++        request_lines = [
++            f'GET {path} HTTP/1.1',
++            f'Host: {host}:{port}',
++            'Upgrade: websocket',
++            'Connection: Upgrade',
++            f'Sec-WebSocket-Key: {key}',
++            'Sec-WebSocket-Version: 13',
++            f'Origin: {origin}',
++            '', '',
++        ]
++        self._sock.sendall('\r\n'.join(request_lines).encode('ascii'))
++        status_line, headers = self._read_http_response_head()
++        if ' 101 ' not in f' {status_line} ':
++            raise HermesWsError(f'WebSocket upgrade refused: {status_line.strip()}')
++        expected = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode('ascii')).digest()).decode('ascii')
++        accept = headers.get('sec-websocket-accept', '')
++        if accept != expected:
++            raise HermesWsError('WebSocket upgrade response failed the Sec-WebSocket-Accept check')
++
++    def _recv_exact(self, n):
++        while len(self._buf) < n:
++            chunk = self._sock.recv(max(4096, n - len(self._buf)))
++            if not chunk:
++                raise HermesWsError('connection closed before the expected bytes arrived')
++            self._buf += chunk
++        data, self._buf = self._buf[:n], self._buf[n:]
++        return data
++
++    def _read_http_response_head(self):
++        head = b''
++        while b'\r\n\r\n' not in head:
++            chunk = self._sock.recv(4096)
++            if not chunk:
++                raise HermesWsError('connection closed during the HTTP upgrade handshake')
++            head += chunk
++        head, rest = head.split(b'\r\n\r\n', 1)
++        self._buf = rest + self._buf
++        lines = head.decode('iso-8859-1').split('\r\n')
++        status_line = lines[0]
++        headers = {}
++        for line in lines[1:]:
++            if ':' in line:
++                name, value = line.split(':', 1)
++                headers[name.strip().lower()] = value.strip()
++        return status_line, headers
++
++    def send_text(self, text):
++        payload = text.encode('utf-8')
++        length = len(payload)
++        header = bytearray()
++        header.append(0x80 | _OPCODE_TEXT)
++        if length < 126:
++            header.append(0x80 | length)
++        elif length < 65536:
++            header.append(0x80 | 126)
++            header += struct.pack('>H', length)
++        else:
++            header.append(0x80 | 127)
++            header += struct.pack('>Q', length)
++        mask = secrets.token_bytes(4)
++        header += mask
++        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
++        self._sock.sendall(bytes(header) + masked)
++
++    def _recv_frame(self):
++        b0, b1 = self._recv_exact(2)
++        fin = bool(b0 & 0x80)
++        opcode = b0 & 0x0F
++        masked = bool(b1 & 0x80)
++        length = b1 & 0x7F
++        if length == 126:
++            (length,) = struct.unpack('>H', self._recv_exact(2))
++        elif length == 127:
++            (length,) = struct.unpack('>Q', self._recv_exact(8))
++        mask = self._recv_exact(4) if masked else None
++        payload = self._recv_exact(length) if length else b''
++        if mask:
++            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
++        return fin, opcode, payload
++
++    def recv_text(self, deadline):
++        """Blocks for one complete (possibly fragmented) text message, up to
++        `deadline` (monotonic seconds). Answers a ping inline and skips
++        pongs; raises on a close frame."""
++        assembled = b''
++        assembling_text = False
++        while True:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise HermesWsError('timed out waiting for a WebSocket message')
++            self._sock.settimeout(remaining)
++            try:
++                fin, opcode, payload = self._recv_frame()
++            except socket.timeout as exc:
++                raise HermesWsError('timed out waiting for a WebSocket message') from exc
++            if opcode == _OPCODE_PING:
++                self._send_control(_OPCODE_PONG, payload)
++                continue
++            if opcode == _OPCODE_PONG:
++                continue
++            if opcode == _OPCODE_CLOSE:
++                raise HermesWsError('the gateway closed the WebSocket connection')
++            if opcode == _OPCODE_TEXT:
++                assembled = payload
++                assembling_text = True
++            elif opcode == _OPCODE_CONT and assembling_text:
++                assembled += payload
++            else:
++                continue
++            if fin:
++                return assembled.decode('utf-8', errors='replace')
++
++    def _send_control(self, opcode, payload):
++        mask = secrets.token_bytes(4)
++        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
++        header = bytes([0x80 | opcode, 0x80 | len(payload)]) + mask
++        self._sock.sendall(header + masked)
++
++    def close(self):
++        try:
++            self._send_control(_OPCODE_CLOSE, b'')
++        except OSError:
++            pass
++        try:
++            self._sock.close()
++        except OSError:
++            pass
++
++
++class HermesWsSession:
++    """One /api/ws connection: drains gateway.ready on connect, then does
++    id-matched JSON-RPC request/response. Any notification observed while
++    waiting for an RPC reply (an `event`) is queued and replayed to the
++    next `wait_event`/`rpc` caller in arrival order, never dropped."""
++
++    def __init__(self):
++        base = _base_url()
++        parts = urlsplit(base)
++        auth_name, auth_value = _ws_auth_param(parts)
++        ws_scheme = 'wss' if parts.scheme == 'https' else 'ws'
++        query = urlencode({auth_name: auth_value})
++        ws_url = urlsplit(f'{ws_scheme}://{parts.netloc}/api/ws?{query}')
++        self._sock = _WSSocket(ws_url, _origin(parts), TIMEOUT)
++        self._next_id = 0
++        self._pending = []
++        self._deadline0 = time.monotonic() + TIMEOUT
++        self._drain_ready()
++
++    def _drain_ready(self):
++        while True:
++            msg = self._raw_recv(self._deadline0)
++            if msg.get('method') == 'event' and (msg.get('params') or {}).get('type') == 'gateway.ready':
++                return
++            self._pending.append(msg)
++
++    def _raw_recv(self, deadline):
++        text = self._sock.recv_text(deadline)
++        try:
++            return json.loads(text)
++        except json.JSONDecodeError as exc:
++            raise HermesWsError(f'non-JSON WebSocket message: {text[:200]!r}') from exc
++
++    def next_event(self, timeout):
++        """Blocks up to `timeout` seconds for the next `event` notification
++        (queued ones first), returning its full envelope."""
++        deadline = time.monotonic() + timeout
++        while True:
++            if self._pending:
++                msg = self._pending.pop(0)
++            else:
++                msg = self._raw_recv(deadline)
++            if msg.get('method') == 'event':
++                return msg
++            # A stray id-tagged reply nobody is waiting on; drop it.
++
++    def rpc(self, method, params, timeout=None):
++        rid = str(self._next_id)
++        self._next_id += 1
++        self._sock.send_text(json.dumps({'jsonrpc': '2.0', 'id': rid, 'method': method, 'params': params}))
++        deadline = time.monotonic() + (timeout if timeout is not None else TIMEOUT)
++        while True:
++            if self._pending and self._pending[0].get('id') == rid:
++                msg = self._pending.pop(0)
++            else:
++                msg = self._raw_recv(deadline)
++                if msg.get('id') != rid:
++                    self._pending.append(msg)
++                    continue
++            if 'error' in msg and msg['error'] is not None:
++                raise HermesWsError(f'{method}: {msg["error"]}')
++            return msg.get('result')
++
++    def close(self):
++        self._sock.close()
++
++
++def _print_result(result):
++    print(json.dumps(result))
++
++
++def cmd_create(args):
++    if len(args) != 1:
++        raise HermesWsError('usage: create <cwd>')
++    session = HermesWsSession()
++    try:
++        _print_result(session.rpc('session.create', {'cwd': args[0]}))
++    finally:
++        session.close()
++
++
++def cmd_submit(args):
++    if len(args) != 2:
++        raise HermesWsError('usage: submit <session_id> <text|->')
++    session_id, text = args[0], _read_text_arg(args[1])
++    session = HermesWsSession()
++    try:
++        _print_result(session.rpc('prompt.submit', {'session_id': session_id, 'text': text}))
++    finally:
++        session.close()
++
++
++def _simple_session_call(method):
++    def handler(args):
++        if len(args) != 1:
++            raise HermesWsError(f'usage: {method.split(".", 1)[1]} <session_id>')
++        session = HermesWsSession()
++        try:
++            _print_result(session.rpc(method, {'session_id': args[0]}))
++        finally:
++            session.close()
++    return handler
++
++
++def cmd_steer(args):
++    if len(args) != 2:
++        raise HermesWsError('usage: steer <session_id> <text|->')
++    session_id, text = args[0], _read_text_arg(args[1])
++    session = HermesWsSession()
++    try:
++        _print_result(session.rpc('session.steer', {'session_id': session_id, 'text': text}))
++    finally:
++        session.close()
++
++
++def cmd_dispatch(args):
++    if len(args) not in (2, 3):
++        raise HermesWsError('usage: dispatch <cwd> <text|-> [timeout_seconds]')
++    cwd, text = args[0], _read_text_arg(args[1])
++    budget = float(args[2]) if len(args) == 3 else 300.0
++    session = HermesWsSession()
++    try:
++        created = session.rpc('session.create', {'cwd': cwd})
++        session_id = created.get('session_id')
++        if not session_id:
++            raise HermesWsError(f'session.create returned no session_id: {created}')
++        session.rpc('prompt.submit', {'session_id': session_id, 'text': text})
++        deadline = time.monotonic() + budget
++        started = False
++        while True:
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise HermesWsError('dispatch timed out waiting for message.complete/error')
++            envelope = session.next_event(remaining)
++            ptype = (envelope.get('params') or {}).get('type')
++            if ptype == 'message.start':
++                started = True
++                continue
++            if not started:
++                continue
++            if ptype == 'error':
++                payload = (envelope.get('params') or {}).get('payload') or {}
++                raise HermesWsError(f'turn failed: {payload.get("message", envelope)}')
++            if ptype == 'message.complete':
++                break
++        history = session.rpc('session.history', {'session_id': session_id})
++        _print_result(history)
++        session.rpc('session.close', {'session_id': session_id})
++    finally:
++        session.close()
++
++
++_COMMANDS = {
++    'create': cmd_create,
++    'submit': cmd_submit,
++    'status': _simple_session_call('session.status'),
++    'history': _simple_session_call('session.history'),
++    'steer': cmd_steer,
++    'interrupt': _simple_session_call('session.interrupt'),
++    'close': _simple_session_call('session.close'),
++    'dispatch': cmd_dispatch,
++}
++
++
++def main(argv):
++    if len(argv) < 2 or argv[1] not in _COMMANDS:
++        names = ', '.join(sorted(_COMMANDS))
++        print(f'usage: fm-hermes-ws.py <{names}> [args...]', file=sys.stderr)
++        return 2
++    try:
++        _COMMANDS[argv[1]](argv[2:])
++    except HermesWsError as exc:
++        print(f'fm-hermes-ws.py: {exc}', file=sys.stderr)
++        return 1
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main(sys.argv))
+diff --git a/bin/fm-hermes-ws.sh b/bin/fm-hermes-ws.sh
+new file mode 100755
+index 0000000..4c3947d
+--- /dev/null
++++ b/bin/fm-hermes-ws.sh
+@@ -0,0 +1,71 @@
++#!/usr/bin/env bash
++# fm-hermes-ws.sh - thin env-resolving wrapper around fm-hermes-ws.py, the
++# JSON-RPC-over-WebSocket client for a Hermes Agent dashboard/serve
++# gateway's /api/ws session API.
++#
++# Standalone dispatch primitive only: no fm-spawn.sh/fm-control.sh/
++# fm-crew-state.sh/fm-busy-lib.sh wiring, per this task's captain-approved
++# scope. See docs/verification/hermes.md for the source evidence this was
++# built from and what remains live-unverified, and fm-hermes-ws.py's own
++# header for the exact subcommand and environment-variable contract - this
++# wrapper only resolves environment/.env, it does not restate that contract.
++#
++# Usage: fm-hermes-ws.sh <create|submit|status|history|steer|interrupt|close|dispatch> [args...]
++#
++# Configuration and credentials are read from the environment, filling
++# missing keys from the gitignored $FM_HOME/.env (same "env wins over
++# .env" convention as fm-mail.sh and the Relay/FMX token). FM_HOME falls
++# back to the repo root when unset. Required: FM_HERMES_WS_BASE_URL, plus
++# either FM_HERMES_WS_TOKEN (loopback/--insecure) or FM_HERMES_WS_USER +
++# FM_HERMES_WS_PASS (gated mode) - fm-hermes-ws.py enforces this and never
++# logs a credential.
++
++set -euo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++FM_HOME="${FM_HOME:-}"
++if [ -z "$FM_HOME" ]; then
++  FM_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
++fi
++ENV_FILE="$FM_HOME/.env"
++
++# One KEY=VALUE lookup from a .env-style file: last assignment wins,
++# tolerates a leading "export ", surrounding whitespace, and one layer of
++# matching quotes. Prints nothing when the file or key is absent.
++_hermes_ws_env_get() {
++  local key=$1 file=$2 line val
++  [ -f "$file" ] || return 0
++  line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -n1) || return 0
++  [ -n "$line" ] || return 0
++  val=${line#*=}
++  val=${val#"${val%%[![:space:]]*}"}
++  val=${val%"${val##*[![:space:]]}"}
++  case "$val" in
++    \"*\") val=${val#\"}; val=${val%\"} ;;
++    \'*\') val=${val#\'}; val=${val%\'} ;;
++  esac
++  printf '%s' "$val"
++}
++
++for var in FM_HERMES_WS_BASE_URL FM_HERMES_WS_TOKEN FM_HERMES_WS_USER FM_HERMES_WS_PASS \
++           FM_HERMES_WS_PROVIDER FM_HERMES_WS_ORIGIN FM_HERMES_WS_TIMEOUT; do
++  if [ -z "${!var:-}" ]; then
++    val=$(_hermes_ws_env_get "$var" "$ENV_FILE")
++    if [ -n "$val" ]; then
++      export "$var=$val"
++    fi
++  fi
++done
++
++PY="$(command -v python3 || true)"
++if [ -z "$PY" ]; then
++  echo "fm-hermes-ws: python3 required" >&2
++  exit 1
++fi
++PY_BIN="$SCRIPT_DIR/fm-hermes-ws.py"
++if [ ! -f "$PY_BIN" ]; then
++  echo "fm-hermes-ws: $PY_BIN missing" >&2
++  exit 1
++fi
++
++exec "$PY" "$PY_BIN" "$@"
+diff --git a/docs/verification/hermes.md b/docs/verification/hermes.md
+index 4a605e6..436152b 100644
+--- a/docs/verification/hermes.md
++++ b/docs/verification/hermes.md
+@@ -255,3 +255,50 @@ The resolved flow (`hermes_cli/dashboard_auth/routes.py`, `hermes_cli/dashboard_
+ This is a real, scriptable, non-browser credential exchange - no PKCE round trip, no `native_pkce` flow needed, since the VPS's only registered provider (`basic`) supports direct password login.
+ **What remains unresolved is not the mechanism but the credential**: exercising step 1 needs the captain's actual VPS login username and password for the `basic` provider, which is not present in any file this task can read (checked `data/captain.md`, `data/learnings.md`, `.env`, and `~/.hermes/config.yaml`) and must not be guessed or fabricated.
+ Until that credential is supplied, this flow is verified by source and by the two public read-only endpoints above, but NOT yet exercised end to end against the real VPS - see `state/hermes-vps-gateway.status` for the open decision this blocks.
++
++## `bin/fm-hermes-ws.py`/`.sh`: a standalone JSON-RPC-over-WebSocket dispatch client, offline-verified
++
++Per the captain's decision on `state/hermes-vps-gateway.status`, this is a standalone dispatch primitive only - it is deliberately NOT wired into `bin/fm-spawn.sh`, `bin/fm-control.sh`, `bin/fm-crew-state.sh`, or `bin/fm-busy-lib.sh`, since those are entirely pane/text-capture-shaped (`fm_backend_capture`, `fm_backend_composer_state`, `fm_backend_send_key`, ...) and a `/api/ws` session has no pane at all.
++Fleet-dispatch wiring is deferred to a follow-up task once this primitive is proven live.
++
++The client (`bin/fm-hermes-ws.py`, stdlib-only Python - no third-party dependency, matching `bin/fm-mail.py`'s existing no-dependency stance rather than the real Hermes reference client's `pip install websockets`) implements, from scratch: the RFC 6455 client handshake and masked text-frame framing, the gated-mode `password-login -> cookie -> ws-ticket -> ?ticket=` flow above (loopback/`--insecure` mode uses a static `?token=` instead, via `FM_HERMES_WS_TOKEN`), and id-matched JSON-RPC request/response over the connection, draining the server's `gateway.ready` notification on connect.
++`bin/fm-hermes-ws.sh` is a thin wrapper resolving `FM_HERMES_WS_*` configuration from the environment, filling gaps from `$FM_HOME/.env` (env wins), matching `fm-mail.sh`'s convention - the captain's VPS login credentials belong in `$FM_HOME/.env` as `FM_HERMES_WS_USER`/`FM_HERMES_WS_PASS`, the same already-gitignored, already-documented file that holds mail-plane credentials, never in a task brief, status line, or report.
++It exposes every primitive the captain's spec named: `create`, `submit`, `status`, `history`, `steer`, `interrupt`, `close`, plus a `dispatch` convenience (create + submit + wait for `message.complete`/`error` + `history` + `close`) for smoke-testing and live verification.
++
++### Wire-protocol grounding
++
++The real Hermes source (v0.21.2, commit `ee4452991d17534aa561f31ee55596d082aa94e7` at `~/.hermes/hermes-agent`, the same git history used for the auth-ticket flow above) was read directly rather than inferred from the earlier scout report's paraphrased transcript:
++
++- `tui_gateway/ws.py`'s `handle_ws` reuses `tui_gateway.server.dispatch` verbatim and reads exactly one JSON-RPC message per `ws.receive_text()` call (confirmed by reading the function body, not just its docstring), so one WebSocket text frame carries one JSON-RPC message on this transport.
++- `handle_ws` sends `{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready",...}}` immediately after accepting the connection - a client must drain this before its first request-scoped read, which `HermesWsSession.__init__` does.
++- `scripts/iso-certify.py`'s `WSClient` - a real first-party Hermes client for this exact endpoint, not a test double - is `HermesWsSession`'s direct structural model: drain `gateway.ready`, then id-matched request/response, and its `drive_heavy_turn` treats a submitted turn as done only on a `message.complete` event (or failed on `error`, with the message at `params.payload.message`) after a `message.start`, never on an earlier or unrelated event - `cmd_dispatch` mirrors that exact predicate.
++
++### Offline verification (no Hermes install, no VPS)
++
++`tests/fixtures/fm-hermes-ws-stub-server.py` is a from-scratch, independently-written HTTP + WebSocket double for `/auth/password-login`, `/api/auth/ws-ticket`, and `/api/ws` (its own framing code was written independently of the client's, so a shared bug would not hide behind a passing test).
++`tests/fm-hermes-ws.test.sh` drives every subcommand through `bin/fm-hermes-ws.sh` against it over a real loopback socket:
++
++```
++$ bash tests/fm-hermes-ws.test.sh
++ok - token mode: every RPC primitive round-trips over a real WebSocket
++ok - gated mode: password-login -> cookie -> ws-ticket -> /api/ws?ticket= round-trips for real
++ok - gated mode: bad credentials fail closed with no ticket minted and no leaked secret
++ok - dispatch: waits past message.start/message.delta and completes only on message.complete
++ok - dispatch: a turn's error event fails the call and surfaces its message
++ok - config: a missing FM_HERMES_WS_BASE_URL fails closed by name, no guessed connection
++ok - config: fm-hermes-ws.sh fills missing env from $FM_HOME/.env, env still wins over it
++```
++
++Run 2026-09-14 (macOS arm64, Python 3.13.12).
++This proves the HTTP auth calls, the RFC 6455 handshake and framing, JSON-RPC id matching, event-notification handling, and the `dispatch` completion predicate all work correctly against a real socket speaking the documented wire protocol.
++
++### What remains unverified
++
++This client has NOT been run against the real VPS or a real Hermes install of any version - only against the offline stub above.
++Two things stand between this and a genuine live verification matching this record's own bar (a real dispatch, a real turn, real output):
++
++1. **The captain's VPS login credentials**, per the open decision on `state/hermes-vps-gateway.status` - not present in any file this task can read, and not guessed or fabricated.
++2. **The `Origin` header on a real gated (non-loopback) connection is unconfirmed.** `scripts/iso-certify.py`'s `WSClient` sets `Origin` to `http://127.0.0.1:<port>` for its loopback-only scratch instance, matching `hermes_cli/web_server.py`'s CORS `allow_origin_regex` (`localhost`/`127.0.0.1` only); whether the gated remote path enforces that same regex on the WS upgrade specifically, or checks Origin at all, was not established by reading `_ws_auth_reason`/the WS accept path in the time this task had.
++   `bin/fm-hermes-ws.py` defaults `Origin` to the real base URL's own origin (the honest choice for a non-loopback connection) and exposes `FM_HERMES_WS_ORIGIN` to override it if a real gated connect is rejected on this header.
++
++Re-run `bash tests/fm-hermes-ws.test.sh` after any change to the client or the stub, and record a real VPS `dispatch` transcript here once the credential and Origin questions above are resolved.
+diff --git a/tests/fixtures/fm-hermes-ws-stub-server.py b/tests/fixtures/fm-hermes-ws-stub-server.py
+new file mode 100755
+index 0000000..f2a751a
+--- /dev/null
++++ b/tests/fixtures/fm-hermes-ws-stub-server.py
+@@ -0,0 +1,221 @@
++#!/usr/bin/env python3
++# tests/fixtures/fm-hermes-ws-stub-server.py - a minimal, offline stand-in
++# for a Hermes Agent dashboard's /auth/password-login, /api/auth/ws-ticket,
++# and /api/ws endpoints, used only by tests/fm-hermes-ws.test.sh.
++#
++# This is a test double, not a reimplementation of Hermes: it exists to
++# prove bin/fm-hermes-ws.py's real HTTP + RFC 6455 WebSocket handling
++# against a real socket, without needing Hermes installed or a live VPS.
++# The JSON-RPC method set it answers (session.create, prompt.submit,
++# session.status, session.history, session.steer, session.interrupt,
++# session.close) and the gated-mode auth handshake (password-login ->
++# cookie -> ws-ticket -> ?ticket=) mirror the real wire evidence recorded
++# in docs/verification/hermes.md; server-side WS framing here is
++# deliberately independent of fm-hermes-ws.py's own framing code, so a bug
++# shared by both would not hide behind a passing test.
++#
++# Usage: fm-hermes-ws-stub-server.py <port> <username> <password> <static-token>
++import base64
++import hashlib
++import http.server
++import json
++import secrets
++import struct
++import sys
++import threading
++
++_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
++PORT, USERNAME, PASSWORD, STATIC_TOKEN = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
++
++_lock = threading.Lock()
++_cookies = set()
++_tickets = set()
++
++
++def _send_frame(wfile, opcode, payload):
++    header = bytearray([0x80 | opcode])
++    length = len(payload)
++    if length < 126:
++        header.append(length)
++    elif length < 65536:
++        header.append(126)
++        header += struct.pack('>H', length)
++    else:
++        header.append(127)
++        header += struct.pack('>Q', length)
++    wfile.write(bytes(header) + payload)
++    wfile.flush()
++
++
++def _send_text(wfile, text):
++    _send_frame(wfile, 0x1, text.encode('utf-8'))
++
++
++def _recv_frame(rfile):
++    b0, b1 = rfile.read(1)[0], rfile.read(1)[0]
++    opcode = b0 & 0x0F
++    length = b1 & 0x7F
++    if length == 126:
++        (length,) = struct.unpack('>H', rfile.read(2))
++    elif length == 127:
++        (length,) = struct.unpack('>Q', rfile.read(8))
++    mask = rfile.read(4)  # client frames are always masked
++    payload = rfile.read(length)
++    unmasked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
++    return opcode, unmasked
++
++
++def _rpc_result(req_id, result):
++    return json.dumps({'jsonrpc': '2.0', 'id': req_id, 'result': result})
++
++
++class Handler(http.server.BaseHTTPRequestHandler):
++    protocol_version = 'HTTP/1.1'
++
++    def log_message(self, fmt, *args):
++        pass
++
++    def _json_body(self):
++        length = int(self.headers.get('Content-Length', '0') or '0')
++        raw = self.rfile.read(length) if length else b''
++        return json.loads(raw.decode('utf-8')) if raw else {}
++
++    def do_POST(self):
++        if self.path == '/auth/password-login':
++            body = self._json_body()
++            if body.get('provider') == 'basic' and body.get('username') == USERNAME \
++                    and body.get('password') == PASSWORD:
++                cookie = secrets.token_urlsafe(16)
++                with _lock:
++                    _cookies.add(cookie)
++                payload = json.dumps({'ok': True, 'next': '/'}).encode('utf-8')
++                self.send_response(200)
++                self.send_header('Content-Type', 'application/json')
++                self.send_header('Content-Length', str(len(payload)))
++                self.send_header('Set-Cookie', f'hermes_session_at={cookie}; Path=/; HttpOnly')
++                self.end_headers()
++                self.wfile.write(payload)
++            else:
++                payload = json.dumps({'detail': 'Invalid credentials'}).encode('utf-8')
++                self.send_response(401)
++                self.send_header('Content-Type', 'application/json')
++                self.send_header('Content-Length', str(len(payload)))
++                self.end_headers()
++                self.wfile.write(payload)
++            return
++        if self.path == '/api/auth/ws-ticket':
++            cookie_header = self.headers.get('Cookie', '')
++            cookie = ''
++            for part in cookie_header.split(';'):
++                part = part.strip()
++                if part.startswith('hermes_session_at='):
++                    cookie = part.split('=', 1)[1]
++            with _lock:
++                ok = cookie in _cookies
++            if ok:
++                ticket = secrets.token_urlsafe(16)
++                with _lock:
++                    _tickets.add(ticket)
++                payload = json.dumps({'ticket': ticket, 'ttl_seconds': 30}).encode('utf-8')
++                self.send_response(200)
++                self.send_header('Content-Type', 'application/json')
++                self.send_header('Content-Length', str(len(payload)))
++                self.end_headers()
++                self.wfile.write(payload)
++            else:
++                self.send_response(401)
++                self.send_header('Content-Length', '0')
++                self.end_headers()
++            return
++        self.send_response(404)
++        self.send_header('Content-Length', '0')
++        self.end_headers()
++
++    def do_GET(self):
++        if self.path.startswith('/api/ws'):
++            self._handle_ws()
++            return
++        self.send_response(404)
++        self.send_header('Content-Length', '0')
++        self.end_headers()
++
++    def _authorized(self):
++        query = self.path.split('?', 1)[1] if '?' in self.path else ''
++        params = dict(p.split('=', 1) for p in query.split('&') if '=' in p)
++        if params.get('token') == STATIC_TOKEN:
++            return True
++        ticket = params.get('ticket')
++        if ticket:
++            with _lock:
++                if ticket in _tickets:
++                    _tickets.discard(ticket)  # single-use
++                    return True
++        return False
++
++    def _handle_ws(self):
++        if not self._authorized():
++            self.send_response(403)
++            self.send_header('Content-Length', '0')
++            self.end_headers()
++            return
++        key = self.headers.get('Sec-WebSocket-Key', '')
++        accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode('ascii')).digest()).decode('ascii')
++        self.send_response(101, 'Switching Protocols')
++        self.send_header('Upgrade', 'websocket')
++        self.send_header('Connection', 'Upgrade')
++        self.send_header('Sec-WebSocket-Accept', accept)
++        self.end_headers()
++        _send_text(self.wfile, json.dumps({
++            'jsonrpc': '2.0', 'method': 'event',
++            'params': {'type': 'gateway.ready', 'payload': {}}}))
++        while True:
++            try:
++                opcode, payload = _recv_frame(self.rfile)
++            except Exception:
++                return
++            if opcode == 0x8:
++                _send_frame(self.wfile, 0x8, b'')
++                return
++            if opcode != 0x1:
++                continue
++            req = json.loads(payload.decode('utf-8'))
++            method, req_id, params = req.get('method'), req.get('id'), req.get('params') or {}
++            if method == 'session.create':
++                _send_text(self.wfile, _rpc_result(
++                    req_id, {'session_id': 'test-session-1', 'info': {'cwd': params.get('cwd')}}))
++            elif method == 'prompt.submit':
++                _send_text(self.wfile, _rpc_result(req_id, {'status': 'streaming'}))
++                text = params.get('text', '')
++                _send_text(self.wfile, json.dumps(
++                    {'jsonrpc': '2.0', 'method': 'event', 'params': {'type': 'message.start'}}))
++                _send_text(self.wfile, json.dumps(
++                    {'jsonrpc': '2.0', 'method': 'event',
++                     'params': {'type': 'message.delta', 'text': 'stub'}}))
++                if 'TRIGGER_ERROR' in text:
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'error', 'payload': {'message': 'stub turn error'}}}))
++                else:
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'message.complete', 'text': 'stub reply'}}))
++            elif method == 'session.status':
++                _send_text(self.wfile, _rpc_result(req_id, {'agent_running': False}))
++            elif method == 'session.history':
++                _send_text(self.wfile, _rpc_result(
++                    req_id, {'count': 1, 'messages': [{'role': 'assistant', 'text': 'stub reply'}]}))
++            elif method == 'session.steer':
++                _send_text(self.wfile, _rpc_result(req_id, {'steered': True}))
++            elif method == 'session.interrupt':
++                _send_text(self.wfile, _rpc_result(req_id, {'interrupted': True}))
++            elif method == 'session.close':
++                _send_text(self.wfile, _rpc_result(req_id, {'closed': True}))
++            else:
++                _send_text(self.wfile, json.dumps(
++                    {'jsonrpc': '2.0', 'id': req_id,
++                     'error': {'code': -32601, 'message': f'unknown method {method}'}}))
++
++
++if __name__ == '__main__':
++    server = http.server.ThreadingHTTPServer(('127.0.0.1', int(PORT)), Handler)
++    server.serve_forever()
+diff --git a/tests/fm-hermes-ws.test.sh b/tests/fm-hermes-ws.test.sh
+new file mode 100755
+index 0000000..cea86c1
+--- /dev/null
++++ b/tests/fm-hermes-ws.test.sh
+@@ -0,0 +1,235 @@
++#!/usr/bin/env bash
++# Behavior tests for bin/fm-hermes-ws.py / bin/fm-hermes-ws.sh, the
++# standalone JSON-RPC-over-WebSocket dispatch client for a Hermes Agent
++# dashboard/serve gateway's /api/ws session API.
++#
++# This is offline and portable: tests/fixtures/fm-hermes-ws-stub-server.py
++# is a from-scratch, independently-written HTTP + RFC 6455 WebSocket
++# double standing in for the real Hermes dashboard, so these tests exercise
++# real sockets and real framing without Hermes installed or a live VPS.
++# What is pinned here:
++#   1. Loopback/--insecure mode's static ?token= auth works end to end
++#      across every RPC primitive the client exposes.
++#   2. Gated mode's password-login -> cookie -> ws-ticket -> ?ticket= flow
++#      works end to end, and bad credentials fail closed with no ticket
++#      minted.
++#   3. `dispatch` blocks until a real message.complete event (not an
++#      earlier event) and surfaces a turn's `error` event as a failure,
++#      matching scripts/iso-certify.py's real first-party Hermes client
++#      (docs/verification/hermes.md).
++#   4. Missing required configuration fails closed with a clear message,
++#      never a partial/guessed connection attempt.
++set -u
++
++# shellcheck source=tests/lib.sh
++. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
++
++command -v python3 >/dev/null 2>&1 || { echo "skip: python3 not found"; exit 0; }
++command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
++
++WRAPPER="$ROOT/bin/fm-hermes-ws.sh"
++STUB="$ROOT/tests/fixtures/fm-hermes-ws-stub-server.py"
++TMP_ROOT=$(fm_test_tmproot fm-hermes-ws)
++
++STUB_USER="probeuser"
++STUB_PASS="probepass"
++STUB_TOKEN="probetoken"
++STUB_PID=""
++
++free_port() {
++  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
++}
++
++start_stub() {
++  local port=$1
++  python3 "$STUB" "$port" "$STUB_USER" "$STUB_PASS" "$STUB_TOKEN" \
++    >"$TMP_ROOT/stub.out" 2>"$TMP_ROOT/stub.err" &
++  STUB_PID=$!
++  local tries=0
++  while [ "$tries" -lt 100 ]; do
++    if python3 -c "
++import socket, sys
++s = socket.socket()
++s.settimeout(0.2)
++try:
++    s.connect(('127.0.0.1', $port))
++except OSError:
++    sys.exit(1)
++sys.exit(0)
++" 2>/dev/null; then
++      return 0
++    fi
++    tries=$((tries + 1))
++    sleep 0.05
++  done
++  fail "stub server on port $port never accepted a connection"
++}
++
++stop_stub() {
++  if [ -n "$STUB_PID" ]; then
++    kill "$STUB_PID" >/dev/null 2>&1 || true
++    wait "$STUB_PID" 2>/dev/null || true
++    STUB_PID=""
++  fi
++}
++trap stop_stub EXIT
++
++# --- token-mode env for a given port ----------------------------------------
++token_env() {
++  local port=$1
++  shift
++  env -i PATH="$PATH" \
++    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
++    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
++    FM_HOME="$TMP_ROOT/home-unused" \
++    "$@"
++}
++
++password_env() {
++  local port=$1 user=$2 pass=$3
++  shift 3
++  env -i PATH="$PATH" \
++    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
++    FM_HERMES_WS_USER="$user" \
++    FM_HERMES_WS_PASS="$pass" \
++    FM_HOME="$TMP_ROOT/home-unused" \
++    "$@"
++}
++
++test_token_mode_full_rpc_cycle() {
++  local port out
++  port=$(free_port)
++  start_stub "$port"
++
++  out=$(token_env "$port" "$WRAPPER" create /tmp/some-worktree) \
++    || fail "create failed: $(cat "$TMP_ROOT/stub.err" 2>/dev/null)"
++  local sid
++  sid=$(printf '%s' "$out" | jq -r '.session_id')
++  [ "$sid" = "test-session-1" ] || fail "create did not return the stub's session_id, got: $out"
++
++  out=$(token_env "$port" "$WRAPPER" submit "$sid" "hello") || fail "submit failed: $out"
++  [ "$(printf '%s' "$out" | jq -r '.status')" = "streaming" ] \
++    || fail "submit did not report status streaming, got: $out"
++
++  out=$(token_env "$port" "$WRAPPER" status "$sid") || fail "status failed: $out"
++  printf '%s' "$out" | jq -e 'has("agent_running")' >/dev/null \
++    || fail "status result missing agent_running, got: $out"
++
++  out=$(token_env "$port" "$WRAPPER" history "$sid") || fail "history failed: $out"
++  [ "$(printf '%s' "$out" | jq -r '.messages[0].text')" = "stub reply" ] \
++    || fail "history did not return the stub transcript, got: $out"
++
++  out=$(token_env "$port" "$WRAPPER" steer "$sid" "redirect") || fail "steer failed: $out"
++  [ "$(printf '%s' "$out" | jq -r '.steered')" = "true" ] || fail "steer result unexpected: $out"
++
++  out=$(token_env "$port" "$WRAPPER" interrupt "$sid") || fail "interrupt failed: $out"
++  [ "$(printf '%s' "$out" | jq -r '.interrupted')" = "true" ] || fail "interrupt result unexpected: $out"
++
++  out=$(token_env "$port" "$WRAPPER" close "$sid") || fail "close failed: $out"
++  [ "$(printf '%s' "$out" | jq -r '.closed')" = "true" ] || fail "close result unexpected: $out"
++
++  stop_stub
++  pass "token mode: every RPC primitive round-trips over a real WebSocket"
++}
++
++test_gated_password_ticket_flow_succeeds() {
++  local port out
++  port=$(free_port)
++  start_stub "$port"
++
++  out=$(password_env "$port" "$STUB_USER" "$STUB_PASS" "$WRAPPER" create /tmp/gated-worktree) \
++    || fail "gated create failed: $(cat "$TMP_ROOT/stub.err" 2>/dev/null)"
++  [ "$(printf '%s' "$out" | jq -r '.session_id')" = "test-session-1" ] \
++    || fail "gated create did not return the stub's session_id, got: $out"
++
++  stop_stub
++  pass "gated mode: password-login -> cookie -> ws-ticket -> /api/ws?ticket= round-trips for real"
++}
++
++test_gated_bad_credentials_fail_closed() {
++  local port rc
++  port=$(free_port)
++  start_stub "$port"
++
++  rc=0
++  password_env "$port" "$STUB_USER" "wrong-password" "$WRAPPER" create /tmp/x >/dev/null 2>"$TMP_ROOT/err.txt" \
++    || rc=$?
++  [ "$rc" -ne 0 ] || fail "bad credentials must fail closed, but the client exited 0"
++  grep -q "wrong-password" "$TMP_ROOT/err.txt" && fail "the password leaked into stderr"
++
++  stop_stub
++  pass "gated mode: bad credentials fail closed with no ticket minted and no leaked secret"
++}
++
++test_dispatch_waits_for_message_complete() {
++  local port out
++  port=$(free_port)
++  start_stub "$port"
++
++  out=$(token_env "$port" "$WRAPPER" dispatch /tmp/dispatch-worktree "a normal prompt" 10) \
++    || fail "dispatch failed on a normal (non-error) turn: $out"
++  [ "$(printf '%s' "$out" | jq -r '.messages[0].text')" = "stub reply" ] \
++    || fail "dispatch did not print the final session.history, got: $out"
++
++  stop_stub
++  pass "dispatch: waits past message.start/message.delta and completes only on message.complete"
++}
++
++test_dispatch_surfaces_a_turn_error() {
++  local port rc errtext
++  port=$(free_port)
++  start_stub "$port"
++
++  rc=0
++  token_env "$port" "$WRAPPER" dispatch /tmp/dispatch-worktree "TRIGGER_ERROR please" 10 \
++    >/dev/null 2>"$TMP_ROOT/dispatch-err.txt" || rc=$?
++  [ "$rc" -ne 0 ] || fail "dispatch must fail when the turn emits an error event"
++  errtext=$(cat "$TMP_ROOT/dispatch-err.txt")
++  case "$errtext" in
++    *"stub turn error"*) ;;
++    *) fail "dispatch's error did not surface the turn's error payload message, got: $errtext" ;;
++  esac
++
++  stop_stub
++  pass "dispatch: a turn's error event fails the call and surfaces its message"
++}
++
++test_missing_base_url_fails_closed() {
++  local rc out
++  rc=0
++  out=$(env -i PATH="$PATH" FM_HOME="$TMP_ROOT/home-unused" "$WRAPPER" create /tmp/x 2>&1) || rc=$?
++  [ "$rc" -ne 0 ] || fail "a missing FM_HERMES_WS_BASE_URL must fail closed, but the client exited 0"
++  case "$out" in
++    *FM_HERMES_WS_BASE_URL*) ;;
++    *) fail "the missing-config error did not name FM_HERMES_WS_BASE_URL, got: $out" ;;
++  esac
++  pass "config: a missing FM_HERMES_WS_BASE_URL fails closed by name, no guessed connection"
++}
++
++test_env_file_credentials_are_read() {
++  local port out home
++  port=$(free_port)
++  start_stub "$port"
++  home="$TMP_ROOT/home-with-env"
++  mkdir -p "$home"
++  {
++    echo "FM_HERMES_WS_BASE_URL=http://127.0.0.1:$port"
++    echo "FM_HERMES_WS_TOKEN=$STUB_TOKEN"
++  } > "$home/.env"
++
++  out=$(env -i PATH="$PATH" FM_HOME="$home" "$WRAPPER" create /tmp/x) \
++    || fail "wrapper did not pick up FM_HOME/.env config: $(cat "$TMP_ROOT/stub.err" 2>/dev/null)"
++  [ "$(printf '%s' "$out" | jq -r '.session_id')" = "test-session-1" ] \
++    || fail "wrapper's .env-sourced config did not reach a real dispatch, got: $out"
++
++  stop_stub
++  pass "config: fm-hermes-ws.sh fills missing env from \$FM_HOME/.env, env still wins over it"
++}
++
++test_token_mode_full_rpc_cycle
++test_gated_password_ticket_flow_succeeds
++test_gated_bad_credentials_fail_closed
++test_dispatch_waits_for_message_complete
++test_dispatch_surfaces_a_turn_error
++test_missing_base_url_fails_closed
++test_env_file_credentials_are_read

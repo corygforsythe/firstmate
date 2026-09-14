@@ -1,0 +1,59 @@
+From 99eeb16e9f9552800d1f2617707c270156ec28a4 Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Mon, 14 Sep 2026 10:10:45 -0500
+Subject: [PATCH 15/24] no-mistakes(review): Check harness mismatch against
+ resolved harness, not just flag
+
+---
+ bin/fm-spawn.sh | 26 ++++++++++++++++----------
+ 1 file changed, 16 insertions(+), 10 deletions(-)
+
+diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
+index 6d0df16..c7c2518 100755
+--- a/bin/fm-spawn.sh
++++ b/bin/fm-spawn.sh
+@@ -13,12 +13,14 @@
+ #   instructions and the recorded task delivery cannot drift apart; a brief
+ #   scaffolded before that line existed warns once and launches on the flag. A
+ #   ship or scout spawn also refuses leftover `{TASK}` / `{FIRSTMATE_SPEC}`
+-#   placeholders, an empty Task, or an incomplete pair of Task subsections. A ship
+-#   or scout spawn passing an explicit --harness also reads the brief's recorded
+-#   "Harness contract: harness=<harness>" line and REFUSES a launch where exactly
+-#   one side is hermes-vps (the only harness whose brief content differs), so the
+-#   worker's hermes-vps-specific instructions and its actual dispatch transport
+-#   cannot drift apart.
++#   placeholders, an empty Task, or an incomplete pair of Task subsections. Every
++#   ship or scout spawn also reads the brief's recorded "Harness contract:
++#   harness=<harness>" line and REFUSES a launch where exactly one side is
++#   hermes-vps (the only harness whose brief content differs), comparing against
++#   the FINAL resolved harness - explicit --harness, crew-dispatch.json's forced
++#   value, or the config/crew-harness standing default - not only an explicit
++#   flag, so the worker's hermes-vps-specific instructions and its actual
++#   dispatch transport cannot drift apart.
+ #   Every ship or scout spawn renders `launch-brief.md`; for a no-mistakes ship
+ #   it also carries the current `--intent` contract and the extracted captain
+ #   intent. A legacy mixed Task is accepted there only under bin/fm-dod-lib.sh's
+@@ -2588,15 +2590,19 @@ fi
+ # every harness except hermes-vps), so the check below compares the single bucket
+ # that actually changes brief content - whether hermes-vps applies - rather than raw
+ # harness-name equality, which would falsely flag two different ordinary harnesses
+-# (e.g. brief scaffolded plain, spawned with --harness claude) as a mismatch.
+-if { [ "$KIND" = ship ] || [ "$KIND" = scout ]; } && [ -n "$HARNESS_ARG" ]; then
++# (e.g. brief scaffolded plain, spawned with --harness claude) as a mismatch. It
++# compares against the FINAL resolved $HARNESS (set above from the explicit
++# --harness, crew-dispatch.json's forced explicit value, or the config/crew-harness
++# standing default), not the raw --harness argument alone, so a standing default of
++# hermes-vps can't silently launch a worker whose brief was scaffolded without it.
++if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
+   BRIEF_HARNESS=$(sed -n 's/^Harness contract: harness=\(.*\)$/\1/p' "$BRIEF" | head -n 1)
+   BRIEF_IS_HERMES_VPS=0
+   [ "$BRIEF_HARNESS" = hermes-vps ] && BRIEF_IS_HERMES_VPS=1
+   SPAWN_IS_HERMES_VPS=0
+-  [ "$HARNESS_ARG" = hermes-vps ] && SPAWN_IS_HERMES_VPS=1
++  [ "$HARNESS" = hermes-vps ] && SPAWN_IS_HERMES_VPS=1
+   if [ "$BRIEF_IS_HERMES_VPS" -ne "$SPAWN_IS_HERMES_VPS" ]; then
+-    echo "error: harness mismatch for $ID: the brief was scaffolded with harness=${BRIEF_HARNESS:-<none>} but this spawn passed --harness $HARNESS_ARG; hermes-vps changes the brief's setup/status/report instructions, so this would launch a worker whose brief and actual transport disagree - correct the flag or re-scaffold the brief with the matching --harness" >&2
++    echo "error: harness mismatch for $ID: the brief was scaffolded with harness=${BRIEF_HARNESS:-<none>} but this spawn resolved harness=$HARNESS; hermes-vps changes the brief's setup/status/report instructions, so this would launch a worker whose brief and actual transport disagree - correct --harness (or the config/crew-harness standing default) or re-scaffold the brief with the matching --harness" >&2
+     exit 1
+   fi
+ fi

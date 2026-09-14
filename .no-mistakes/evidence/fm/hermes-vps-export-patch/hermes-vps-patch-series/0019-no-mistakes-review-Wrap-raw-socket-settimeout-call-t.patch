@@ -1,0 +1,26 @@
+From f90730f5306f41f2ed5aa2514c4d490d7d3cab2d Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Mon, 14 Sep 2026 13:09:35 -0500
+Subject: [PATCH 19/24] no-mistakes(review): Wrap raw socket settimeout call to
+ translate OSError to HermesWsError
+
+---
+ bin/fm-hermes-ws.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/bin/fm-hermes-ws.py b/bin/fm-hermes-ws.py
+index 9d60354..e304f84 100755
+--- a/bin/fm-hermes-ws.py
++++ b/bin/fm-hermes-ws.py
+@@ -356,7 +356,10 @@ class _WSSocket:
+             remaining = deadline - time.monotonic()
+             if remaining <= 0:
+                 raise HermesWsError('timed out waiting for a WebSocket message')
+-            self._sock.settimeout(remaining)
++            try:
++                self._sock.settimeout(remaining)
++            except OSError as exc:
++                raise HermesWsError(f'connection error while setting timeout: {exc}') from exc
+             fin, opcode, payload = self._recv_frame()
+             if opcode == _OPCODE_PING:
+                 self._send_control(_OPCODE_PONG, payload)

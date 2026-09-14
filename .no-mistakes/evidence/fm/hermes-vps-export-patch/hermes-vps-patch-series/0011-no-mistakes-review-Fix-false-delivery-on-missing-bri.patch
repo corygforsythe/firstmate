@@ -1,0 +1,31 @@
+From 1a2301f5e52622f7469c2e93f8fe60e33ac99c33 Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Sun, 13 Sep 2026 22:18:22 -0500
+Subject: [PATCH 11/24] no-mistakes(review): Fix false-delivery on missing
+ brief and trap SIGHUP for session cleanup
+
+---
+ bin/fm-hermes-vps-bridge.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/bin/fm-hermes-vps-bridge.py b/bin/fm-hermes-vps-bridge.py
+index 1caf457..bb2263a 100755
+--- a/bin/fm-hermes-vps-bridge.py
++++ b/bin/fm-hermes-vps-bridge.py
+@@ -168,6 +168,8 @@ class Bridge:
+                     return
+                 self._forward(content)
+                 return
++            print(f'[fm-hermes-vps-bridge] brief not found at {path}', flush=True)
++            return
+         if line == '/exit':
+             self.shutdown()
+             return
+@@ -323,6 +325,7 @@ def main(argv):
+ 
+     signal.signal(signal.SIGTERM, _on_term)
+     signal.signal(signal.SIGINT, _on_term)
++    signal.signal(signal.SIGHUP, _on_term)
+     try:
+         bridge.start()
+     except HermesWsError as exc:

@@ -1,0 +1,23 @@
+From 63e27cba108b0ec683f71531f2ca96ca8860724e Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Sun, 13 Sep 2026 16:14:18 -0500
+Subject: [PATCH 03/24] no-mistakes(review): Add hermes to fm-bootstrap
+ crew-dispatch verified harness allowlist
+
+---
+ bin/fm-bootstrap.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/bin/fm-bootstrap.sh b/bin/fm-bootstrap.sh
+index 98b791e..633ad2a 100755
+--- a/bin/fm-bootstrap.sh
++++ b/bin/fm-bootstrap.sh
+@@ -1114,7 +1114,7 @@ crew_dispatch_validate() {
+     return 0
+   fi
+   err=$(jq -r '
+-    def verified($h): ["claude","codex","opencode","pi","pi-signed","grok","kimi","cursor","agy","muse","rovo","omp"] | index($h);
++    def verified($h): ["claude","codex","opencode","pi","pi-signed","grok","kimi","cursor","agy","muse","rovo","omp","hermes"] | index($h);
+     def effort_ok($h; $m; $e):
+       if $e == null then true
+       elif ($e | type) != "string" then false

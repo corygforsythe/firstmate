@@ -1,0 +1,111 @@
+From f408776ac4402908616e40521171e5fd5001909d Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Mon, 14 Sep 2026 10:21:15 -0500
+Subject: [PATCH 16/24] no-mistakes(review): Preserve inbox order on forward
+ failure; test harness contract check
+
+---
+ bin/fm-hermes-vps-bridge.py    |  2 +-
+ tests/fm-task-delivery.test.sh | 62 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/bin/fm-hermes-vps-bridge.py b/bin/fm-hermes-vps-bridge.py
+index 3459659..f07951a 100755
+--- a/bin/fm-hermes-vps-bridge.py
++++ b/bin/fm-hermes-vps-bridge.py
+@@ -405,7 +405,7 @@ class Bridge:
+                 )
+                 continue
+             if not self._forward(body):
+-                continue  # left in place; retried on the next poll
++                break  # left in place; retried on the next poll
+             handled_dir = self._inbox_handled_dir()
+             try:
+                 os.makedirs(handled_dir, exist_ok=True)
+diff --git a/tests/fm-task-delivery.test.sh b/tests/fm-task-delivery.test.sh
+index bdace4b..d963f26 100755
+--- a/tests/fm-task-delivery.test.sh
++++ b/tests/fm-task-delivery.test.sh
+@@ -51,6 +51,16 @@ write_brief() {  # <home> <id> [<recorded-mode>]
+   } > "$home/data/$id/brief.md"
+ }
+ 
++write_brief_harness() {  # <home> <id> <recorded-mode> [<recorded-harness>]
++  local home=$1 id=$2 mode=$3 harness=${4:-}
++  mkdir -p "$home/data/$id"
++  {
++    printf 'You are a crewmate.\n\n# Task\n## Captain'\''s intent\nExercise the harness contract.\n\n## Firstmate spec\nVerify the selected harness behavior.\n\n# Setup\n'
++    [ -z "$harness" ] || printf 'Harness contract: harness=%s\n' "$harness"
++    printf '\n# Definition of done\nDelivery contract: mode=%s\n' "$mode"
++  } > "$home/data/$id/brief.md"
++}
++
+ fill_brief_subsections() {  # <file> <intent> <spec>
+   local file=$1 intent=$2 spec=$3 content
+   content=$(cat "$file")
+@@ -156,6 +166,57 @@ EOF
+   pass "fm-spawn: the brief's recorded mode and the spawn's explicit mode must agree"
+ }
+ 
++# hermes-vps changes the worker's Setup/status/report instructions, so a brief
++# recorded for one harness must not launch against a resolved harness that
++# disagrees on whether hermes-vps applies - whether that disagreement comes
++# from an explicit --harness or from the config/crew-harness standing default
++# fm-spawn.sh falls back to when neither --harness nor crew-dispatch.json forces
++# an explicit value.
++test_spawn_refuses_a_brief_harness_mismatch() {
++  local rec home proj fakebin out status
++  rec=$(make_home harness-agreement)
++  IFS='|' read -r home proj fakebin <<EOF
++$rec
++EOF
++
++  # Explicit vs explicit mismatch.
++  write_brief_harness "$home" harness-mismatch-c1 no-mistakes hermes-vps
++  out=$(run_spawn "$home" "$fakebin" harness-mismatch-c1 "$proj" --harness claude --mode no-mistakes --yolo off)
++  status=$?
++  [ "$status" -ne 0 ] || fail "a brief/spawn harness mismatch should exit non-zero"
++  assert_contains "$out" "harness mismatch for harness-mismatch-c1" "mismatch refusal did not name the task"
++  assert_contains "$out" "the brief was scaffolded with harness=hermes-vps but this spawn resolved harness=claude" \
++    "mismatch refusal did not show both sides of the disagreement"
++  assert_absent "$home/state/harness-mismatch-c1.meta" "mismatched spawn wrote task metadata"
++
++  # The agreeing case clears the check and only fails later, at the refusing tmux.
++  write_brief_harness "$home" harness-agree-c2 no-mistakes hermes-vps
++  out=$(run_spawn "$home" "$fakebin" harness-agree-c2 "$proj" --harness hermes-vps --mode no-mistakes --yolo off)
++  assert_not_contains "$out" "harness mismatch" "an agreeing harness was reported as a mismatch"
++
++  # A brief scaffolded without --harness (the ordinary default) agrees with any
++  # ordinary explicit harness: only hermes-vps changes brief content, so two
++  # different ordinary harness names are not a real disagreement.
++  write_brief_harness "$home" harness-plain-c3 no-mistakes
++  out=$(run_spawn "$home" "$fakebin" harness-plain-c3 "$proj" --harness claude --mode no-mistakes --yolo off)
++  assert_not_contains "$out" "harness mismatch" "a plain brief against an ordinary explicit harness was reported as a mismatch"
++
++  # A standing config/crew-harness default of hermes-vps must be caught too: an
++  # omitted --harness on both the brief and this spawn should not let a
++  # hermes-vps standing default silently launch a worker whose brief was never
++  # scaffolded for it.
++  printf 'hermes-vps\n' > "$home/config/crew-harness"
++  write_brief_harness "$home" harness-default-c4 no-mistakes
++  out=$(run_spawn "$home" "$fakebin" harness-default-c4 "$proj" --mode no-mistakes --yolo off)
++  status=$?
++  [ "$status" -ne 0 ] || fail "a config/crew-harness default resolving to hermes-vps against a plain brief should exit non-zero"
++  assert_contains "$out" "harness mismatch for harness-default-c4" "the standing-default mismatch was not refused"
++  assert_contains "$out" "this spawn resolved harness=hermes-vps" "the standing-default mismatch did not name the resolved harness"
++  rm -f "$home/config/crew-harness"
++
++  pass "fm-spawn: the brief's recorded harness contract and the spawn's resolved harness must agree"
++}
++
+ # The registry is the captain's standing posture, so dropping below its rigor is
+ # allowed but never silent, while matching or exceeding it stays quiet. An
+ # unregistered project resolves to the same no-mistakes standing default
+@@ -794,6 +855,7 @@ test_spawn_refreshes_legacy_worker_roles
+ test_ship_spawn_requires_a_valid_delivery_contract
+ test_scout_and_secondmate_refuse_delivery_flags
+ test_spawn_refuses_a_brief_mode_mismatch
++test_spawn_refuses_a_brief_harness_mismatch
+ test_spawn_notices_a_rigor_downgrade_against_the_registry
+ test_scout_records_no_delivery_posture
+ test_promote_requires_and_records_the_delivery_contract

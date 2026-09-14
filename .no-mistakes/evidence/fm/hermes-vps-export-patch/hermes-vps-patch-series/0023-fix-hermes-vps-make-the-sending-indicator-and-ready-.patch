@@ -1,0 +1,600 @@
+From 078e2fad379d32247fe0face9776606d05f11282 Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Mon, 14 Sep 2026 17:38:49 -0500
+Subject: [PATCH 23/24] fix(hermes-vps): make the sending indicator and ready
+ marker actually work
+
+The prior sending/ready-marker fix looked correct in offline stub tests
+and against direct pane typing, but a live retest against a real
+hermes-vps crewmate showed both regressions persisted.
+
+The captain's real steering path is fm-send.sh's durable inbox, delivered
+by poll_inbox(), never direct pane typing. poll_inbox() only ran once per
+run()'s select() loop iteration, and that loop could block up to
+EVENT_WAIT_TIMEOUT (30s) while idle, so a steer could sit unnoticed for
+tens of seconds before "[sending...]" ever printed (live-verified: 38s).
+INBOX_POLL_INTERVAL is now its own short constant, and run()'s select()
+timeout is capped to it whenever --inbox-dir is armed.
+
+The ready marker printed with a trailing newline, leaving the cursor on a
+blank line below it instead of beside it. It now prints with no trailing
+newline so a real terminal's own input echo continues on the same line;
+_forward() supplies the one newline poll_inbox()'s non-echoed path still
+needs so "[sending...]" never glues onto the marker's own line.
+
+Both fixes are live-verified against the real VPS (raw pty and tmux).
+---
+ .../references/harness/hermes-vps.md          |   9 +-
+ bin/fm-hermes-vps-bridge.py                   | 116 ++++++++---
+ docs/verification/hermes.md                   |  52 +++++
+ tests/fm-hermes-vps-bridge.test.sh            | 192 ++++++++++++++++--
+ 4 files changed, 323 insertions(+), 46 deletions(-)
+
+diff --git a/.agents/skills/harness-adapters/references/harness/hermes-vps.md b/.agents/skills/harness-adapters/references/harness/hermes-vps.md
+index 0e856a3..1d9cc80 100644
+--- a/.agents/skills/harness-adapters/references/harness/hermes-vps.md
++++ b/.agents/skills/harness-adapters/references/harness/hermes-vps.md
+@@ -65,14 +65,17 @@ Live-verified (offline, no VPS credentials in a task worktree - see `docs/verifi
+ ### Sending indicator
+ 
+ `[working...]` itself only ever rendered once the SERVER confirmed the turn (`message.start`), i.e. after the full round trip to the VPS had already begun - a captain pressing Enter got no feedback at all until that round trip completed, worse on a slow network hop.
+-`_forward()` (the one choke point every submission path shares - pane-typed input, brief-content delivery, and inbox-polled steers alike) now prints a bare `[sending...]` line the instant it is about to issue `prompt.submit`/`session.steer`, before that RPC call - a genuinely distinct, earlier signal from `[working...]`, which still means the server has confirmed the turn is running.
++`_forward()` (the one choke point every submission path shares - pane-typed input, brief-content delivery, and inbox-polled steers alike) prints a bare `[sending...]` line the instant it is about to issue `prompt.submit`/`session.steer`, before that RPC call - a genuinely distinct, earlier signal from `[working...]`, which still means the server has confirmed the turn is running.
+ Never printed for input that never reaches `_forward()` (the doorbell line, a brief pointer whose path does not exist, `/exit`, `/interrupt`), so a local read/parse failure before submission never falsely claims a send was attempted.
+-Live-verified (offline, same methodology as "Working indicator" above) both on the ordinary fast path and against the stub's multi-second delay: `[sending...]` renders immediately after the delivery-confirmation bullet, well before `[working...]`, which still only renders once `message.start` actually arrives.
++Direct pane-typed input was always immediate (proven within milliseconds against the real VPS, `docs/verification/hermes.md`'s "did not survive real-world use" section), but that was never the captain's real steering path: `AGENTS.md` section 7's `fm-send.sh` writes into `--inbox-dir`, delivered by `poll_inbox()`.
++`poll_inbox()` only runs once per `run()`'s own `select()` loop iteration; `INBOX_POLL_INTERVAL` is its own constant (1.0s by default, decoupled from `EVENT_WAIT_TIMEOUT`), and `run()`'s `select()` timeout is capped to it whenever `--inbox-dir` is armed, so an idle bridge notices a durable steer on that cadence instead of `EVENT_WAIT_TIMEOUT`'s (30s) - live-verified against the real VPS: an inbox-delivered steer on an idle bridge previously took 38s to produce `[sending...]`, now under 2s.
+ 
+ ### Ready-for-input marker
+ 
+ The pane had no visible signal that it was idle and ready to accept a line at all, unlike every other verified harness's own composer.
+-A bare `❯` (the same idle-composer glyph `bin/fm-composer-lib.sh` already documents for claude) now renders once whenever the bridge becomes idle: right after the readiness banner, and after every `message.complete`/`error` event resets `self.busy` to `False`.
++A bare `❯` (the same idle-composer glyph `bin/fm-composer-lib.sh` already documents for claude), followed by a trailing space and **no newline**, renders once whenever the bridge becomes idle: right after the readiness banner, and after every `message.complete`/`error` event resets `self.busy` to `False`.
++No trailing newline is deliberate: a real attached terminal's own input echo continues on the marker's own line, so it reads as an inline prompt rather than a label sitting over an empty line below it (live-verified against the real VPS, both a raw pty and a real tmux pane - `docs/verification/hermes.md`'s "did not survive real-world use" section has the exact before/after bytes).
++Because the pane can no longer assume every earlier print left it on a fresh line, `self._prompt_pending` tracks whether the bare marker is still the last thing printed; `_forward()` prepends one newline exactly when nothing has cleared it since the marker (only `poll_inbox()`'s direct `_forward()` call needs this, since it never echoes the line first the way pane-typed input does), so an inbox-delivered `[sending...]` still starts its own line instead of gluing onto the marker's.
+ Because the pane is an append-only scrollback with no way to erase a prior line, "absent while a submission is in flight" means exactly that no NEW `❯` line is printed between a `[sending...]` and the next idle transition - the reader judges the pane's current state from its tail, the same convention every composer-having harness already uses.
+ This is a rendering-only signal: `hermes-vps`'s own busy classification (`fm_busy_hermes_vps_agent_running`) is a live `session.status` RPC and never reads pane text, so neither this marker nor `[sending...]` can be mistaken for a structural busy/idle source by anything that classifies this task's state.
+ Live-verified (offline, same methodology as above): `❯` renders once right after the readiness banner, no `❯` line appears anywhere during a submission's busy stretch (bullet, `[sending...]`, `[working...]`, streamed content, `[turn <status>]`), and it reappears exactly once more right after the turn completes.
+diff --git a/bin/fm-hermes-vps-bridge.py b/bin/fm-hermes-vps-bridge.py
+index 5b917f1..3a794dc 100755
+--- a/bin/fm-hermes-vps-bridge.py
++++ b/bin/fm-hermes-vps-bridge.py
+@@ -150,8 +150,30 @@
+ # (pane-typed input, brief-content delivery, inbox-polled steers), so this
+ # is never printed for input that never reaches it - the doorbell line, a
+ # brief pointer whose path does not exist, /exit, /interrupt (a distinct RPC
+-# with its own "[interrupted]" outcome line, untouched here). Symmetrically,
+-# a bare "❯" line renders once whenever the session becomes idle and ready
++# with its own "[interrupted]" outcome line, untouched here).
++#
++# A first fix attempt (PR "fix(hermes-vps): add immediate send feedback and
++# ready-for-input marker to the bridge pane") made _forward() print
++# SENDING_LINE first, which IS immediate for pane-typed
++# input - but the captain's real steering path is fm-send.sh's durable
++# inbox (AGENTS.md section 7: "Steer a worker with ordinary text through
++# fail-closed fm-send"), delivered here by poll_inbox(), never by typing
++# into this pane directly. poll_inbox() only ran once per run()'s own
++# select() loop iteration, gated by `now - self._last_inbox_poll >=
++# INBOX_POLL_INTERVAL`, and that loop iteration itself blocks inside
++# select() for up to EVENT_WAIT_TIMEOUT (30s) whenever the pane is
++# otherwise idle - so a steer landing on an idle bridge could sit unnoticed
++# for up to ~2*EVENT_WAIT_TIMEOUT before _forward() ever ran, making
++# "[sending...]" arrive tens of seconds late for the one delivery path that
++# actually matters. Live-verified against the real VPS: a steer dropped
++# into --inbox-dir on an idle bridge took 38s to produce "[sending...]".
++# INBOX_POLL_INTERVAL is now its own constant, decoupled from
++# EVENT_WAIT_TIMEOUT, and run()'s select() call uses the smaller of the two
++# as its timeout whenever --inbox-dir is armed, so an idle bridge wakes up
++# and checks the inbox on INBOX_POLL_INTERVAL's own cadence instead of
++# EVENT_WAIT_TIMEOUT's.
++#
++# A bare "❯" line renders once whenever the session becomes idle and ready
+ # for a new line: after start()'s readiness banner, and after every
+ # message.complete/error event resets self.busy to False. Because this is
+ # an append-only scrollback, "absent while a submission is in flight" means
+@@ -165,6 +187,25 @@
+ # (fm_busy_hermes_vps_agent_running) never reads pane text, so neither new
+ # marker can be mistaken for a busy/idle signal by anything that classifies
+ # this task's state.
++#
++# A second fix in the same first attempt printed the marker as a full line
++# ("❯\n"), which left the CURSOR on a fresh, blank line below it rather than
++# beside it - it read as a label sitting over an empty line, not an inline
++# prompt a captain types into. _print_ready_marker() now prints the glyph
++# plus a trailing space with NO newline, so a real attached terminal's own
++# input echo continues on the SAME line right after it. That in turn means
++# whatever this bridge prints next is no longer guaranteed to start on a
++# fresh line the way every earlier line-buffered print could assume: the
++# ONE caller that can genuinely run right after a bare marker with nothing
++# else printed in between - poll_inbox()'s direct _forward() call, since it
++# has no typed line to be echoed first - would otherwise glue "[sending...]"
++# onto the marker's own line ("❯ [sending...]"). self._prompt_pending
++# tracks exactly this: set True only by _print_ready_marker(), cleared by
++# _echo() (the keyboard/brief-pointer path always echoes the submitted line
++# before forwarding it, so by the time _forward() runs the pane is already
++# on a fresh line and needs no help), and consulted by _forward() itself,
++# which prepends one newline exactly when nothing has cleared it since the
++# marker - i.e. only for the inbox-polled path that never calls _echo().
+ import importlib.util
+ import os
+ import re
+@@ -222,7 +263,12 @@ VALID_STATUS_STATES = frozenset(
+ # brief already renders as `echo "{state}: {note}" >> status-file`.
+ _STATUS_LINE_RE = re.compile(r'^([A-Za-z][A-Za-z-]*)(\s*\[key=[^\]\s]+\])?:\s*(\S.*)$')
+ 
+-INBOX_POLL_INTERVAL = EVENT_WAIT_TIMEOUT
++# Deliberately decoupled from EVENT_WAIT_TIMEOUT (see the module docstring's
++# "Local-submit and ready-for-input rendering" section): run()'s select()
++# call uses the smaller of the two as its own timeout whenever --inbox-dir
++# is armed, so an idle bridge notices a durable steer within this cadence
++# instead of waiting up to EVENT_WAIT_TIMEOUT.
++INBOX_POLL_INTERVAL = 1.0
+ 
+ 
+ def _parse_args(argv):
+@@ -255,18 +301,6 @@ def _parse_args(argv):
+     return cwd, status_file, report_file, inbox_dir
+ 
+ 
+-def _echo(line):
+-    print(f'{BULLET} {line}', flush=True)
+-
+-
+-def _print_ready_marker():
+-    """Renders once per idle transition - see the module docstring's
+-    "Local-submit and ready-for-input rendering" section. Never gates
+-    anything: hermes-vps busy classification is a live session.status RPC
+-    (fm_busy_hermes_vps_agent_running), not pane text."""
+-    print(READY_MARKER, flush=True)
+-
+-
+ def _inbox_record_body(raw):
+     """Body of one fm-task-inbox-lib.sh record: header lines, a bare "--"
+     separator line, then the message text verbatim. Returns None when no
+@@ -294,6 +328,27 @@ class Bridge:
+         self._stdin_buf = b''
+         self._turn_text_buf = ''
+         self._last_inbox_poll = 0.0
++        # See the module docstring's "Local-submit and ready-for-input
++        # rendering" section: True only right after _print_ready_marker()
++        # printed the bare, newline-less marker with nothing since; cleared
++        # by _echo() (the keyboard/brief-pointer path always echoes the
++        # submitted line first) and consulted by _forward() itself.
++        self._prompt_pending = False
++
++    def _echo(self, line):
++        print(f'{BULLET} {line}', flush=True)
++        self._prompt_pending = False
++
++    def _print_ready_marker(self):
++        """Renders once per idle transition - see the module docstring's
++        "Local-submit and ready-for-input rendering" section. Never gates
++        anything: hermes-vps busy classification is a live session.status
++        RPC (fm_busy_hermes_vps_agent_running), not pane text. No trailing
++        newline: a real attached terminal's own input echo continues on
++        this same line, so the marker reads as an inline prompt rather than
++        a label over an empty line below it."""
++        print(f'{READY_MARKER} ', end='', flush=True)
++        self._prompt_pending = True
+ 
+     def start(self):
+         created = self.session.rpc('session.create', {'cwd': self.cwd})
+@@ -301,7 +356,7 @@ class Bridge:
+         if not self.session_id:
+             raise HermesWsError(f'session.create returned no session_id: {created}')
+         print(f'{READY_PREFIX} session_id={self.session_id}', flush=True)
+-        _print_ready_marker()
++        self._print_ready_marker()
+ 
+     def _forward(self, text):
+         """Submit or steer <text> depending on the last-observed turn state.
+@@ -314,8 +369,14 @@ class Bridge:
+         submission path shares, so it is the earliest point-in-time local
+         signal available without inventing a second one per caller - see the
+         module docstring's "Local-submit and ready-for-input rendering"
+-        section for why this is distinct from message.start's "[working...]"."""
+-        print(SENDING_LINE, flush=True)
++        section for why this is distinct from message.start's "[working...]".
++        Prepends a newline when self._prompt_pending is still set: only the
++        inbox-polled path can reach here with the bare ready marker as the
++        last thing printed (every other caller echoes the line first), and
++        without this SENDING_LINE would glue onto the marker's own line."""
++        prefix = '\n' if self._prompt_pending else ''
++        self._prompt_pending = False
++        print(f'{prefix}{SENDING_LINE}', flush=True)
+         try:
+             method = 'session.steer' if self.busy else 'prompt.submit'
+             self.session.rpc(method, {'session_id': self.session_id, 'text': text})
+@@ -480,7 +541,7 @@ class Bridge:
+             path = line[len(BRIEF_POINTER_PREFIX):-len(BRIEF_POINTER_SUFFIX)]
+             if os.path.isfile(path):
+                 self.brief_delivered = True
+-                _echo(line)
++                self._echo(line)
+                 try:
+                     with open(path, 'r', encoding='utf-8') as fh:
+                         content = fh.read()
+@@ -514,7 +575,7 @@ class Bridge:
+                     return
+             print('[interrupted]', flush=True)
+             return
+-        _echo(line)
++        self._echo(line)
+         self._forward(line)
+ 
+     def handle_event(self, envelope):
+@@ -560,7 +621,7 @@ class Bridge:
+             text = self._turn_text_buf or (data.get('text') or '')
+             if text:
+                 self._process_turn_text(text)
+-            _print_ready_marker()
++            self._print_ready_marker()
+         elif etype == 'tool.start':
+             name = data.get('name', '?')
+             context = data.get('context', '')
+@@ -573,7 +634,7 @@ class Bridge:
+             self.busy = False
+             message = data.get('message', envelope)
+             print(f'\n[error] {message}', flush=True)
+-            _print_ready_marker()
++            self._print_ready_marker()
+ 
+     def shutdown(self):
+         if self._shutdown:
+@@ -621,8 +682,17 @@ class Bridge:
+                 self._last_inbox_poll = now
+                 self.poll_inbox()
+             raw_sock = self.session._sock._sock  # same-process bridge; not crossing a public API boundary
++            # A shorter select() timeout whenever --inbox-dir is armed: an
++            # idle bridge otherwise only wakes to re-check the clock above
++            # every EVENT_WAIT_TIMEOUT (30s), which is also the longest a
++            # durable steer sitting in the inbox could go unnoticed - see
++            # the module docstring's "Local-submit and ready-for-input
++            # rendering" section.
++            select_timeout = (
++                min(EVENT_WAIT_TIMEOUT, INBOX_POLL_INTERVAL) if self.inbox_dir else EVENT_WAIT_TIMEOUT
++            )
+             try:
+-                readable, _, _ = select.select([self._stdin_fd, raw_sock], [], [], EVENT_WAIT_TIMEOUT)
++                readable, _, _ = select.select([self._stdin_fd, raw_sock], [], [], select_timeout)
+             except (OSError, ValueError):
+                 if self.reconnect():
+                     continue
+diff --git a/docs/verification/hermes.md b/docs/verification/hermes.md
+index 7a117d9..c2c0819 100644
+--- a/docs/verification/hermes.md
++++ b/docs/verification/hermes.md
+@@ -565,3 +565,55 @@ Also confirmed directly against the real bridge subprocess and stub, outside the
+ `[sending...]` rendered within the same tick as the submitted line's delivery bullet on both turns - well before `[working...]`, which (as the working-indicator fix above already established) only renders once `message.start` actually arrives - and `❯` rendered once on open, never during either busy stretch, reappearing once each turn completed.
+ Under this sandbox's own CPU scheduling, a further repeat of the delayed-submission run occasionally showed `[working...]` itself arriving only once the stub's sleep elapsed instead of promptly after `message.start` - the SAME class of timing variance the working-indicator fix's own test already carries as a rare environment-level flake (`docs/verification/hermes.md`'s prior section; reproduced identically against this task's unmodified baseline before any of this task's changes, so it predates and is unrelated to the sending/ready-marker work here) rather than anything introduced by this fix, since neither new marker touches `message.start` handling at all.
+ No VPS credentials exist in a dispatched task's own worktree, so neither fix has yet been re-confirmed against the real VPS; re-run against a live `hermes-vps` pane the next time one is available, and update this section with that result.
++
++## hermes-vps: the sending/ready-marker fix above did not survive real-world use
++
++Fixed 2026-09-14, following a captain live-test of the fix directly above against a fresh `hermes-vps` crewmate: both regressions the prior fix targeted were still present in practice, for two different reasons neither the offline stub tests above nor a direct-pane-typing live check could have caught.
++
++**"[sending...]" not immediate.** Live-testing the merged fix by typing directly into a real `hermes-vps` pane (a raw pty, and a real tmux pane, both against the real VPS) showed `[sending...]` rendering within milliseconds of pressing Enter, exactly as the section above documented - direct pane typing was never the broken path. The captain's actual steering path is `fm-send.sh`'s durable inbox (`AGENTS.md` section 7: "Steer a worker with ordinary text through fail-closed fm-send"), delivered here by `poll_inbox()`, never by typing into this pane directly. `poll_inbox()` ran only once per `run()`'s own `select()` loop iteration, gated by `now - self._last_inbox_poll >= INBOX_POLL_INTERVAL`, and `INBOX_POLL_INTERVAL` was `EVENT_WAIT_TIMEOUT` (30s) - the SAME value `select()` itself used as its blocking timeout whenever the pane was otherwise idle. A steer landing on an idle bridge could therefore sit unnoticed for up to roughly two poll periods before `[sending...]` ever printed. Live-reproduced against the real VPS: a steering record dropped into an idle bridge's `--inbox-dir` took **38 seconds** to produce `[sending...]`.
++
++**Ready marker not inline.** `_print_ready_marker()` printed the glyph with a normal trailing newline (`print(READY_MARKER, flush=True)`), which is exactly what makes it read as a label sitting above an empty line rather than a prompt a captain types into: the cursor ends up on a fresh blank line below the marker, not beside it. Live-reproduced against the real VPS over both a raw pty and a real tmux pane; the raw bytes right after the readiness banner were `...\xe2\x9d\xaf\r\n` (glyph, then an unconditional carriage-return-newline).
++
++**Fix**: `bin/fm-hermes-vps-bridge.py`.
++
++- `INBOX_POLL_INTERVAL` is now its own constant (1.0s), decoupled from `EVENT_WAIT_TIMEOUT`, and `run()`'s `select()` call uses `min(EVENT_WAIT_TIMEOUT, INBOX_POLL_INTERVAL)` as its own timeout whenever `--inbox-dir` is armed, so an idle bridge wakes and checks the inbox on `INBOX_POLL_INTERVAL`'s cadence instead of `EVENT_WAIT_TIMEOUT`'s.
++- `_print_ready_marker()` now prints the glyph plus one trailing space with **no** trailing newline (`print(f'{READY_MARKER} ', end='', flush=True)`), so a real attached terminal's own input echo continues on the same line. Because the pane can no longer assume every earlier print left it on a fresh line, `self._prompt_pending` tracks whether the bare marker is still the last thing printed (set by `_print_ready_marker()`, cleared by `_echo()`), and `_forward()` - the one choke point every submission path shares - prepends a single newline exactly when nothing has cleared it since the marker. This matters only for `poll_inbox()`'s direct `_forward()` call, since it never calls `_echo()` first the way pane-typed input does; without it, fixing the newline would have made an inbox-delivered `[sending...]` glue onto the marker's own line instead.
++
++**Live verification against the real VPS** (not the offline stub - this task's worktree had no VPS credentials of its own, so the running firstmate home's `.env` values were exported directly into a disposable Python/tmux probe rather than copied into the worktree):
++
++Inbox-steer promptness, before the fix (raw pty, `--inbox-dir` armed, a steering record dropped in immediately after the bridge opened idle):
++
++```
++t=0.00  ready, idle
++... (nothing renders)
++t=38.48  [sending...]
++t=38.60  [working...]
++```
++
++The same probe after the fix:
++
++```
++t=0.02  Hermes VPS bridge ready. session_id=8912da10
++❯
++t=1.12  [sending...]
++[working...]
++```
++
++Ready-marker byte shape, before and after, captured with a raw pty (`repr()` of the exact bytes right after the readiness banner):
++
++```
++before: b'Hermes VPS bridge ready. session_id=...\r\n\xe2\x9d\xaf\r\n'
++after:  b'Hermes VPS bridge ready. session_id=...\r\n\xe2\x9d\xaf '
++```
++
++And confirming the marker/sending-boundary fix (an inbox-delivered steer right after the marker, raw bytes):
++
++```
++b'\r\n[sending...]\r\n[working...]\r\n...\r\n[turn complete]\r\n\xe2\x9d\xaf '
++```
++
++- the leading `\r\n` is `_forward()`'s inserted separator, proving `[sending...]` starts its own line rather than gluing onto `\xe2\x9d\xaf` (the bare marker).
++
++Also confirmed in a real tmux pane against the real VPS (not just a raw pty): a captain-typed line still produces `[sending...]` within single-digit milliseconds of pressing Enter (unaffected by this fix, matching the section above), and `tmux capture-pane` shows the marker and a subsequent typed line sharing one visual row instead of the marker occupying an empty row by itself.
++
++**Test coverage**: `tests/fm-hermes-vps-bridge.test.sh` gained `test_bridge_forwards_inbox_steer_promptly` (pins the inbox-promptness fix: a steer dropped into an idle bridge's `--inbox-dir` must produce `[sending...]` within a few seconds, not the old ~30-60s-tied cadence, and the marker/sending boundary must never glue together) and a new `expect_ready_marker` helper used by every existing ready-marker assertion, which reads the marker's exact bytes (a bare `read -r` line read cannot: the marker no longer ends in a newline) and confirms nothing - in particular no trailing newline - follows it until new input is submitted. bash 3.2 (macOS's system bash, this suite's actual runtime) has no `read -N`, so the new `read_bytes_timeout` helper drives a small `python3 os.read()`/`select()` reader against the same already-open fd instead.
+diff --git a/tests/fm-hermes-vps-bridge.test.sh b/tests/fm-hermes-vps-bridge.test.sh
+index 7238636..48411e7 100644
+--- a/tests/fm-hermes-vps-bridge.test.sh
++++ b/tests/fm-hermes-vps-bridge.test.sh
+@@ -62,10 +62,22 @@
+ #      really are separate renders in order, not one renamed.
+ #  11. Ready-for-input marker (the fix for no visible signal that the pane
+ #      was idle and ready to accept a line, unlike every other verified
+-#      harness's composer): a bare "❯" renders once whenever the bridge
+-#      becomes idle (readiness, and after every message.complete/error), and
+-#      never renders again until the next such transition - proven by
+-#      scanning an entire busy stretch for a stray mid-turn "❯".
++#      harness's composer): a bare "❯ " (glyph plus a trailing space, no
++#      newline - expect_ready_marker pins the exact bytes) renders once
++#      whenever the bridge becomes idle (readiness, and after every
++#      message.complete/error), and never renders again until the next such
++#      transition - proven by scanning an entire busy stretch for a stray
++#      mid-turn marker.
++#  12. Inbox-steer promptness (the real root cause of a captain-reported
++#      regression in items 10/11's first fix attempt: [sending...] WAS
++#      immediate for pane-typed input, but the captain's real steering path
++#      is fm-send.sh's durable inbox, delivered by poll_inbox(), which only
++#      ran once per run()'s own select() loop iteration - up to
++#      EVENT_WAIT_TIMEOUT (30s) late on an idle bridge): a steer dropped
++#      into --inbox-dir on an idle bridge must produce [sending...] within a
++#      few seconds, cleanly separated from the ready marker's own
++#      newline-less bytes by a leading newline _forward() supplies itself,
++#      never glued onto the marker's line.
+ set -u
+ 
+ # shellcheck source=tests/lib.sh
+@@ -127,6 +139,60 @@ read_line_timeout() {
+   printf '%s' "$line"
+ }
+ 
++# The ready marker's own print (_print_ready_marker) deliberately never ends
++# in a newline (see fm-hermes-vps-bridge.py's "Local-submit and
++# ready-for-input rendering" section), so it can never be read as a "line"
++# with read_line_timeout - that would block forever waiting for a
++# terminator the marker itself never sends. bash's own `read` has no
++# portable "read exactly N bytes, no delimiter" primitive on bash 3.2
++# (macOS's system bash - no `-N`), so read_bytes_timeout drives a tiny
++# python3 reader against the same already-open fd instead.
++READY_MARKER='❯'
++READY_MARKER_BYTES=4  # the glyph (3 UTF-8 bytes) plus one trailing space
++
++# read_bytes_timeout <fd> <nbytes> <secs> -> prints up to <nbytes> raw bytes
++# read from <fd> within <secs> (fewer if the deadline passes first); never
++# blocks past <secs> even if nbytes never arrive.
++read_bytes_timeout() {
++  local fd=$1 nbytes=$2 secs=$3
++  python3 -c '
++import os, select, sys, time
++fd, n, timeout = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3])
++buf = b""
++deadline = time.monotonic() + timeout
++while len(buf) < n:
++    remaining = deadline - time.monotonic()
++    if remaining <= 0:
++        break
++    r, _, _ = select.select([fd], [], [], remaining)
++    if fd not in r:
++        break
++    chunk = os.read(fd, n - len(buf))
++    if not chunk:
++        break
++    buf += chunk
++sys.stdout.buffer.write(buf)
++' "$fd" "$nbytes" "$secs"
++}
++
++# expect_ready_marker <fd> <secs> -> reads exactly READY_MARKER_BYTES raw
++# bytes and fails the test unless they are the marker glyph plus a single
++# trailing space with no newline - the exact shape a real attached
++# terminal needs to keep typed input on the same line as the marker.
++expect_ready_marker() {
++  local fd=$1 secs=$2 got extra
++  got=$(read_bytes_timeout "$fd" "$READY_MARKER_BYTES" "$secs")
++  [ "$got" = "${READY_MARKER} " ] \
++    || fail "expected the ready marker '${READY_MARKER} ' (glyph + trailing space, no newline), got: $(printf '%s' "$got" | od -c | tr -s ' ')"
++  # Captain-reported regression: the marker previously ended in its own
++  # newline, leaving the cursor on a fresh blank line below it instead of
++  # beside it. Confirm nothing - in particular no trailing newline - follows
++  # the marker's own bytes until the test itself submits new input.
++  extra=$(read_bytes_timeout "$fd" 1 0.3)
++  [ -z "$extra" ] \
++    || fail "expected nothing to follow the ready marker until new input is submitted, got an extra byte: $(printf '%s' "$extra" | od -c | tr -s ' ')"
++}
++
+ # --- 1. process identity -----------------------------------------------------
+ 
+ test_bridge_identity_functions() {
+@@ -277,8 +343,7 @@ Do the real work."
+ 
+   # A fresh session opens idle: the ready-for-input marker renders once,
+   # right after the banner, before any input is sent.
+-  line=$(read_line_timeout 4 10)
+-  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the bridge opened idle, got: $line"
++  expect_ready_marker 4 10
+ 
+   # Brief delivery: the exact pointer sentence fm-spawn.sh types into every
+   # launch-then-send harness's pane, with a LOCAL path the bridge can read -
+@@ -314,8 +379,7 @@ Do the real work."
+ 
+   # The ready marker renders once more right after the turn completes, since
+   # the session is idle and ready for a new line again.
+-  line=$(read_line_timeout 4 10)
+-  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the turn completed, got: $line"
++  expect_ready_marker 4 10
+ 
+   # Interrupt: a local command, not a chat message - must never reach the
+   # model as a submitted line, and must call the real RPC.
+@@ -384,8 +448,7 @@ test_bridge_missing_brief_never_reports_false_delivery() {
+     *) fail "expected the readiness banner, got: $line" ;;
+   esac
+ 
+-  line=$(read_line_timeout 4 10)
+-  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the bridge opened idle, got: $line"
++  expect_ready_marker 4 10
+ 
+   printf 'Read the brief at %s and follow it exactly.\n' "$missing_path" >&3
+   line=$(read_line_timeout 4 10)
+@@ -837,8 +900,7 @@ test_bridge_renders_working_indicator_before_slow_response() {
+     *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-working.err" 2>/dev/null))" ;;
+   esac
+ 
+-  line=$(read_line_timeout 4 10)
+-  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the bridge opened idle, got: $line"
++  expect_ready_marker 4 10
+ 
+   printf 'STUB_DELAY:4:slow reply landed\n' >&3
+   line=$(read_line_timeout 4 10)
+@@ -925,8 +987,7 @@ test_bridge_renders_sending_indicator_before_working_on_ordinary_submit() {
+     'Hermes VPS bridge ready.'*) ;;
+     *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-sending.err" 2>/dev/null))" ;;
+   esac
+-  line=$(read_line_timeout 4 10)
+-  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the bridge opened idle, got: $line"
++  expect_ready_marker 4 10
+ 
+   printf 'hello captain\n' >&3
+   line=$(read_line_timeout 4 10)
+@@ -989,18 +1050,22 @@ test_bridge_renders_ready_marker_when_idle_and_absent_while_busy() {
+     'Hermes VPS bridge ready.'*) ;;
+     *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-ready.err" 2>/dev/null))" ;;
+   esac
+-  line=$(read_line_timeout 4 10)
+-  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the bridge opened idle, got: $line"
++  expect_ready_marker 4 10
+ 
+   printf 'hello captain\n' >&3
+ 
+   # Every line from here through [turn complete] is the busy stretch: none
+   # of them may be a bare "❯", or the marker would be lying about being
+-  # ready for input while a submission is still in flight.
++  # ready for input while a submission is still in flight. The marker never
++  # ends in a newline, so a stray mid-turn occurrence would surface here as
++  # a line merely STARTING WITH it (glued to whatever the bridge prints
++  # next), not necessarily an exact "❯" line - both are checked.
+   local saw_turn_complete=0 tries=0
+   while [ "$tries" -lt 20 ]; do
+     if IFS= read -r -t 2 -u 4 line; then
+-      [ "$line" = '❯' ] && fail "a ready marker (❯) rendered mid-turn, while a submission was in flight: line was '$line'"
++      case "$line" in
++        "$READY_MARKER"*) fail "a ready marker ($READY_MARKER) rendered mid-turn, while a submission was in flight: line was '$line'" ;;
++      esac
+       [ "$line" = '[turn complete]' ] && { saw_turn_complete=1; break; }
+     fi
+     tries=$((tries + 1))
+@@ -1008,8 +1073,7 @@ test_bridge_renders_ready_marker_when_idle_and_absent_while_busy() {
+   [ "$saw_turn_complete" = 1 ] || fail "never saw [turn complete] while scanning for a stray mid-turn ready marker"
+ 
+   # The marker reappears exactly once more, right after the turn completes.
+-  line=$(read_line_timeout 4 10)
+-  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the turn completed, got: $line"
++  expect_ready_marker 4 10
+ 
+   printf '/exit\n' >&3
+   local waited=0
+@@ -1020,6 +1084,92 @@ test_bridge_renders_ready_marker_when_idle_and_absent_while_busy() {
+   pass "ready marker: ❯ renders when idle and never mid-turn, reappearing once the turn completes"
+ }
+ 
++# --- 12. inbox-steer promptness ----------------------------------------------
++
++test_bridge_forwards_inbox_steer_promptly() {
++  # Captain-reported gap, root cause of the "[sending...] not shown
++  # immediately" regression: [sending...] IS immediate on pane-typed input,
++  # but the captain's real steering path is fm-send.sh's durable inbox
++  # (AGENTS.md section 7: "Steer a worker with ordinary text through
++  # fail-closed fm-send"), delivered here by poll_inbox(), never by typing
++  # into this pane directly. poll_inbox() used to run only once per run()'s
++  # own select() loop iteration, and that loop blocked inside select() for
++  # up to EVENT_WAIT_TIMEOUT (30s) whenever the pane was otherwise idle - so
++  # a steer landing on an idle bridge could sit unnoticed for tens of
++  # seconds before "[sending...]" ever printed. Live-verified against the
++  # real VPS: a steer dropped into an idle bridge's --inbox-dir took 38s to
++  # produce "[sending...]" before this fix. INBOX_POLL_INTERVAL is now its
++  # own short constant, and run()'s select() timeout is capped to it
++  # whenever --inbox-dir is armed. This pins a generous upper bound (well
++  # under the old ~30-60s cadence) rather than an exact figure, so it stays
++  # reliable under load while still catching a regression toward the old
++  # cadence.
++  local port rpc_log inbox_dir line
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc-inbox-prompt.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  inbox_dir="$TMP_ROOT/inbox-prompt.inbox"
++  rm -rf "$inbox_dir"
++  mkdir -p "$inbox_dir/handled"
++
++  local in_fifo="$TMP_ROOT/bridge-inbox-prompt.in" out_fifo="$TMP_ROOT/bridge-inbox-prompt.out"
++  rm -f "$in_fifo" "$out_fifo"
++  mkfifo "$in_fifo" "$out_fifo"
++  exec 3<>"$in_fifo"
++  exec 4<>"$out_fifo"
++  env -i PATH="$PATH" \
++    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
++    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
++    python3 "$BRIDGE" --cwd /tmp/some-worktree --inbox-dir "$inbox_dir" \
++      <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-inbox-prompt.err" &
++  BRIDGE_PID=$!
++
++  line=$(read_line_timeout 4 10)
++  case "$line" in
++    'Hermes VPS bridge ready.'*) ;;
++    *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-inbox-prompt.err" 2>/dev/null))" ;;
++  esac
++  expect_ready_marker 4 10
++
++  # Drop the durable steer record only AFTER the bridge is confirmed idle -
++  # exactly like fm-send.sh writing into a live crewmate's inbox, never a
++  # line typed directly into this pane.
++  printf 'schema=fm-task-inbox.v1\nat=2026-01-01T00:00:00Z\n--\nsteered via the durable inbox\n' \
++    > "$inbox_dir/001.msg"
++  local t0
++  t0=$(date +%s)
++
++  # The marker's own bytes carry no trailing newline (expect_ready_marker
++  # above), and poll_inbox() never calls _echo() first the way pane-typed
++  # input does, so _forward() must supply the separating newline itself:
++  # the very next line here is that inserted blank line, never
++  # "[sending...]" glued directly onto the marker's own line.
++  line=$(read_line_timeout 4 15)
++  [ "$line" = '' ] \
++    || fail "expected a bare newline separating the ready marker from the inbox-forwarded [sending...] (not glued onto the marker), got: $line"
++
++  line=$(read_line_timeout 4 5)
++  [ "$line" = '[sending...]' ] \
++    || fail "expected [sending...] promptly after an inbox-delivered steer, got: $line"
++  local elapsed=$(( $(date +%s) - t0 ))
++  [ "$elapsed" -le 10 ] \
++    || fail "expected [sending...] within a few seconds of an inbox-delivered steer (INBOX_POLL_INTERVAL), took ${elapsed}s - a regression toward the old ~30s-tied poll cadence"
++
++  if ! grep -q '"method": "prompt.submit"' "$rpc_log" 2>/dev/null; then
++    fail "the bridge never sent a real prompt.submit RPC for the inbox-delivered steer"
++  fi
++
++  printf '/exit\n' >&3
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
++  BRIDGE_PID=""
++  exec 3>&- 4>&-
++  stop_stub
++  pass "inbox-steer promptness: a durable fm-send.sh-style steer on an idle bridge produces [sending...] within a few seconds, cleanly separated from the ready marker, not the old ~30-60s-tied cadence"
++}
++
+ test_bridge_identity_functions
+ test_agent_process_classify_recognizes_bridge
+ test_busy_hermes_vps_agent_running_parses_status
+@@ -1047,3 +1197,5 @@ test_bridge_renders_sending_indicator_before_working_on_ordinary_submit
+ stop_bridge
+ test_bridge_renders_ready_marker_when_idle_and_absent_while_busy
+ stop_bridge
++test_bridge_forwards_inbox_steer_promptly
++stop_bridge

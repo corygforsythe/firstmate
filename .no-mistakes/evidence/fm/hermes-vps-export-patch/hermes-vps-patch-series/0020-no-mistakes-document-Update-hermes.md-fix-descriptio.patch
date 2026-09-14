@@ -1,0 +1,23 @@
+From 1db3f60e4ca73b5b1895d004c6a6a3536aec31f2 Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Mon, 14 Sep 2026 13:13:04 -0500
+Subject: [PATCH 20/24] no-mistakes(document): Update hermes.md fix description
+ to cover settimeout OSError wrap
+
+---
+ docs/verification/hermes.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/docs/verification/hermes.md b/docs/verification/hermes.md
+index 67963c2..37b1045 100644
+--- a/docs/verification/hermes.md
++++ b/docs/verification/hermes.md
+@@ -491,7 +491,7 @@ The "Herdr's own key routing for a composer-less foreground process" theory was
+ 
+ Live-verified with a real dead connection: `bin/fm-hermes-ws.sh create <cwd>` against a refused port crashed with an uncaught `ConnectionRefusedError` traceback before the fix, confirmed by directly reverting the fix and re-running the CLI.
+ 
+-**Fix**: `_WSSocket` now routes every raw socket write through `_send()` and every raw socket read through `_recv()`, both of which catch `OSError` (covers `ConnectionResetError`, `BrokenPipeError`, `ssl.SSLError`, and `socket.timeout`, an `OSError` subclass since Python 3.3) and re-raise as `HermesWsError`; the initial `socket.create_connection`/`ctx.wrap_socket` in `__init__` are wrapped the same way. Every existing caller (`HermesWsSession.rpc()`, `Bridge._forward()`, `Bridge.reconnect()`, `main()`) already only ever handled `HermesWsError`, so no caller-side change was needed - the fix closes the gap between what those handlers expected and what the raw socket layer could actually raise.
++**Fix**: `_WSSocket` now routes every raw socket write through `_send()` and every raw socket read through `_recv()`, both of which catch `OSError` (covers `ConnectionResetError`, `BrokenPipeError`, `ssl.SSLError`, and `socket.timeout`, an `OSError` subclass since Python 3.3) and re-raise as `HermesWsError`; the initial `socket.create_connection`/`ctx.wrap_socket` in `__init__` are wrapped the same way. `recv_text`'s per-iteration `self._sock.settimeout(remaining)` call sits outside the `_send`/`_recv` wrapper pattern (it's neither a write nor a read) and is wrapped inline with its own `try`/`except OSError` for the same reason. Every existing caller (`HermesWsSession.rpc()`, `Bridge._forward()`, `Bridge.reconnect()`, `main()`) already only ever handled `HermesWsError`, so no caller-side change was needed - the fix closes the gap between what those handlers expected and what the raw socket layer could actually raise.
+ 
+ Pinned by `tests/fm-hermes-ws.test.sh`'s `test_dead_connection_fails_closed_not_uncaught`: a refused connection now fails closed through the same `fm-hermes-ws.py: ...` message every other failure mode already used, never an uncaught traceback. Confirmed live that this test fails (reproduces the uncaught traceback) against the pre-fix code and passes against the fix.
+ 

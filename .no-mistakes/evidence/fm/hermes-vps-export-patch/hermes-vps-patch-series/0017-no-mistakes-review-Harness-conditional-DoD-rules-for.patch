@@ -1,0 +1,477 @@
+From 7d9913ba9c3755c791a29d52194f5b7a8a747c87 Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Mon, 14 Sep 2026 10:48:22 -0500
+Subject: [PATCH 17/24] no-mistakes(review): Harness-conditional DoD/rules for
+ hermes-vps; test inbox order fix
+
+---
+ bin/fm-brief.sh                            |  94 ++++++++-----
+ bin/fm-dod-lib.sh                          |  38 ++++--
+ tests/fixtures/fm-hermes-ws-stub-server.py | 145 +++++++++++----------
+ tests/fm-hermes-vps-bridge.test.sh         |  68 ++++++++++
+ 4 files changed, 236 insertions(+), 109 deletions(-)
+
+diff --git a/bin/fm-brief.sh b/bin/fm-brief.sh
+index e2e80d0..db64347 100755
+--- a/bin/fm-brief.sh
++++ b/bin/fm-brief.sh
+@@ -216,7 +216,7 @@ BRIEF="$DATA/$ID/brief.md"
+ mkdir -p "$DATA/$ID"
+ 
+ ASK_USER_BLOCK=
+-if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
++if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ] && [ "$HARNESS" != hermes-vps ]; then
+   ASK_USER_BLOCK=$(fm_ask_user_escalation_block "$DATA" "$ID")
+ fi
+ 
+@@ -290,6 +290,40 @@ else
+   SHIP_WORKTREE_RULE='Stay inside this worktree; modify nothing outside it.'
+ fi
+ 
++# gh-axi and chrome-devtools-axi are LOCAL command-line tools; a hermes-vps
++# remote agent has no shell reaching this machine and so cannot reach either.
++if [ "$HARNESS" = hermes-vps ]; then
++  TOOLS_RULE='gh-axi and chrome-devtools-axi are local command-line tools unreachable from this harness (you have no shell reaching this machine), so GitHub and browser work is not available to you here.'
++else
++  TOOLS_RULE='Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.'
++fi
++
++# `no-mistakes daemon status`/`no-mistakes axi status` are LOCAL commands a
++# hermes-vps remote agent cannot run either; the Definition of done above
++# already routes it away from the pipeline entirely.
++if [ "$HARNESS" = hermes-vps ]; then
++IFS= read -r -d '' DAEMON_RULE <<'EOF' || true
++You have no local shell to run any no-mistakes command at all - not `no-mistakes daemon status`, not `no-mistakes axi status`, nothing.
++   If this task's mode needed the pipeline, the Definition of done above already explains what to do instead.
++EOF
++else
++IFS= read -r -d '' DAEMON_RULE <<'EOF' || true
++Never stop, restart, or update the shared `no-mistakes` daemon - it is one instance serving
++   every lane/home, so restarting it kills other lanes' in-flight pipeline runs; only firstmate
++   manages the daemon.
++   Before you append `blocked:` about the pipeline, run `no-mistakes daemon status` and
++   `no-mistakes axi status`. If the daemon socket refuses connections or is missing, append
++   `blocked: {the daemon error}` and stop even when the local run record still says running or
++   fixing, because that record can be stale after the daemon exits. A run record failed with a
++   daemon error is also a real block.
++   Only after ruling out socket refusal, if the run is still running or fixing, reattach and keep
++   going. A drive-call error, timeout, slow read, or generic unreachability is NOT a daemon error:
++   the daemon accepts `respond` immediately and runs the round in the background, so a killed or
++   timed-out call was only waiting for a read while the run kept working.
++EOF
++fi
++DAEMON_RULE=${DAEMON_RULE%$'\n'}
++
+ if [ "$KIND" = secondmate ]; then
+ SECONDMATE_PROJECTS=""
+ idx=1
+@@ -484,7 +518,7 @@ The report is the only thing that survives, so anything worth keeping must be in
+ # Rules
+ 1. Never push to any remote and never open a PR.
+ 2. $SCOUT_WORKTREE_RULE
+-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
++3. $TOOLS_RULE
+ 4. $STATUS_REPORT_INTRO
+    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
+    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
+@@ -504,18 +538,7 @@ The report is the only thing that survives, so anything worth keeping must be in
+    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
+    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
+    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
+-7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
+-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs; only firstmate
+-   manages the daemon.
+-   Before you append \`blocked:\` about the pipeline, run \`no-mistakes daemon status\` and
+-   \`no-mistakes axi status\`. If the daemon socket refuses connections or is missing, append
+-   \`blocked: {the daemon error}\` and stop even when the local run record still says running or
+-   fixing, because that record can be stale after the daemon exits. A run record failed with a
+-   daemon error is also a real block.
+-   Only after ruling out socket refusal, if the run is still running or fixing, reattach and keep
+-   going. A drive-call error, timeout, slow read, or generic unreachability is NOT a daemon error:
+-   the daemon accepts \`respond\` immediately and runs the round in the background, so a killed or
+-   timed-out call was only waiting for a read while the run kept working.
++7. $DAEMON_RULE
+ 
+ $INBOX_SECTION
+ 
+@@ -545,7 +568,7 @@ case "$MODE" in
+     RULE1='1. Never push to the default branch. Never merge a PR.'
+     ;;
+ esac
+-DOD=$(fm_dod_block "$MODE" "$ID") || exit 1
++DOD=$(fm_dod_block "$MODE" "$ID" "$HARNESS") || exit 1
+ 
+ if [ "$HARNESS" = hermes-vps ]; then
+ IFS= read -r -d '' HERMES_VPS_SHIP_NOTE <<EOF || true
+@@ -571,6 +594,25 @@ EOF
+ fi
+ SETUP_ISOLATION_AND_BRANCH=${SETUP_ISOLATION_AND_BRANCH%$'\n'}
+ 
++# fm-ensure-agents-md.sh is a LOCAL script operating on the worktree; a
++# hermes-vps remote agent has no access to either.
++if [ "$HARNESS" = hermes-vps ]; then
++IFS= read -r -d '' PROJECT_MEMORY_SECTION <<'EOF' || true
++# Project memory
++Project-memory capture is not reachable from this harness (no local worktree access), so it is skipped.
++EOF
++else
++IFS= read -r -d '' PROJECT_MEMORY_SECTION <<EOF || true
++# Project memory
++If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
++Record only project knowledge useful to almost every future session.
++For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
++If you touch a project \`AGENTS.md\`, follow \`$FM_ROOT/bin/fm-ensure-agents-md.sh\`'s self-governance contract in the same pass.
++Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
++EOF
++fi
++PROJECT_MEMORY_SECTION=${PROJECT_MEMORY_SECTION%$'\n'}
++
+ cat > "$BRIEF" <<EOF
+ You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
+ 
+@@ -587,7 +629,7 @@ $SETUP_ISOLATION_AND_BRANCH
+ # Rules
+ $RULE1
+ 2. $SHIP_WORKTREE_RULE
+-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
++3. $TOOLS_RULE
+ 4. $STATUS_REPORT_INTRO
+    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
+    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
+@@ -609,27 +651,11 @@ $RULE1
+ $ASK_USER_BLOCK
+    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
+    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
+-7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
+-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs; only firstmate
+-   manages the daemon.
+-   Before you append \`blocked:\` about the pipeline, run \`no-mistakes daemon status\` and
+-   \`no-mistakes axi status\`. If the daemon socket refuses connections or is missing, append
+-   \`blocked: {the daemon error}\` and stop even when the local run record still says running or
+-   fixing, because that record can be stale after the daemon exits. A run record failed with a
+-   daemon error is also a real block.
+-   Only after ruling out socket refusal, if the run is still running or fixing, reattach and keep
+-   going. A drive-call error, timeout, slow read, or generic unreachability is NOT a daemon error:
+-   the daemon accepts \`respond\` immediately and runs the round in the background, so a killed or
+-   timed-out call was only waiting for a read while the run kept working.
++7. $DAEMON_RULE
+ 
+ $INBOX_SECTION
+ 
+-# Project memory
+-If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
+-Record only project knowledge useful to almost every future session.
+-For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
+-If you touch a project \`AGENTS.md\`, follow \`$FM_ROOT/bin/fm-ensure-agents-md.sh\`'s self-governance contract in the same pass.
+-Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
++$PROJECT_MEMORY_SECTION
+ 
+ $DOD
+ EOF
+diff --git a/bin/fm-dod-lib.sh b/bin/fm-dod-lib.sh
+index 07a7b46..93fd24e 100755
+--- a/bin/fm-dod-lib.sh
++++ b/bin/fm-dod-lib.sh
+@@ -5,9 +5,14 @@
+ # receives. Both paths must hand the worker the same contract: a promoted
+ # no-mistakes worker that never received the ask-user escalation rule or the
+ # `--yes` ban is the exact delivery hole this single owner exists to close.
+-# fm_dod_block <no-mistakes|direct-PR|local-only> <task-id> prints the block on
+-# stdout with no trailing blank line. The caller validates the mode; an unknown
+-# mode is refused rather than silently rendered as the pipeline contract.
++# fm_dod_block <no-mistakes|direct-PR|local-only> <task-id> [<harness>] prints
++# the block on stdout with no trailing blank line. The caller validates the
++# mode; an unknown mode is refused rather than silently rendered as the
++# pipeline contract. The optional third argument defaults to empty for every
++# existing caller (bin/fm-promote.sh never passes it, unchanged); when it is
++# exactly "hermes-vps", every mode renders the same harness-conditional block
++# instead of its normal mode-specific text, since all three modes equally need
++# local git/shell access that harness structurally does not have.
+ # The block opens with the fixed machine-readable "Delivery contract: mode=<mode>"
+ # line that bin/fm-spawn.sh checks a ship brief against.
+ # This file is the one owner of the no-mistakes `--intent` contract: only the
+@@ -190,8 +195,28 @@ fm_ask_user_escalation_block() {  # <data-dir> <task-id>
+ EOF
+ }
+ 
+-fm_dod_block() {  # <mode> <task-id>
+-  local mode=$1 id=$2
++fm_dod_block() {  # <mode> <task-id> [<harness>]
++  local mode=$1 id=$2 harness=${3:-}
++  case "$mode" in
++    direct-PR|local-only|no-mistakes) ;;
++    *)
++      echo "error: fm_dod_block: unknown delivery mode '$mode'" >&2
++      return 1 ;;
++  esac
++  if [ "$harness" = hermes-vps ]; then
++    cat <<EOF
++# Definition of done
++Delivery contract: mode=$mode
++You have no access to this machine's filesystem or any local shell at all, so you cannot push a branch, open a PR, commit locally, or drive no-mistakes - every one of this mode's actual completion mechanics needs local git/shell you do not have. This ship task should not have been dispatched on harness=hermes-vps for that reason.
++Do not attempt to push a branch, open a PR, commit locally, or run no-mistakes; none of them are reachable from your remote sandbox.
++Instead, in the plain text of one of your own chat replies, wrap your COMPLETE findings between two bare marker lines on their own, with nothing else on those two lines:
++FIRSTMATE-REPORT-BEGIN
++<what you were asked to build, and whatever you determined or accomplished inside your own remote sandbox>
++FIRSTMATE-REPORT-END
++Then include a \`FIRSTMATE-STATUS: blocked: this ship task cannot be completed on harness=hermes-vps (no local git/shell access to push, open a PR, or drive no-mistakes)\` line, and stop.
++EOF
++    return 0
++  fi
+   case "$mode" in
+     direct-PR)
+       cat <<EOF
+@@ -248,8 +273,5 @@ Two firstmate-specific rules layer on top of that guidance:
+ After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
+ EOF
+       ;;
+-    *)
+-      echo "error: fm_dod_block: unknown delivery mode '$mode'" >&2
+-      return 1 ;;
+   esac
+ }
+diff --git a/tests/fixtures/fm-hermes-ws-stub-server.py b/tests/fixtures/fm-hermes-ws-stub-server.py
+index fcfe1ff..f6f6cac 100755
+--- a/tests/fixtures/fm-hermes-ws-stub-server.py
++++ b/tests/fixtures/fm-hermes-ws-stub-server.py
+@@ -203,77 +203,88 @@ class Handler(http.server.BaseHTTPRequestHandler):
+                 _send_text(self.wfile, _rpc_result(
+                     req_id, {'session_id': 'test-session-1', 'info': {'cwd': params.get('cwd')}}))
+             elif method == 'prompt.submit':
+-                _send_text(self.wfile, _rpc_result(req_id, {'status': 'streaming'}))
+                 text = params.get('text', '')
+-                _send_text(self.wfile, json.dumps(
+-                    {'jsonrpc': '2.0', 'method': 'event', 'params': {'type': 'message.start'}}))
+-                # Nested under "payload", matching the real server's _emit()
+-                # shape (tui_gateway/server.py: params = {"type": event,
+-                # "session_id": sid}; params["payload"] = payload when given) -
+-                # confirmed by reading that source directly rather than
+-                # inferred from this stub's own pre-existing (flatter) shape.
+-                if 'TRIGGER_ERROR' in text:
+-                    _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
+-                    _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'error', 'payload': {'message': 'stub turn error'}}}))
+-                elif 'TRIGGER_HANG' in text:
+-                    pass  # never send message.complete/error: the client must time out
+-                elif text.startswith('STUB_ECHO:'):
+-                    # Lets a test control the turn's real content, streamed as
+-                    # a delta exactly like the real server does (embedded
+-                    # newlines included, since this is a single RPC text
+-                    # param, never split by a client-side readline()) instead
+-                    # of the fixed 'stub reply' below - used by
+-                    # tests/fm-hermes-vps-bridge.test.sh to drive the
+-                    # bridge's real FIRSTMATE-STATUS/FIRSTMATE-REPORT
+-                    # marker-processing over a real socket. message.complete's
+-                    # own "text" carries the same content too, matching a
+-                    # normal (non-interleaved-tool-call) turn.
+-                    echoed = text[len('STUB_ECHO:'):]
+-                    _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'message.delta', 'payload': {'text': echoed}}}))
+-                    _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'message.complete',
+-                                    'payload': {'text': echoed, 'status': 'complete'}}}))
+-                elif text.startswith('STUB_SPLIT_ECHO:'):
+-                    # Regression fixture for the live-verified finding
+-                    # (data/hv-protocol-verify/report.md): a turn that emits
+-                    # text, then a tool call, then more text fires exactly
+-                    # ONE message.start/message.complete pair for the WHOLE
+-                    # turn, and message.complete's own "text" field holds
+-                    # ONLY the LAST segment - the first segment survives only
+-                    # in its own earlier message.delta. Payload shape:
+-                    # "STUB_SPLIT_ECHO:<segment1>|||<segment2>".
+-                    seg1, _, seg2 = text[len('STUB_SPLIT_ECHO:'):].partition('|||')
++                if 'TRIGGER_RPC_ERROR' in text:
++                    # An id-matched JSON-RPC error reply, unlike TRIGGER_ERROR
++                    # below (which succeeds at the RPC layer and only fails
++                    # later, mid-turn, as an async "error" event): this fails
++                    # session.rpc() itself, synchronously, for a caller like
++                    # _forward() in bin/fm-hermes-vps-bridge.py that only
++                    # awaits the RPC response and never the event stream.
+                     _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'message.delta', 'payload': {'text': seg1}}}))
+-                    _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'tool.start', 'payload': {'tool_id': 't1', 'name': 'terminal'}}}))
+-                    _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'tool.complete', 'payload': {'tool_id': 't1', 'name': 'terminal'}}}))
+-                    _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'message.delta', 'payload': {'text': seg2}}}))
+-                    _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'message.complete',
+-                                    'payload': {'text': seg2, 'status': 'complete'}}}))
++                        {'jsonrpc': '2.0', 'id': req_id,
++                         'error': {'code': -32000, 'message': 'stub rpc error'}}))
+                 else:
++                    _send_text(self.wfile, _rpc_result(req_id, {'status': 'streaming'}))
+                     _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
+-                    _send_text(self.wfile, json.dumps(
+-                        {'jsonrpc': '2.0', 'method': 'event',
+-                         'params': {'type': 'message.complete',
+-                                    'payload': {'text': 'stub reply', 'status': 'complete'}}}))
++                        {'jsonrpc': '2.0', 'method': 'event', 'params': {'type': 'message.start'}}))
++                    # Nested under "payload", matching the real server's _emit()
++                    # shape (tui_gateway/server.py: params = {"type": event,
++                    # "session_id": sid}; params["payload"] = payload when given) -
++                    # confirmed by reading that source directly rather than
++                    # inferred from this stub's own pre-existing (flatter) shape.
++                    if 'TRIGGER_ERROR' in text:
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'error', 'payload': {'message': 'stub turn error'}}}))
++                    elif 'TRIGGER_HANG' in text:
++                        pass  # never send message.complete/error: the client must time out
++                    elif text.startswith('STUB_ECHO:'):
++                        # Lets a test control the turn's real content, streamed as
++                        # a delta exactly like the real server does (embedded
++                        # newlines included, since this is a single RPC text
++                        # param, never split by a client-side readline()) instead
++                        # of the fixed 'stub reply' below - used by
++                        # tests/fm-hermes-vps-bridge.test.sh to drive the
++                        # bridge's real FIRSTMATE-STATUS/FIRSTMATE-REPORT
++                        # marker-processing over a real socket. message.complete's
++                        # own "text" carries the same content too, matching a
++                        # normal (non-interleaved-tool-call) turn.
++                        echoed = text[len('STUB_ECHO:'):]
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'message.delta', 'payload': {'text': echoed}}}))
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'message.complete',
++                                        'payload': {'text': echoed, 'status': 'complete'}}}))
++                    elif text.startswith('STUB_SPLIT_ECHO:'):
++                        # Regression fixture for the live-verified finding
++                        # (data/hv-protocol-verify/report.md): a turn that emits
++                        # text, then a tool call, then more text fires exactly
++                        # ONE message.start/message.complete pair for the WHOLE
++                        # turn, and message.complete's own "text" field holds
++                        # ONLY the LAST segment - the first segment survives only
++                        # in its own earlier message.delta. Payload shape:
++                        # "STUB_SPLIT_ECHO:<segment1>|||<segment2>".
++                        seg1, _, seg2 = text[len('STUB_SPLIT_ECHO:'):].partition('|||')
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'message.delta', 'payload': {'text': seg1}}}))
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'tool.start', 'payload': {'tool_id': 't1', 'name': 'terminal'}}}))
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'tool.complete', 'payload': {'tool_id': 't1', 'name': 'terminal'}}}))
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'message.delta', 'payload': {'text': seg2}}}))
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'message.complete',
++                                        'payload': {'text': seg2, 'status': 'complete'}}}))
++                    else:
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
++                        _send_text(self.wfile, json.dumps(
++                            {'jsonrpc': '2.0', 'method': 'event',
++                             'params': {'type': 'message.complete',
++                                        'payload': {'text': 'stub reply', 'status': 'complete'}}}))
+             elif method == 'session.status':
+                 _send_text(self.wfile, _rpc_result(req_id, {'agent_running': False}))
+             elif method == 'session.history':
+diff --git a/tests/fm-hermes-vps-bridge.test.sh b/tests/fm-hermes-vps-bridge.test.sh
+index a861606..d056377 100644
+--- a/tests/fm-hermes-vps-bridge.test.sh
++++ b/tests/fm-hermes-vps-bridge.test.sh
+@@ -655,6 +655,72 @@ test_bridge_report_and_inbox_over_real_socket() {
+   pass "report + inbox protocol: the bridge polls, delivers, and acknowledges a steering record unassisted, and a FIRSTMATE-REPORT block lands in the real local report file"
+ }
+ 
++test_bridge_preserves_inbox_order_on_forward_failure() {
++  # Regression for poll_inbox()'s FIFO order guarantee: a record whose
++  # forward permanently fails (both the initial attempt and the
++  # reconnect-retry) must stop the sweep, not let a later, deliverable
++  # record jump ahead of it. TRIGGER_RPC_ERROR (tests/fixtures/
++  # fm-hermes-ws-stub-server.py) makes the stub fail the RPC itself,
++  # synchronously - unlike TRIGGER_ERROR, which only fails later, mid-turn,
++  # as an async event _forward() never waits for.
++  local port rpc_log status_file report_file inbox_dir handled_dir submit_count
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc-order.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  status_file="$TMP_ROOT/status-8g.status"
++  report_file="$TMP_ROOT/status-8g-report.md"
++  inbox_dir="$TMP_ROOT/status-8g.inbox"
++  handled_dir="$inbox_dir/handled"
++  rm -rf "$status_file" "$report_file" "$inbox_dir"
++  mkdir -p "$handled_dir"
++
++  printf 'schema=fm-task-inbox.v1\nat=2026-01-01T00:00:00Z\n--\nTRIGGER_RPC_ERROR' \
++    > "$inbox_dir/001.msg"
++  printf 'schema=fm-task-inbox.v1\nat=2026-01-01T00:00:01Z\n--\nSTUB_ECHO:should never be delivered' \
++    > "$inbox_dir/002.msg"
++
++  start_bridge_with_protocol "$port" bridge-order "$status_file" "$report_file" "$inbox_dir"
++
++  # Wait for both of 001's forward attempts (initial + reconnect-retry) to
++  # reach the stub before asserting the sweep stopped there.
++  local tries=100
++  while :; do
++    submit_count=$(grep -c '"method": "prompt.submit"' "$rpc_log" 2>/dev/null || true)
++    [ -n "$submit_count" ] || submit_count=0
++    [ "$submit_count" -ge 2 ] && break
++    tries=$((tries - 1))
++    [ "$tries" -gt 0 ] || fail "expected both of 001's forward attempts (initial + reconnect-retry) to reach the stub, got: $(cat "$rpc_log" 2>/dev/null)"
++    sleep 0.1
++  done
++
++  # Give a regressed continue-past-failure path time to also process 002.
++  sleep 1
++
++  [ -f "$inbox_dir/001.msg" ] \
++    || fail "001 must stay in the inbox root after its forward permanently fails, not be dropped"
++  [ -f "$handled_dir/001.msg" ] \
++    && fail "001's forward failed, so it must never be acknowledged into handled/"
++  [ -f "$inbox_dir/002.msg" ] \
++    || fail "a later record must not be delivered while an earlier one is still stalled - 002 was removed from the inbox root"
++  [ -f "$handled_dir/002.msg" ] \
++    && fail "002 must not jump ahead of a still-pending 001 and be delivered/acknowledged out of order"
++  submit_count=$(grep -c '"method": "prompt.submit"' "$rpc_log" 2>/dev/null || true)
++  [ -n "$submit_count" ] || submit_count=0
++  [ "$submit_count" -eq 2 ] \
++    || fail "002 must never be forwarded to the remote session while 001 is still pending, got $submit_count prompt.submit calls: $(cat "$rpc_log" 2>/dev/null)"
++
++  printf '/exit\n' >&3
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
++  BRIDGE_PID=""
++  stop_drain
++  exec 3>&- 4>&-
++  stop_stub
++  pass "report + inbox protocol: a failed forward blocks the sweep so a later record cannot jump ahead of a still-pending one"
++}
++
+ test_bridge_suppresses_inbox_doorbell_line() {
+   local port rpc_log status_file report_file inbox_dir
+   port=$(free_port)
+@@ -713,5 +779,7 @@ test_bridge_rejects_malformed_status_line
+ stop_bridge
+ test_bridge_report_and_inbox_over_real_socket
+ stop_bridge
++test_bridge_preserves_inbox_order_on_forward_failure
++stop_bridge
+ test_bridge_suppresses_inbox_doorbell_line
+ stop_bridge

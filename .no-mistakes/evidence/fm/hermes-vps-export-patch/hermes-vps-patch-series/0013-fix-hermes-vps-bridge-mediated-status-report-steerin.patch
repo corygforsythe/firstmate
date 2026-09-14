@@ -1,0 +1,1285 @@
+From 6d835a8d4820465119807471d293a6335c91915c Mon Sep 17 00:00:00 2001
+From: Cory Forsythe <cory@coryforsythe.com>
+Date: Mon, 14 Sep 2026 09:34:44 -0500
+Subject: [PATCH 13/24] fix(hermes-vps): bridge-mediated status/report/steering
+ protocol
+
+The remote VPS agent has no path back to this Mac's filesystem at all, so it
+could not append its own status, write its report, read steering messages, or
+even report that it was blocked - a broken dispatch produced no signal in
+Firstmate at all. The local bridge now owns status (FIRSTMATE-STATUS sentinel
+lines, validated against the fixed state vocabulary), report
+(FIRSTMATE-REPORT-BEGIN/END blocks), and steering (polls and delivers the
+inbox itself, swallowing the unreachable doorbell line) as a transport
+concern instead of a filesystem one, with every protocol failure surfacing as
+a bridge-authored status diagnostic rather than silence.
+
+Live verification against the real VPS surfaced and fixed two additional
+bugs: a select()/buffered-readline() mismatch that could strand an
+already-buffered second stdin line for up to 30s, and message.complete's own
+"text" field silently dropping an earlier text segment whenever a turn
+interleaves text with a tool call (fixed by accumulating message.delta chunks
+per turn instead).
+
+bin/fm-brief.sh --harness hermes-vps scaffolds the worker-side protocol
+instead of literal local shell commands, and routes the scout completion gate
+to firstmate since the worker cannot read captain-hold-lifecycle or run
+bin/fm-captain-hold.sh either.
+---
+ .../skills/captain-hold-lifecycle/SKILL.md    |   1 +
+ .../references/harness/hermes-vps.md          |  20 +-
+ bin/fm-brief.sh                               | 129 ++++++-
+ bin/fm-hermes-vps-bridge.py                   | 346 +++++++++++++++++-
+ bin/fm-hermes-vps-bridge.sh                   |   2 +
+ bin/fm-spawn.sh                               |  23 +-
+ docs/verification/hermes.md                   |  52 +++
+ tests/fixtures/fm-hermes-ws-stub-server.py    |  54 ++-
+ tests/fm-hermes-vps-bridge.test.sh            | 286 +++++++++++++++
+ 9 files changed, 872 insertions(+), 41 deletions(-)
+
+diff --git a/.agents/skills/captain-hold-lifecycle/SKILL.md b/.agents/skills/captain-hold-lifecycle/SKILL.md
+index b408b51..80a2041 100644
+--- a/.agents/skills/captain-hold-lifecycle/SKILL.md
++++ b/.agents/skills/captain-hold-lifecycle/SKILL.md
+@@ -17,6 +17,7 @@ The agent performs the semantic inventory because scripts must not infer captain
+ ## Policy
+ 
+ Every unresolved question that belongs to the captain and is discovered while producing, reading, presenting, or ending an investigation or visual review must be carried by a captain-held task in the authoritative backlog of the home that owns the originating work before that work or review may be treated as complete.
++A harness whose worker cannot read this skill or run `bin/fm-captain-hold.sh` (`.agents/skills/harness-adapters/references/harness/hermes-vps.md`'s "Status, report, and steering") routes this gate to firstmate itself instead: the worker names the open question in its report and firstmate applies this policy on receipt, rather than leaving the gate silently unenforced.
+ Prefer holding the work item the question gates over minting a new row; create a new task only when no work item exists to hold.
+ Put the question and its options in the hold reason, and keep one held task per genuine gate: a multi-question review is one held task pointing at its report, not a row per question. Represent that task with exactly one board card that consolidates its questions and options; never fan one task id into duplicate same-key cards.
+ Register or re-hold through `bin/fm-captain-hold.sh hold`, which is idempotent per task id.
+diff --git a/.agents/skills/harness-adapters/references/harness/hermes-vps.md b/.agents/skills/harness-adapters/references/harness/hermes-vps.md
+index 0447aef..96246b7 100644
+--- a/.agents/skills/harness-adapters/references/harness/hermes-vps.md
++++ b/.agents/skills/harness-adapters/references/harness/hermes-vps.md
+@@ -23,7 +23,7 @@ The pane's foreground process is always this bridge (a python script), never the
+ | Interrupt | **A real, verified RPC** (`session.interrupt`), unlike bare hermes's "no safe key exists" gap. `../../../../bin/fm-control-lib.sh`'s `fm_control_interrupt_via_text` names the literal line `/interrupt`, delivered through the ordinary text-submit pane mechanic (not a named key - this transport has no composer for `Escape`/`Ctrl+C` to act on); the bridge recognizes it locally and calls the RPC instead of forwarding it as chat. `fm-control.sh interrupt\|exit\|relaunch` all work normally. |
+ | Skill invocation | Not applicable - crewmate/scout only. |
+ | Autonomy | Whatever the VPS's own Hermes deployment is configured with; the bridge passes no autonomy flag of its own. |
+-| File access | **The VPS's own filesystem only - see "Known limitation" below.** |
++| File access | **The VPS's own filesystem only for the agent's own tools - see "Known limitation" below.** Status, report, and steering are bridged locally instead - see "Status, report, and steering". |
+ | Trust dialog | None observed (no vendor UI at all). |
+ | Environment marker | None needed: the bridge is a distinct tracked script (`fm-hermes-vps-bridge.py`), matched structurally by `../../../../bin/fm-hermes-lib.sh`'s `fm_hermes_vps_bridge_*` functions, the same interpreter-argv[1] pattern bare hermes's own identity check uses. |
+ | Process name | Always the python interpreter (`python3`/`python3.*`), with `fm-hermes-vps-bridge.py` as argv[1] - see Detection. |
+@@ -55,7 +55,23 @@ If the pointer's path is NOT locally readable, the bridge never echoes that line
+ The bridge renders a grounded subset of the real Hermes event vocabulary (read directly from the installed Hermes source, `tui_gateway/server.py`, not inferred): `message.delta` (streamed text), `message.complete` (a `[turn <status>]` marker), `tool.start`/`tool.complete` (a one-line summary each), and `error`.
+ Every other event type (`reasoning.available`, `subagent.*`, `tool.generating`, todo updates) is deliberately not rendered - an initial pane-rendering scope, not a wire-protocol gap.
+ 
+-## Known limitation: no local file access
++## Status, report, and steering: bridged locally, not filesystem access
++
++The remote VPS agent has no path back to this Mac's filesystem at all (see "Known limitation" below), so it cannot append `state/<id>.status`, write `data/<id>/report.md`, or read `state/<id>.inbox/` the way every other harness's crewmate does directly.
++Live-verified 2026-09-14 (`docs/verification/hermes.md`'s "hermes-vps: local status/report/steering protocol" section) after a live-verification finding that a broken dispatch on this harness produced literally no signal in Firstmate, not even a `blocked:` line: the local bridge (`../../../../bin/fm-hermes-vps-bridge.py`) now owns all three as a transport concern, using `--status-file`/`--report-file`/`--inbox-dir` (armed by `../../../../bin/fm-spawn.sh`'s launch template, all optional so older callers and tests still work with `--cwd` alone).
++
++- **Status**: the remote agent includes a line of the exact shape `FIRSTMATE-STATUS: <state>[ [key=..]]: <note>` in the plain text of its own chat reply (never a shell command); the bridge scans each completed turn's FULL accumulated text (every `message.delta` chunk since the last `message.start`, never `message.complete`'s own `text` field alone - see the next paragraph) for that sentinel, validates the state word against `fm-classify-lib.sh`'s vocabulary itself, and appends only the validated `<state>: <note>` line to the real local status file. A line that fails validation is never written verbatim.
++- **Report**: the remote agent wraps its findings between bare `FIRSTMATE-REPORT-BEGIN`/`FIRSTMATE-REPORT-END` marker lines in ONE reply; the bridge writes exactly the text between them to the real local report file, replacing prior content.
++- **Steering**: the bridge itself polls `--inbox-dir` once per loop iteration (`fm-task-inbox-lib.sh`'s own record format), forwards each body through the same `_forward()` path pane-typed input uses, and moves the record to `handled/` only after a confirmed delivery. The doorbell line every other harness's pane receives (`fm_task_inbox_doorbell_line`, `": Firstmate instruction waiting: ..."`) names a local path this agent can never reach, so the bridge recognizes and swallows that exact line locally rather than forwarding an instruction the model cannot act on.
++- **Failure signal**: a protocol failure (malformed status line, a local write that fails, an unreadable inbox record) always produces a bridge-authored diagnostic through the bridge's own `write_status_line()`, never text the remote agent supplied, so the fix cannot itself become a new silent-failure path.
++- **Scaffolding**: `../../../../bin/fm-brief.sh --harness hermes-vps` renders this protocol into the worker-side brief instead of the literal local shell commands every other harness receives, and for a scout, routes the captain-hold-lifecycle completion gate to firstmate itself rather than the worker - the worker cannot read `.agents/skills/captain-hold-lifecycle/SKILL.md` or run `bin/fm-captain-hold.sh` either. If its investigation surfaces a captain-relevant question, the brief tells it to name that explicitly inside its report's own `## Open questions for the captain` section instead.
++
++`message.complete`'s `text` field is NOT reliably a turn's full cumulative text: live-reproduced, a turn that emits text, then a tool call, then more text fires exactly ONE `message.start`/`message.complete` pair for the whole turn, and that field holds only the LAST text segment.
++An opening `FIRSTMATE-STATUS:` line emitted before the agent reaches for a tool would be silently dropped by trusting that field alone; the bridge instead accumulates every delta chunk itself.
++A second, independent bug fixed alongside this one: mixing `select()` with buffered `sys.stdin.readline()` can strand an already-buffered second line invisibly whenever two lines arrive close together (a steering doorbell immediately followed by real content, for example), because `readline()` can pull multiple lines into its own internal buffer from one underlying read while `select()` only observes the OS-level fd - fixed by reading stdin with raw `os.read()` and assembling lines ourselves.
++Both are pinned by portable regressions in `tests/fm-hermes-vps-bridge.test.sh` (`test_bridge_recovers_status_line_split_by_tool_call`, `test_bridge_suppresses_inbox_doorbell_line`).
++
++## Known limitation: no local file or repo access for the agent's own tools
+ 
+ **`session.create`'s `cwd` param is NOT honored on the captain's real VPS deployment** (live-verified, `docs/verification/hermes.md`'s "Live verification against the real VPS" section - a real `terminal` tool call inside a created session printed `pwd` as `/`, not the requested cwd).
+ The VPS agent's own file and terminal tools therefore reach only the VPS's OWN filesystem, never this task's local git worktree, regardless of what `--cwd` the bridge was launched with.
+diff --git a/bin/fm-brief.sh b/bin/fm-brief.sh
+index 750f19f..3ca51e4 100755
+--- a/bin/fm-brief.sh
++++ b/bin/fm-brief.sh
+@@ -12,9 +12,21 @@
+ # charters still use a single `{TASK}` charter fill. Firstmate may adjust other
+ # sections when the task genuinely deviates (e.g. working an existing external
+ # PR instead of shipping a new one).
+-# Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--herdr-lab]
+-#        fm-brief.sh <task-id> <repo-name> --scout [--herdr-lab]
++# Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--herdr-lab] [--harness <name>]
++#        fm-brief.sh <task-id> <repo-name> --scout [--herdr-lab] [--harness <name>]
+ #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
++#   --harness <name> is optional and defaults to the ordinary harness-agnostic
++#   scaffold; pass the task's already-resolved harness when it changes what the
++#   worker can literally do. Currently only harness=hermes-vps changes anything:
++#   its remote VPS agent has no path back to this machine's filesystem at all
++#   (.agents/skills/harness-adapters/references/harness/hermes-vps.md "Known
++#   limitation"), so its status/report/steering-inbox sections describe the
++#   bridge-mediated FIRSTMATE-STATUS/FIRSTMATE-REPORT protocol
++#   (bin/fm-hermes-vps-bridge.py's own header owns that contract) instead of
++#   literal local shell commands, and its scout Definition of done routes the
++#   captain-hold-lifecycle completion gate to firstmate instead of the worker,
++#   since the worker cannot read that skill file or run bin/fm-captain-hold.sh
++#   either. Every other harness value is accepted and changes nothing.
+ #   --scout writes the scout contract instead: the deliverable is a report at
+ #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
+ #   It offers the Lavish review loop only when `fm-bootstrap.sh lavish-compatible`
+@@ -123,6 +135,7 @@ HERDR_LAB=0
+ NO_PROJECTS=0
+ MODE=
+ MODE_SET=0
++HARNESS=
+ POS=()
+ want_value=
+ for a in "$@"; do
+@@ -132,6 +145,7 @@ for a in "$@"; do
+     esac
+     case "$want_value" in
+       mode) MODE=$a; MODE_SET=1 ;;
++      harness) HARNESS=$a ;;
+       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
+     esac
+     want_value=
+@@ -144,6 +158,8 @@ for a in "$@"; do
+     --no-projects) NO_PROJECTS=1 ;;
+     --mode) want_value=mode ;;
+     --mode=*) MODE=${a#--mode=}; MODE_SET=1 ;;
++    --harness) want_value=harness ;;
++    --harness=*) HARNESS=${a#--harness=} ;;
+     # yolo never reaches the worker: it is firstmate's merge authority, not a
+     # brief input. Refuse it loudly so it is never silently dropped here and then
+     # believed to have been recorded.
+@@ -206,14 +222,62 @@ INBOX_DIR=$(shell_quote "$STATE/$ID.inbox")
+ # owned by bin/fm-task-inbox-lib.sh; the doorbell itself is self-describing,
+ # so this section is reinforcement for the natural-checkpoint habit, not the
+ # only carrier of the instruction.
++if [ "$HARNESS" = hermes-vps ]; then
++# hermes-vps has no path back to this machine's filesystem at all
++# (.agents/skills/harness-adapters/references/harness/hermes-vps.md "Known
++# limitation"), so it never lists or moves inbox records itself; the local
++# bridge process (bin/fm-hermes-vps-bridge.py) polls $INBOX_DIR on its
++# behalf and delivers each message straight into this conversation.
++IFS= read -r -d '' INBOX_SECTION <<EOF || true
++# Firstmate instruction inbox
++You have no access to this machine's filesystem, so you never read or move anything under an inbox path yourself.
++When firstmate has a new instruction for you, a local bridge process delivers its exact text directly into this conversation as an ordinary message on your behalf. Treat any such message exactly like a normal steer from firstmate arriving mid-task: act on it, then continue.
++EOF
++else
+ IFS= read -r -d '' INBOX_SECTION <<EOF || true
+ # Firstmate instruction inbox
+ Firstmate steers you through durable message files in $INBOX_DIR.
+ When a terminal message says an instruction is waiting there - and at any natural checkpoint when you are unsure - list $INBOX_DIR/*.msg, read and act on each message in numeric order, then acknowledge each handled message by moving it: \`mv $INBOX_DIR/NNN.msg $INBOX_DIR/handled/\`.
+ The move IS the acknowledgement: without it firstmate rings again and eventually treats you as stuck. An empty or absent inbox needs no action.
+ EOF
++fi
+ INBOX_SECTION=${INBOX_SECTION%$'\n'}
+ 
++# The status-append mechanism itself, harness-conditional; the surrounding
++# rule text (state vocabulary, paused-verb semantics, PR-URL formatting,
++# keyed decision/blocker lifecycle) is common and stays inline in each
++# scaffold below. hermes-vps's remote agent cannot run a shell command that
++# reaches this machine, so it emits the same state vocabulary as chat text
++# instead, and the local bridge (bin/fm-hermes-vps-bridge.py, its header
++# owns the exact protocol) appends it on the agent's behalf.
++if [ "$HARNESS" = hermes-vps ]; then
++IFS= read -r -d '' STATUS_REPORT_INTRO <<EOF || true
++Report status: you have no access to this machine's filesystem at all, only to your own remote sandbox, so never try to write $STATUS_FILE yourself.
++   Instead, include this exact line anywhere in the plain text of one of your own chat replies, never inside a code block or shell command:
++   \`FIRSTMATE-STATUS: {state}: {one short line}\`
++   A local bridge process on the captain's machine recognizes that exact line and appends \`{state}: {one short line}\` to the real status file for you.
++   The state word must be exactly one of the states below, optionally followed by \` [key=<slug>]\`; anything else is rejected and reported back to firstmate as a local diagnostic blocker instead of the status you intended.
++EOF
++else
++IFS= read -r -d '' STATUS_REPORT_INTRO <<EOF || true
++Report status by appending one line:
++   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
++EOF
++fi
++STATUS_REPORT_INTRO=${STATUS_REPORT_INTRO%$'\n'}
++
++# The worktree/local-file-access rule text, harness-conditional for the same
++# reason: hermes-vps has no path to this machine's worktree, report file, or
++# status file at all (session.create's cwd param is not honored on the real
++# VPS - see the bridge's own header and hermes-vps.md's "Known limitation").
++if [ "$HARNESS" = hermes-vps ]; then
++  SCOUT_WORKTREE_RULE="Stay inside your own remote sandbox; you have no access to this machine's worktree, report file, or status file at all - the status/report protocol below is the only channel back to firstmate."
++  SHIP_WORKTREE_RULE="You have no access to this machine's worktree or any other local path at all; do your actual work in your own remote sandbox and communicate only through the status/report/steering protocol below."
++else
++  SCOUT_WORKTREE_RULE='Stay inside this worktree; the only files you may write outside it are the report and the status file below.'
++  SHIP_WORKTREE_RULE='Stay inside this worktree; modify nothing outside it.'
++fi
++
+ if [ "$KIND" = secondmate ]; then
+ SECONDMATE_PROJECTS=""
+ idx=1
+@@ -356,11 +420,41 @@ EOF
+ TASK_SECTION=${TASK_SECTION%$'\n'}
+ 
+ if [ "$KIND" = scout ]; then
+-if "$SCRIPT_DIR/fm-bootstrap.sh" lavish-compatible >/dev/null 2>&1; then
++if [ "$HARNESS" = hermes-vps ]; then
++  # lavish-axi is a LOCAL command-line tool; a remote VPS agent with no path
++  # back to this machine can never invoke it, regardless of local
++  # compatibility, so this never consults fm-bootstrap.sh for this harness.
++  LAVISH_LINE='Lavish is not reachable from this harness (lavish-axi is a local command-line tool and you have no access to this machine), so deliver your findings as a text report without Lavish, even for a visual deliverable.'
++elif "$SCRIPT_DIR/fm-bootstrap.sh" lavish-compatible >/dev/null 2>&1; then
+   LAVISH_LINE='If your deliverable is a visual artifact the captain will review and iterate on, you may host the Lavish review loop yourself (poll, revise, re-serve, staying alive) instead of handing it back to firstmate.'
+ else
+   LAVISH_LINE='Lavish is unavailable (lavish-axi is missing or below its supported version floor), so deliver your findings as a text report without Lavish, even for a visual deliverable.'
+ fi
++if [ "$HARNESS" = hermes-vps ]; then
++IFS= read -r -d '' REPORT_DOD_SECTION <<EOF || true
++# Definition of done
++You have no access to this machine's filesystem, so you never write \`$DATA/$ID/report.md\` yourself. Instead, in the plain text of one of your own chat replies, wrap your COMPLETE findings between two bare marker lines on their own, with nothing else on those two lines:
++FIRSTMATE-REPORT-BEGIN
++<your complete report: what you did, what you found, the evidence (commands run, output), and what you recommend>
++FIRSTMATE-REPORT-END
++A local bridge process writes everything between those two lines to the real report file for you, verbatim, replacing whatever was there before - so put the ENTIRE report inside ONE such block in a single reply; it is not accumulated across replies.
++$LAVISH_LINE
++You cannot read \`$FM_ROOT/.agents/skills/captain-hold-lifecycle/SKILL.md\` or run any other local script, so do not try. If your investigation surfaces a question that needs the captain's decision, say so explicitly in a clearly labeled "Open questions for the captain" section inside your report block; firstmate applies its own completion procedure for that gate when it reads your report locally, in your place.
++When the report is written and any open questions are named in it, include a \`FIRSTMATE-STATUS: done: {one-line conclusion}\` line (in the same reply or a later one) and stop.
++If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
++EOF
++else
++IFS= read -r -d '' REPORT_DOD_SECTION <<EOF || true
++# Definition of done
++Write your findings to \`$DATA/$ID/report.md\`.
++The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
++$LAVISH_LINE
++Before reporting done, read and follow \`$FM_ROOT/.agents/skills/captain-hold-lifecycle/SKILL.md\` and pass its shared completion gate for the report and any visual review.
++When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
++If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
++EOF
++fi
++REPORT_DOD_SECTION=${REPORT_DOD_SECTION%$'\n'}
+ cat > "$BRIEF" <<EOF
+ You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
+ 
+@@ -376,10 +470,9 @@ The report is the only thing that survives, so anything worth keeping must be in
+ 
+ # Rules
+ 1. Never push to any remote and never open a PR.
+-2. Stay inside this worktree; the only files you may write outside it are the report and the status file below.
++2. $SCOUT_WORKTREE_RULE
+ 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+-4. Report status by appending one line:
+-   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
++4. $STATUS_REPORT_INTRO
+    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
+    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
+    would act on and the needs-decision/blocked/paused/done/failed states. No step-by-step
+@@ -413,13 +506,7 @@ The report is the only thing that survives, so anything worth keeping must be in
+ 
+ $INBOX_SECTION
+ 
+-# Definition of done
+-Write your findings to \`$DATA/$ID/report.md\`.
+-The report must stand alone: what you did, what you found, the evidence (commands run, output, file:line references), and what you recommend.
+-$LAVISH_LINE
+-Before reporting done, read and follow \`$FM_ROOT/.agents/skills/captain-hold-lifecycle/SKILL.md\` and pass its shared completion gate for the report and any visual review.
+-When the report is complete, append \`done: {one-line conclusion}\` to the status file and stop.
+-If your findings reveal work that should ship (e.g. you reproduced a bug and the fix is clear), say so in the report; firstmate may promote this task in place, and you would then receive mode-specific ship instructions as a follow-up message.
++$REPORT_DOD_SECTION
+ EOF
+ echo "scaffolded: $BRIEF (scout; replace {TASK} and {FIRSTMATE_SPEC})"
+ exit 0
+@@ -447,6 +534,16 @@ case "$MODE" in
+ esac
+ DOD=$(fm_dod_block "$MODE" "$ID") || exit 1
+ 
++if [ "$HARNESS" = hermes-vps ]; then
++IFS= read -r -d '' HERMES_VPS_SHIP_NOTE <<EOF || true
++
++**hermes-vps has no access to this worktree at all** (\`.agents/skills/harness-adapters/references/harness/hermes-vps.md\` "Known limitation"). The isolation, branch, and \`no-mistakes\` steps below describe LOCAL bookkeeping only; you have no shell reaching this machine, so you cannot run any of them. Do your actual work in your own remote sandbox and report through the status/report/steering protocol below instead.
++EOF
++else
++HERMES_VPS_SHIP_NOTE=""
++fi
++HERMES_VPS_SHIP_NOTE=${HERMES_VPS_SHIP_NOTE%$'\n'}
++
+ cat > "$BRIEF" <<EOF
+ You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
+ 
+@@ -456,6 +553,7 @@ $HERDR_SECTION
+ 
+ # Setup
+ You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
++$HERMES_VPS_SHIP_NOTE
+ 
+ **Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
+ The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
+@@ -465,10 +563,9 @@ If the top-level path is the primary checkout or not the worktree you were launc
+ 
+ # Rules
+ $RULE1
+-2. Stay inside this worktree; modify nothing outside it.
++2. $SHIP_WORKTREE_RULE
+ 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+-4. Report status by appending one line:
+-   \`echo "{state}: {one short line}" >> $STATUS_FILE\`
++4. $STATUS_REPORT_INTRO
+    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
+    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
+    would act on (setup done, bug reproduced, fix implemented, validation passed) and the
+diff --git a/bin/fm-hermes-vps-bridge.py b/bin/fm-hermes-vps-bridge.py
+index bb2263a..3459659 100755
+--- a/bin/fm-hermes-vps-bridge.py
++++ b/bin/fm-hermes-vps-bridge.py
+@@ -7,6 +7,10 @@
+ # not by anything rendered here.
+ #
+ # Usage: fm-hermes-vps-bridge.py --cwd <path>
++#          [--status-file <path>] [--report-file <path>] [--inbox-dir <path>]
++#   The three optional flags arm the local status/report/inbox protocol
++#   below; omitting one only disables that one piece (existing callers and
++#   tests that predate this protocol still work with --cwd alone).
+ #
+ # Design (harness=hermes-vps, distinct from harness=hermes's pane-based
+ # `hermes --cli` adapter):
+@@ -30,14 +34,15 @@
+ #     below), because every other harness's "Read the brief at <path> and
+ #     follow it exactly." pointer assumes the AGENT can open that path
+ #     itself, which a remote VPS session cannot.
+-#   - THE KEY LIMITATION, not solved here: session.create's cwd param is
+-#     NOT honored on the captain's real VPS deployment (live-verified,
+-#     docs/verification/hermes.md), so the VPS agent's own file/terminal
+-#     tools reach only the VPS's OWN filesystem, never this task's local
+-#     git worktree. A hermes-vps crewmate can converse and use tools in the
+-#     VPS's own sandbox but cannot read or edit this project's code; do not
+-#     dispatch a ship/scout task onto it that needs local repo access -
+-#     see .agents/skills/harness-adapters/references/harness/hermes-vps.md.
++#   - THE KEY LIMITATION, addressed here for the status/report/inbox surface
++#     only: session.create's cwd param is NOT honored on the captain's real
++#     VPS deployment (live-verified, docs/verification/hermes.md), so the
++#     VPS agent's own file/terminal tools reach only the VPS's OWN
++#     filesystem, never this task's local git worktree. A hermes-vps
++#     crewmate can converse and use tools in the VPS's own sandbox but
++#     cannot read or edit this project's code; do not dispatch a ship/scout
++#     task onto it that needs local repo access - see
++#     .agents/skills/harness-adapters/references/harness/hermes-vps.md.
+ #
+ # Brief delivery: fm-spawn.sh's launch-then-send shape for hermes-vps types
+ # the SAME pointer sentence every launch-then-send harness receives -
+@@ -51,6 +56,62 @@
+ # the VPS session instead of the sentence about it. Every later line (an
+ # ordinary steer) is forwarded verbatim, unexamined.
+ #
++# Status/report/inbox protocol (live-verification finding,
++# data/hermes-vps-live-verify/report.md): the remote agent has NO path back
++# to this Mac's filesystem at all, so it cannot append its own
++# state/<id>.status, cannot write data/<id>/report.md, and cannot read or
++# acknowledge state/<id>.inbox/*.msg the way every other harness's crewmate
++# does directly with shell commands. Before this fix that made the failure
++# mode silent: a crewmate that hit this wall had no way to even append a
++# `blocked:` line about it. This bridge - which DOES run locally - now owns
++# all three as a transport concern instead of a filesystem one, using
++# --status-file/--report-file/--inbox-dir (all optional; omitting one only
++# disables that one piece, for callers or tests that predate this protocol):
++#   - Status: bin/fm-brief.sh's hermes-vps scaffold tells the remote agent to
++#     emit a line of the exact shape `FIRSTMATE-STATUS: <state>[ [key=..]]: <note>`
++#     in its own chat output, mirroring the literal `echo "{state}: ..." >>`
++#     convention every other harness's brief already uses (fm-classify-lib.sh
++#     owns the state vocabulary). This bridge scans each completed turn's
++#     full accumulated text - every message.delta chunk concatenated across
++#     the turn, never message.complete's own "text" field alone, which
++#     live-verification proved holds only the LAST text segment when a turn
++#     interleaves text with a tool call (handle_event's own comment on the
++#     message.complete branch has the evidence) - for
++#     that sentinel, validates the state word itself, and appends the
++#     validated line to the REAL local status file. A line that carries the
++#     sentinel but fails validation is never forwarded verbatim: the remote
++#     agent cannot make this bridge write arbitrary bytes to the status file
++#     merely by emitting them in chat, because only text matching the exact
++#     state vocabulary is ever accepted (write_status_line's docstring).
++#   - Report: the remote agent wraps its findings between two bare marker
++#     lines, FIRSTMATE-REPORT-BEGIN and FIRSTMATE-REPORT-END, in one
++#     completed turn. This bridge extracts exactly the text between them and
++#     writes it to the real local report file, replacing prior content.
++#   - Inbox: every loop iteration (so at least every EVENT_WAIT_TIMEOUT
++#     seconds even when nothing else wakes the select() below), this bridge
++#     itself lists --inbox-dir for *.msg records (fm-task-inbox-lib.sh's own
++#     format: header lines, a bare "--" separator, then the message body),
++#     forwards each body through the same _forward() path pane-typed input
++#     uses, and moves the record to inbox-dir/handled/ ONLY after a
++#     confirmed successful forward - exactly the local read-act-acknowledge
++#     loop every other harness's crewmate performs on itself, performed here
++#     on the remote agent's behalf because it cannot reach those paths. The
++#     doorbell line fm_task_inbox_doorbell_line() types into every pane
++#     (starting ": Firstmate instruction waiting:") asks the reader to list
++#     and read a LOCAL path the remote agent can never reach; forwarding it
++#     as chat would only confuse the model with an instruction it cannot
++#     carry out, so this bridge recognizes and swallows that exact line
++#     locally instead - the proactive poll above already delivers the real
++#     content.
++#   - Failure signal: if the protocol itself breaks locally (a malformed
++#     status line, a status/report file write that fails, an unreadable or
++#     unacknowledgeable inbox record), that is never silent and never
++#     something the remote agent's own text can forge: write_status_line()
++#     is the one function that ever appends to the real status file, and
++#     every failure path calls it with a bridge-authored (not
++#     remote-authored) diagnostic line, falling back to a plain pane-visible
++#     stderr-equivalent print only if that write itself fails.
++#
+ # Delivery confirmation mirrors the native hermes adapter's own convention
+ # (docs/verification/hermes.md "Delivery gate"): every line this bridge
+ # forwards is first echoed to stdout with a leading bullet - the same
+@@ -71,6 +132,7 @@
+ # wire-protocol gap.
+ import importlib.util
+ import os
++import re
+ import select
+ import signal
+ import sys
+@@ -99,34 +161,94 @@ EVENT_WAIT_TIMEOUT = 30.0
+ RECONNECT_ATTEMPTS = 5
+ RECONNECT_BACKOFF = 2.0
+ 
++# The doorbell line fm_task_inbox_doorbell_line() (bin/fm-task-inbox-lib.sh)
++# types into every pane for a steering message - that file is the one owner
++# of the exact wording. Only the stable, self-describing prefix is matched
++# here, the same "recognize a known local convention, don't restate it"
++# pattern BRIEF_POINTER_PREFIX/SUFFIX above already use for fm-spawn.sh's
++# launch-then-send pointer sentence.
++DOORBELL_PREFIX = ': Firstmate instruction waiting:'
++
++# Status/report protocol (see the module docstring's "Status/report/inbox
++# protocol" section). fm-classify-lib.sh is the one owner of the state
++# vocabulary; FM_CLASSIFY_PAUSED_VERB is read the same way every shell
++# producer of a status line already does, so a captain override of the
++# paused verb is honored here too.
++STATUS_SENTINEL = 'FIRSTMATE-STATUS: '
++REPORT_BEGIN_MARKER = 'FIRSTMATE-REPORT-BEGIN'
++REPORT_END_MARKER = 'FIRSTMATE-REPORT-END'
++_PAUSED_VERB = os.environ.get('FM_CLASSIFY_PAUSED_VERB') or 'paused'
++VALID_STATUS_STATES = frozenset(
++    {'working', 'needs-decision', 'blocked', _PAUSED_VERB, 'done', 'failed', 'resolved'}
++)
++# "<state>[ [key=<slug>]]: <note>", the same shape every other harness's
++# brief already renders as `echo "{state}: {note}" >> status-file`.
++_STATUS_LINE_RE = re.compile(r'^([A-Za-z][A-Za-z-]*)(\s*\[key=[^\]\s]+\])?:\s*(\S.*)$')
++
++INBOX_POLL_INTERVAL = EVENT_WAIT_TIMEOUT
++
+ 
+ def _parse_args(argv):
+     cwd = None
++    status_file = None
++    report_file = None
++    inbox_dir = None
+     i = 1
+     while i < len(argv):
+         if argv[i] == '--cwd' and i + 1 < len(argv):
+             cwd = argv[i + 1]
+             i += 2
+             continue
++        if argv[i] == '--status-file' and i + 1 < len(argv):
++            status_file = argv[i + 1]
++            i += 2
++            continue
++        if argv[i] == '--report-file' and i + 1 < len(argv):
++            report_file = argv[i + 1]
++            i += 2
++            continue
++        if argv[i] == '--inbox-dir' and i + 1 < len(argv):
++            inbox_dir = argv[i + 1]
++            i += 2
++            continue
+         i += 1
+     if not cwd:
+         print('fm-hermes-vps-bridge: --cwd is required', file=sys.stderr)
+         sys.exit(2)
+-    return cwd
++    return cwd, status_file, report_file, inbox_dir
+ 
+ 
+ def _echo(line):
+     print(f'{BULLET} {line}', flush=True)
+ 
+ 
++def _inbox_record_body(raw):
++    """Body of one fm-task-inbox-lib.sh record: header lines, a bare "--"
++    separator line, then the message text verbatim. Returns None when no
++    separator is present (a malformed or foreign file), matching
++    fm_task_inbox_body's own contract without sourcing shell from Python."""
++    lines = raw.split('\n')
++    for idx, ln in enumerate(lines):
++        if ln == '--':
++            return '\n'.join(lines[idx + 1:])
++    return None
++
++
+ class Bridge:
+-    def __init__(self, cwd):
++    def __init__(self, cwd, status_file=None, report_file=None, inbox_dir=None):
+         self.cwd = cwd
++        self.status_file = status_file
++        self.report_file = report_file
++        self.inbox_dir = inbox_dir
+         self.session = HermesWsSession()
+         self.session_id = None
+         self.busy = False
+         self.brief_delivered = False
+         self._shutdown = False
++        self._stdin_fd = sys.stdin.fileno()
++        self._stdin_buf = b''
++        self._turn_text_buf = ''
++        self._last_inbox_poll = 0.0
+ 
+     def start(self):
+         created = self.session.rpc('session.create', {'cwd': self.cwd})
+@@ -138,22 +260,169 @@ class Bridge:
+     def _forward(self, text):
+         """Submit or steer <text> depending on the last-observed turn state.
+         A real RPC failure is printed into the pane rather than swallowed -
+-        a captain steering a wedged session needs to see that, not silence."""
++        a captain steering a wedged session needs to see that, not silence.
++        Returns True once the RPC is confirmed sent, False otherwise, so a
++        caller with its own delivery-then-acknowledge contract (the inbox
++        poll below) never acknowledges a delivery that never happened."""
+         try:
+             method = 'session.steer' if self.busy else 'prompt.submit'
+             self.session.rpc(method, {'session_id': self.session_id, 'text': text})
++            return True
+         except HermesWsError as exc:
+             # One reconnect-and-retry: the connection may have dropped (see
+             # reconnect()'s docstring) between the last event and this input.
+             if not self.reconnect():
+                 print(f'[fm-hermes-vps-bridge] delivery failed: {exc}', flush=True)
+-                return
++                return False
+             try:
+                 self.session.rpc(method, {'session_id': self.session_id, 'text': text})
++                return True
+             except HermesWsError as exc2:
+                 print(f'[fm-hermes-vps-bridge] delivery failed: {exc2}', flush=True)
++                return False
++
++    def write_status_line(self, line):
++        """The ONE function that ever appends to the real local status file.
++        Used both for a remote status line already validated by
++        _apply_remote_status_line, and for every bridge-authored diagnostic
++        below - so a protocol failure always has a path to become
++        Firstmate-visible through the same channel a healthy status update
++        would use. Best-effort: a write failure here falls back to a plain
++        pane-visible print rather than raising, because there is nothing
++        further local to retry against and the pane itself remains a valid,
++        Firstmate-readable failure signal."""
++        if not self.status_file:
++            return
++        try:
++            with open(self.status_file, 'a', encoding='utf-8') as fh:
++                fh.write(line.rstrip('\n') + '\n')
++        except OSError as exc:
++            print(f'[fm-hermes-vps-bridge] status write failed ({line.strip()!r}): {exc}', flush=True)
++
++    def _apply_remote_status_line(self, candidate):
++        """<candidate> is the text after STATUS_SENTINEL in one completed
++        turn's final text. Never appended verbatim: only a line whose state
++        word is in VALID_STATUS_STATES is accepted, so the remote agent can
++        never make this bridge write arbitrary bytes to the status file by
++        emitting them in chat - it can only ever select from the same
++        vocabulary every other harness's brief already uses."""
++        match = _STATUS_LINE_RE.match(candidate)
++        state = match.group(1) if match else None
++        if not match or state not in VALID_STATUS_STATES:
++            self.write_status_line(
++                'blocked: hermes-vps bridge rejected a malformed status line from the remote '
++                f'session (state must be one of {", ".join(sorted(VALID_STATUS_STATES))}): '
++                f'{candidate.strip()[:200]!r}'
++            )
++            return
++        self.write_status_line(candidate)
++
++    def _write_report(self, content):
++        if not self.report_file:
++            return
++        if not content.strip():
++            self.write_status_line(
++                'blocked: hermes-vps bridge received an empty FIRSTMATE-REPORT block from the '
++                'remote session; report not written'
++            )
++            return
++        try:
++            report_dir = os.path.dirname(self.report_file)
++            if report_dir:
++                os.makedirs(report_dir, exist_ok=True)
++            with open(self.report_file, 'w', encoding='utf-8') as fh:
++                fh.write(content if content.endswith('\n') else content + '\n')
++        except OSError as exc:
++            print(f'[fm-hermes-vps-bridge] report write failed: {exc}', flush=True)
++            self.write_status_line(f'blocked: hermes-vps bridge could not write the report locally: {exc}')
++
++    def _process_turn_text(self, text):
++        """Called with one turn's FULL accumulated text (every message.delta
++        chunk concatenated since the last message.start, never a bare
++        partial delta and never message.complete's own possibly-truncated
++        "text" field alone - see handle_event's message.complete comment).
++        A marker split across streamed chunks is never misread because this
++        only ever sees the assembled whole. Extracts at most one
++        FIRSTMATE-REPORT block and every FIRSTMATE-STATUS line; the
++        rendered pane output is untouched, these markers are also visible
++        there like any other turn text."""
++        lines = text.splitlines()
++        begin_idx = end_idx = None
++        for idx, raw in enumerate(lines):
++            stripped = raw.strip()
++            if begin_idx is None and stripped == REPORT_BEGIN_MARKER:
++                begin_idx = idx
++            elif begin_idx is not None and end_idx is None and stripped == REPORT_END_MARKER:
++                end_idx = idx
++                break
++        if begin_idx is not None and end_idx is not None:
++            self._write_report('\n'.join(lines[begin_idx + 1:end_idx]))
++        for raw in lines:
++            stripped = raw.strip()
++            if stripped.startswith(STATUS_SENTINEL):
++                self._apply_remote_status_line(stripped[len(STATUS_SENTINEL):])
++
++    def _inbox_handled_dir(self):
++        return os.path.join(self.inbox_dir, 'handled')
++
++    def poll_inbox(self):
++        """Read-act-acknowledge the steering inbox on the remote agent's
++        behalf, since it cannot reach --inbox-dir itself (module docstring's
++        "Status/report/inbox protocol"). A record is moved to handled/ ONLY
++        after _forward() confirms delivery, so a dropped connection leaves it
++        in place for the next poll instead of silently losing the steer -
++        the same durable retry the inbox contract already gives every other
++        harness (fm-task-inbox-lib.sh)."""
++        if not self.inbox_dir:
++            return
++        try:
++            names = os.listdir(self.inbox_dir)
++        except OSError:
++            return
++        records = []
++        for name in names:
++            if not name.endswith('.msg'):
++                continue
++            stem = name[:-4]
++            if not stem.isdigit():
++                continue
++            records.append((int(stem), name))
++        for _, name in sorted(records):
++            path = os.path.join(self.inbox_dir, name)
++            try:
++                with open(path, 'r', encoding='utf-8') as fh:
++                    raw = fh.read()
++            except OSError as exc:
++                self.write_status_line(
++                    f'blocked: hermes-vps bridge could not read steering inbox record {name}: {exc}'
++                )
++                continue
++            body = _inbox_record_body(raw)
++            if body is None:
++                self.write_status_line(
++                    f'blocked: hermes-vps bridge found a malformed steering inbox record {name} '
++                    '(no "--" body separator)'
++                )
++                continue
++            if not self._forward(body):
++                continue  # left in place; retried on the next poll
++            handled_dir = self._inbox_handled_dir()
++            try:
++                os.makedirs(handled_dir, exist_ok=True)
++                os.rename(path, os.path.join(handled_dir, name))
++            except OSError as exc:
++                self.write_status_line(
++                    f'blocked: hermes-vps bridge delivered steering message {name} but could not '
++                    f'acknowledge it (move to handled/ failed): {exc}'
++                )
+ 
+     def handle_input_line(self, line):
++        if line.startswith(DOORBELL_PREFIX):
++            # This tells the reader to list and read a LOCAL path the remote
++            # agent can never reach; poll_inbox() above already delivers the
++            # real content proactively, so forwarding this would only hand
++            # the model an instruction it cannot carry out.
++            return
+         if (not self.brief_delivered and line.startswith(BRIEF_POINTER_PREFIX)
+                 and line.endswith(BRIEF_POINTER_SUFFIX)):
+             path = line[len(BRIEF_POINTER_PREFIX):-len(BRIEF_POINTER_SUFFIX)]
+@@ -202,15 +471,34 @@ class Bridge:
+         data = payload.get('payload') or {}
+         if etype == 'message.start':
+             self.busy = True
++            self._turn_text_buf = ''
+         elif etype == 'message.delta':
+             text = data.get('text', '')
+             if text:
+                 sys.stdout.write(text)
+                 sys.stdout.flush()
++                self._turn_text_buf += text
+         elif etype == 'message.complete':
+             self.busy = False
+             status = data.get('status', 'complete')
+             print(f'\n[turn {status}]', flush=True)
++            # message.complete's own "text" field is NOT reliably the turn's
++            # full cumulative text: live-verified against the real VPS
++            # (data/hv-protocol-verify/report.md), a turn that emits text,
++            # then a tool call, then more text fires exactly ONE
++            # message.start/message.complete pair for the whole turn, and
++            # that field holds only the LAST text segment - the FIRST
++            # segment (e.g. an opening FIRSTMATE-STATUS line before the
++            # agent reaches for a tool) is silently absent from it, even
++            # though it streamed correctly through message.delta above and
++            # rendered in the pane. The accumulated delta buffer is the
++            # complete, authoritative record of everything this turn
++            # actually said; message.complete's own field is used only as a
++            # fallback for the degenerate case of a complete with no
++            # preceding deltas at all.
++            text = self._turn_text_buf or (data.get('text') or '')
++            if text:
++                self._process_turn_text(text)
+         elif etype == 'tool.start':
+             name = data.get('name', '?')
+             context = data.get('context', '')
+@@ -265,9 +553,13 @@ class Bridge:
+ 
+     def run(self):
+         while not self._shutdown:
++            now = time.monotonic()
++            if self.inbox_dir and now - self._last_inbox_poll >= INBOX_POLL_INTERVAL:
++                self._last_inbox_poll = now
++                self.poll_inbox()
+             raw_sock = self.session._sock._sock  # same-process bridge; not crossing a public API boundary
+             try:
+-                readable, _, _ = select.select([sys.stdin, raw_sock], [], [], EVENT_WAIT_TIMEOUT)
++                readable, _, _ = select.select([self._stdin_fd, raw_sock], [], [], EVENT_WAIT_TIMEOUT)
+             except (OSError, ValueError):
+                 if self.reconnect():
+                     continue
+@@ -307,17 +599,33 @@ class Bridge:
+                     except HermesWsError:
+                         break
+                     self.handle_event(envelope)
+-            if sys.stdin in readable:
+-                line = sys.stdin.readline()
+-                if line == '':
++            if self._stdin_fd in readable:
++                # Raw os.read(), not sys.stdin.readline(): a buffered
++                # TextIOWrapper can pull MULTIPLE newline-terminated lines
++                # into its own internal buffer from a single underlying
++                # read() whenever more than one line is already queued on
++                # the pipe (exactly what a steering doorbell immediately
++                # followed by real content produces) - readline() would then
++                # return the first line while stranding the second INSIDE
++                # that buffer, invisible to select(), which only observes
++                # the OS-level fd. select() would report "not readable" on
++                # the next iteration even though a second line is sitting
++                # ready, and the bridge would wedge for up to
++                # EVENT_WAIT_TIMEOUT seconds. Reading raw bytes ourselves and
++                # splitting on '\n' keeps everything select() can see.
++                chunk = os.read(self._stdin_fd, 65536)
++                if chunk == b'':
+                     self.shutdown()
+                     break
+-                self.handle_input_line(line.rstrip('\n'))
++                self._stdin_buf += chunk
++                while b'\n' in self._stdin_buf:
++                    raw_line, self._stdin_buf = self._stdin_buf.split(b'\n', 1)
++                    self.handle_input_line(raw_line.decode('utf-8', errors='replace').rstrip('\r'))
+ 
+ 
+ def main(argv):
+-    cwd = _parse_args(argv)
+-    bridge = Bridge(cwd)
++    cwd, status_file, report_file, inbox_dir = _parse_args(argv)
++    bridge = Bridge(cwd, status_file=status_file, report_file=report_file, inbox_dir=inbox_dir)
+ 
+     def _on_term(_signum, _frame):
+         bridge.shutdown()
+diff --git a/bin/fm-hermes-vps-bridge.sh b/bin/fm-hermes-vps-bridge.sh
+index b15726f..ae141a5 100755
+--- a/bin/fm-hermes-vps-bridge.sh
++++ b/bin/fm-hermes-vps-bridge.sh
+@@ -8,6 +8,8 @@
+ # section for the live evidence this was built from.
+ #
+ # Usage: fm-hermes-vps-bridge.sh --cwd <path>
++#          [--status-file <path>] [--report-file <path>] [--inbox-dir <path>]
++#   See fm-hermes-vps-bridge.py's own header for what the optional flags arm.
+ #
+ # Configuration and credentials are resolved the identical way
+ # bin/fm-hermes-ws.sh resolves them (bin/fm-hermes-ws-env-lib.sh is the one
+diff --git a/bin/fm-spawn.sh b/bin/fm-spawn.sh
+index c3b4547..0d6a4e9 100755
+--- a/bin/fm-spawn.sh
++++ b/bin/fm-spawn.sh
+@@ -283,6 +283,15 @@
+ #     __ROVOBIN__   resolved, rovo-verified executable for a rovo launch
+ #     __AGYBIN__    resolved, agy-verified executable for an agy launch
+ #     __HERMESBIN__ resolved, hermes-verified executable for a hermes launch
++#     __HERMESVPSSTATUSFILE__ absolute path to state/<task-id>.status, passed to the
++#                  hermes-vps bridge so it - not the remote VPS agent, which cannot
++#                  reach this path - is the one process that ever appends to it
++#     __HERMESVPSREPORTFILE__ absolute path to data/<task-id>/report.md, passed to the
++#                  hermes-vps bridge for the same reason
++#     __HERMESVPSINBOXDIR__ absolute path to state/<task-id>.inbox, passed to the
++#                  hermes-vps bridge so it polls and delivers steering messages the
++#                  remote agent cannot read itself (.agents/skills/harness-adapters/
++#                  references/harness/hermes-vps.md "Status, report, and steering")
+ # Verified per-harness turn-end hooks are installed automatically where enabled; some live outside the worktree.
+ # Kimi uses one surgically installed Firstmate region in $HOME/.kimi-code/config.toml,
+ # a firstmate-owned global hook and registry, and a gitignored per-task pointer.
+@@ -1770,7 +1779,13 @@ launch_template() {
+     # and hermes-vps.md's "Known limitation" for what that means for a task
+     # that needs local repo access). No model/effort flag exists for this
+     # transport (record-and-omit, matching hermes/kimi below).
+-    hermes-vps) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESVPSBRIDGE__ --cwd __WORKTREE__' ;;
++    # __HERMESVPSSTATUSFILE__/__HERMESVPSREPORTFILE__/__HERMESVPSINBOXDIR__ arm
++    # the bridge's own local status/report/steering protocol (the bridge's
++    # header comment and hermes-vps.md's "Status, report, and steering" own
++    # the contract) - the remote VPS agent has no path back to this Mac's
++    # filesystem at all, so the bridge, which runs locally, is the one
++    # process that ever touches these paths on its behalf.
++    hermes-vps) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESVPSBRIDGE__ --cwd __WORKTREE__ --status-file __HERMESVPSSTATUSFILE__ --report-file __HERMESVPSREPORTFILE__ --inbox-dir __HERMESVPSINBOXDIR__' ;;
+     *) return 1 ;;
+   esac
+ }
+@@ -2239,6 +2254,12 @@ case "$LAUNCH" in
+     # search like every resolve_*_binary above (there is no vendor binary to
+     # find - see the hermes-vps launch_template case).
+     LAUNCH=${LAUNCH//__HERMESVPSBRIDGE__/$(shell_quote "$FM_ROOT/bin/fm-hermes-vps-bridge.sh")}
++    # Arm the bridge's own local status/report/inbox protocol with this
++    # task's real local paths - the remote VPS agent cannot resolve these
++    # itself (module docstring of bin/fm-hermes-vps-bridge.py).
++    LAUNCH=${LAUNCH//__HERMESVPSSTATUSFILE__/$(shell_quote "$STATE/$ID.status")}
++    LAUNCH=${LAUNCH//__HERMESVPSREPORTFILE__/$(shell_quote "$DATA/$ID/report.md")}
++    LAUNCH=${LAUNCH//__HERMESVPSINBOXDIR__/$(shell_quote "$STATE/$ID.inbox")}
+     ;;
+ esac
+ 
+diff --git a/docs/verification/hermes.md b/docs/verification/hermes.md
+index ad80061..8eb6bfc 100644
+--- a/docs/verification/hermes.md
++++ b/docs/verification/hermes.md
+@@ -415,4 +415,56 @@ Confirmed live, inside this task's required isolated Herdr lab session (`bin/fm-
+ **`session.create`'s `cwd` param is still not honored** on this VPS (same finding as above, re-confirmed here): the VPS agent's own tools reach only the VPS's own filesystem.
+ Live-verified concretely during this task's own dispatch gate test: given a brief referencing macOS paths under `/private/tmp/...` and `/Users/coryforsythe/...`, the VPS agent (a real Linux host, `6.8.0-139-generic`, home `/home/coryforsythe`) correctly reported those paths do not exist there and that `/` is not writable, and wrote its own report to the only location it could reach.
+ **A `hermes-vps` crewmate cannot read or edit a task's local git worktree, run `git`, or drive the no-mistakes pipeline** - it is proven useful for VPS-local work and for this fleet-visibility wiring itself, not yet as a substitute for a real local crewmate on project work.
++Before the fix below, that same unreachability extended to the crewmate's OWN status/report/steering paths, which is a materially worse gap: a broken dispatch produced no signal in Firstmate at all, not even a `blocked:` line - see the next section.
++
++## hermes-vps: local status/report/steering protocol, live-verified end to end
++
++Verified 2026-09-14, same real VPS as above, following a live-verification finding (`data/hermes-vps-live-verify/report.md`) that a `hermes-vps` crewmate had no path back to this Mac's filesystem at all: it could not append `state/<id>.status`, write `data/<id>/report.md`, or read `state/<id>.inbox/`, and could not even report `blocked:` about hitting exactly that wall.
++A second, earlier crewmate had hit the identical wall roughly 11 hours prior (a leftover `~/hvcheck-report.md` on the VPS) and it went unfixed and unescalated - the failure mode silenced its own alarm.
++
++### Design: a transport concern, not a filesystem one
++
++The bridge (`bin/fm-hermes-vps-bridge.py`) runs locally and always has real access to this machine's filesystem, so it now owns all three pieces on the remote agent's behalf instead of asking the remote agent to perform filesystem operations it structurally cannot:
++
++- **Status**: the remote agent emits a line of the exact shape `FIRSTMATE-STATUS: <state>[ [key=..]]: <note>` in the plain text of its own chat reply - the same state vocabulary (`fm-classify-lib.sh`) every other harness's brief already uses via a literal `echo ... >>`. The bridge scans each completed turn's text for that sentinel, validates the state word itself against the fixed vocabulary, and appends only the validated `<state>: <note>` line to the real local status file. A line that carries the sentinel but fails validation is never written verbatim: the remote agent cannot make the bridge write arbitrary text merely by emitting it in chat.
++- **Report**: the remote agent wraps its findings between two bare marker lines, `FIRSTMATE-REPORT-BEGIN` and `FIRSTMATE-REPORT-END`, in one reply. The bridge writes exactly the text between them to the real local report file.
++- **Steering inbox**: the bridge itself polls `state/<id>.inbox/*.msg` (`fm-task-inbox-lib.sh`'s own record format) once per loop iteration, delivers each body through the same `_forward()` path pane-typed input uses, and moves the record to `handled/` only after a confirmed delivery - the same local read-act-acknowledge loop every other harness's crewmate performs on itself, performed here on the remote agent's behalf. The doorbell line every other harness's pane receives for a steering message (`fm_task_inbox_doorbell_line`, `": Firstmate instruction waiting: ..."`) names a local path the remote agent can never reach, so the bridge recognizes and swallows that exact line locally instead of forwarding an instruction the model cannot act on.
++- **Failure signal**: every protocol failure path (a malformed status line, a local write that fails, an unreadable inbox record) calls the bridge's own `write_status_line()` with a bridge-authored diagnostic - never text the remote agent supplied - falling back to a plain pane-visible print only if that write itself fails. `bin/fm-brief.sh --harness hermes-vps` scaffolds the worker-side half of this contract (status/inbox/report sections and, for scout, the report-completion instructions), and routes the captain-hold-lifecycle completion gate to firstmate itself rather than the worker, since the worker cannot read that skill file or run `bin/fm-captain-hold.sh` either.
++
++### Two real bugs, found only by driving real turns through the real VPS
++
++Neither is reachable from a stub that never streams genuinely fragmented, multi-segment turns:
++
++1. **`select()`/buffered `readline()` mismatch on stdin.** A single underlying `read()` inside Python's `TextIOWrapper` can pull MULTIPLE newline-terminated lines from the pipe into its own internal buffer whenever more than one line is already queued (exactly what a steering doorbell immediately followed by real content produces, or two rapid steers). `readline()` then returns the first line while stranding the second INSIDE that buffer, invisible to `select()`, which only observes the OS-level fd - the bridge would wedge for up to `EVENT_WAIT_TIMEOUT` (30s) waiting on a `select()` that will never again see the already-buffered second line. Fixed by reading stdin with raw `os.read()` and splitting on `\n` ourselves, so nothing is ever buffered anywhere `select()` cannot see. Reproduced by sending two lines back-to-back with nothing read in between; pinned by `tests/fm-hermes-vps-bridge.test.sh`'s `test_bridge_suppresses_inbox_doorbell_line` (which depends on exactly this fix to pass reliably) and the general status/report tests.
++2. **`message.complete`'s own `text` field is not the turn's full cumulative text.** Live-reproduced against the real VPS (`data/hv-protocol-verify/report.md`): a turn that emits text, then a tool call, then more text fires exactly ONE `message.start`/`message.complete` pair for the WHOLE turn, and `message.complete`'s `text` field holds ONLY the last text segment - an opening `FIRSTMATE-STATUS: working: ...` line emitted before the agent reached for a tool was silently absent from it, even though it streamed correctly through `message.delta` and rendered in the pane. Confirmed directly: a scripted turn instructed to say `FIRSTMATE-STATUS: working: test1`, run a shell command, then say `FIRSTMATE-STATUS: done: test1 complete` produced exactly one `message.complete` event whose `text` was `'FIRSTMATE-STATUS: done: test1 complete'` - the `working:` segment never appeared in the completion payload at all, only in its own earlier delta. Fixed by accumulating every `message.delta` chunk into a per-turn buffer (reset on `message.start`) and scanning that accumulated buffer instead of `message.complete`'s own field. Pinned by `tests/fm-hermes-vps-bridge.test.sh`'s `test_bridge_recovers_status_line_split_by_tool_call`, which uses a dedicated `STUB_SPLIT_ECHO:` stub trigger to reproduce the exact split.
++
++### Live fleet-dispatch run (dated evidence)
++
++Driven through the real, unmodified `bin/fm-spawn.sh` against the real production firstmate home and the real VPS (a genuine end-to-end proof, not a scratch home, since the whole point was proving the real fleet's status/report files receive real content):
++
++```
++$ tasks-axi add hv-protocol-verify "Live-verify hermes-vps bridge status/report/inbox protocol" --kind scout --repo firstmate --start
++$ bin/fm-brief.sh hv-protocol-verify firstmate --scout --harness hermes-vps
++$ bin/fm-spawn.sh hv-protocol-verify <project> --scout --harness hermes-vps --backend tmux
++spawned hv-protocol-verify harness=hermes-vps kind=scout window=firstmate:fm-hv-protocol-verify worktree=.../3/firstmate
++```
++
++The brief instructed the crewmate to exercise every protocol element in order: an opening `working:` status, real sandbox identity commands, a deliberate `blocked:` status (proving the exact signal that was silent before this fix), an immediate `working:` recovery, a `FIRSTMATE-REPORT` block, and a closing `done:` status.
++Real local file contents after the run:
++
++```
++$ cat state/hv-protocol-verify.status
++blocked: deliberate test of the blocked: signal path - this is not a real blocker, ignore and continue
++working: resuming after deliberate blocked test
++done: protocol verified from the crewmate side - all status states and the report block emitted from a Linux sandbox with zero reach to the captain's Mac; inbound steering leg untested and 3 open questions raised
++```
++
++The report landed at `data/hv-protocol-verify/report.md` with real sandbox evidence (`hostname` = `ubuntu`, `uname -a` = a Linux 6.8 x86_64 kernel, confirmation that `/Users` does not exist there) and, notably, its own `## Open questions for the captain` section - proof that a crewmate whose report block is read directly by firstmate can still surface a captain call through the report itself, which is exactly the harness-conditional routing `bin/fm-brief.sh` scaffolds for this harness.
++The opening `working: starting verification` line is conspicuously ABSENT from the status file above: the crewmate's first reply included a tool call before its next reply, triggering bug 2 above in the wild on the very first live run after the fix - the fix for bug 2 (delta accumulation) was applied and re-verified by direct dispatch (see bug 2's own entry) after this run had already demonstrated the gap.
++`bin/fm-control.sh hv-protocol-verify exit` cleanly closed the session afterward, same as the "Known limitation" section's run above.
++
++### Known limitation, updated
++
++Status, report, and steering are now solved.
++`session.create`'s `cwd` still is not honored, so a `hermes-vps` crewmate still cannot read or edit a task's local git worktree, run `git`, or drive the no-mistakes pipeline - only VPS-local sandbox work and this fleet-visibility wiring are proven use cases.
+ Do not dispatch a ship task onto it that needs local repo access; `hermes-vps.md`'s "Known limitation" owns this for future dispatch decisions.
+diff --git a/tests/fixtures/fm-hermes-ws-stub-server.py b/tests/fixtures/fm-hermes-ws-stub-server.py
+index 79e8e8a..fcfe1ff 100755
+--- a/tests/fixtures/fm-hermes-ws-stub-server.py
++++ b/tests/fixtures/fm-hermes-ws-stub-server.py
+@@ -212,16 +212,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
+                 # "session_id": sid}; params["payload"] = payload when given) -
+                 # confirmed by reading that source directly rather than
+                 # inferred from this stub's own pre-existing (flatter) shape.
+-                _send_text(self.wfile, json.dumps(
+-                    {'jsonrpc': '2.0', 'method': 'event',
+-                     'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
+                 if 'TRIGGER_ERROR' in text:
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
+                     _send_text(self.wfile, json.dumps(
+                         {'jsonrpc': '2.0', 'method': 'event',
+                          'params': {'type': 'error', 'payload': {'message': 'stub turn error'}}}))
+                 elif 'TRIGGER_HANG' in text:
+                     pass  # never send message.complete/error: the client must time out
++                elif text.startswith('STUB_ECHO:'):
++                    # Lets a test control the turn's real content, streamed as
++                    # a delta exactly like the real server does (embedded
++                    # newlines included, since this is a single RPC text
++                    # param, never split by a client-side readline()) instead
++                    # of the fixed 'stub reply' below - used by
++                    # tests/fm-hermes-vps-bridge.test.sh to drive the
++                    # bridge's real FIRSTMATE-STATUS/FIRSTMATE-REPORT
++                    # marker-processing over a real socket. message.complete's
++                    # own "text" carries the same content too, matching a
++                    # normal (non-interleaved-tool-call) turn.
++                    echoed = text[len('STUB_ECHO:'):]
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'message.delta', 'payload': {'text': echoed}}}))
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'message.complete',
++                                    'payload': {'text': echoed, 'status': 'complete'}}}))
++                elif text.startswith('STUB_SPLIT_ECHO:'):
++                    # Regression fixture for the live-verified finding
++                    # (data/hv-protocol-verify/report.md): a turn that emits
++                    # text, then a tool call, then more text fires exactly
++                    # ONE message.start/message.complete pair for the WHOLE
++                    # turn, and message.complete's own "text" field holds
++                    # ONLY the LAST segment - the first segment survives only
++                    # in its own earlier message.delta. Payload shape:
++                    # "STUB_SPLIT_ECHO:<segment1>|||<segment2>".
++                    seg1, _, seg2 = text[len('STUB_SPLIT_ECHO:'):].partition('|||')
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'message.delta', 'payload': {'text': seg1}}}))
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'tool.start', 'payload': {'tool_id': 't1', 'name': 'terminal'}}}))
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'tool.complete', 'payload': {'tool_id': 't1', 'name': 'terminal'}}}))
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'message.delta', 'payload': {'text': seg2}}}))
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'message.complete',
++                                    'payload': {'text': seg2, 'status': 'complete'}}}))
+                 else:
++                    _send_text(self.wfile, json.dumps(
++                        {'jsonrpc': '2.0', 'method': 'event',
++                         'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
+                     _send_text(self.wfile, json.dumps(
+                         {'jsonrpc': '2.0', 'method': 'event',
+                          'params': {'type': 'message.complete',
+diff --git a/tests/fm-hermes-vps-bridge.test.sh b/tests/fm-hermes-vps-bridge.test.sh
+index 9d8a8c2..a861606 100644
+--- a/tests/fm-hermes-vps-bridge.test.sh
++++ b/tests/fm-hermes-vps-bridge.test.sh
+@@ -31,6 +31,20 @@
+ #      not just the client's exit code) and then the process exits.
+ #   7. /interrupt sends a real session.interrupt RPC and never reaches the
+ #      model as a submitted message.
++#   8. Status/report/inbox protocol (the fix for the live-verification
++#      finding that a hermes-vps crewmate had no way back to this machine's
++#      filesystem at all, not even to report its own blocked status): a
++#      FIRSTMATE-STATUS line in a completed turn's real text lands in the
++#      real local status file; a malformed one is rejected and replaced with
++#      a bridge-authored diagnostic instead of being written verbatim; a
++#      FIRSTMATE-REPORT block lands in the real local report file; a
++#      pre-existing steering inbox record is delivered and acknowledged
++#      (moved to handled/) without the remote agent touching either path;
++#      and the doorbell line typed into every pane for a steering message is
++#      recognized and swallowed locally rather than forwarded as chat text
++#      the remote agent could never act on. The stub server's STUB_ECHO:
++#      prefix (tests/fixtures/fm-hermes-ws-stub-server.py) is what lets these
++#      tests control message.complete's own final text over the real socket.
+ set -u
+ 
+ # shellcheck source=tests/lib.sh
+@@ -420,6 +434,268 @@ test_bridge_closes_session_on_sighup() {
+   pass "SIGHUP: the bridge runs the same clean-shutdown path as SIGTERM, sending a real session.close RPC before exiting"
+ }
+ 
++# --- 8. status/report/inbox protocol -----------------------------------------
++
++# Launches the bridge with the three protocol flags armed, over fifos named
++# from <tag>, and waits for its readiness banner. Sets BRIDGE_PID.
++# These tests assert on the real local FILES the bridge writes, not on its
++# rendered pane output, so a background drain continuously empties fd 4
++# (DRAIN_PID) once readiness is confirmed - the OS pipe buffer is small
++# enough that a bridge rendering its usual echo/delta/turn-complete output
++# with nobody reading fd 4 would otherwise block INSIDE the bridge process
++# on a full pipe, silently wedging it (no stderr, no crash) before it ever
++# reaches the RPC that would satisfy the file-content assertion below.
++DRAIN_PID=""
++stop_drain() {
++  if [ -n "$DRAIN_PID" ] && kill -0 "$DRAIN_PID" 2>/dev/null; then
++    kill "$DRAIN_PID" >/dev/null 2>&1 || true
++    wait "$DRAIN_PID" 2>/dev/null || true
++  fi
++  DRAIN_PID=""
++}
++start_bridge_with_protocol() {  # <port> <tag> <status-file> <report-file> <inbox-dir>
++  local port=$1 tag=$2 status_file=$3 report_file=$4 inbox_dir=$5 line
++  local in_fifo="$TMP_ROOT/$tag.in" out_fifo="$TMP_ROOT/$tag.out"
++  rm -f "$in_fifo" "$out_fifo"
++  mkfifo "$in_fifo" "$out_fifo"
++  exec 3<>"$in_fifo"
++  exec 4<>"$out_fifo"
++  env -i PATH="$PATH" \
++    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
++    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
++    python3 "$BRIDGE" --cwd /tmp/some-worktree \
++      --status-file "$status_file" --report-file "$report_file" --inbox-dir "$inbox_dir" \
++      <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/$tag.err" &
++  BRIDGE_PID=$!
++  line=$(read_line_timeout 4 10)
++  case "$line" in
++    'Hermes VPS bridge ready.'*) ;;
++    *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/$tag.err" 2>/dev/null))" ;;
++  esac
++  cat <&4 > "$TMP_ROOT/$tag.rendered.log" 2>/dev/null &
++  DRAIN_PID=$!
++}
++
++# wait_for_file_content <path> <needle> <seconds> -> fails the test if <path>
++# never contains <needle> within the deadline. Polling, not a fixed sleep,
++# because delivery timing (inbox poll, a full round trip to the stub and
++# back) is not deterministic to the millisecond.
++wait_for_file_content() {
++  local path=$1 needle=$2 secs=$3 tries
++  tries=$((secs * 10))
++  while [ "$tries" -gt 0 ]; do
++    if [ -f "$path" ] && grep -qF "$needle" "$path" 2>/dev/null; then
++      return 0
++    fi
++    sleep 0.1
++    tries=$((tries - 1))
++  done
++  return 1
++}
++
++test_bridge_status_line_over_real_socket() {
++  local port rpc_log status_file report_file inbox_dir
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc-status.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  status_file="$TMP_ROOT/status-8a.status"
++  report_file="$TMP_ROOT/status-8a-report.md"
++  inbox_dir="$TMP_ROOT/status-8a.inbox"
++  rm -f "$status_file"
++
++  start_bridge_with_protocol "$port" bridge-status "$status_file" "$report_file" "$inbox_dir"
++
++  # A real completed turn whose text carries a valid FIRSTMATE-STATUS line -
++  # the stub echoes it back verbatim as message.complete's own text, exactly
++  # like a real remote agent's reply would.
++  printf 'STUB_ECHO:FIRSTMATE-STATUS: working: setup complete\n' >&3
++  wait_for_file_content "$status_file" 'working: setup complete' 10 \
++    || fail "expected the real local status file to receive 'working: setup complete', got: $(cat "$status_file" 2>/dev/null)"
++  grep -q '^FIRSTMATE-STATUS:' "$status_file" 2>/dev/null \
++    && fail "the sentinel prefix must never reach the real status file, only the state:note it wraps"
++
++  printf '/exit\n' >&3
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
++  BRIDGE_PID=""
++  stop_drain
++  exec 3>&- 4>&-
++  stop_stub
++  pass "status protocol: a valid FIRSTMATE-STATUS line in a completed turn's real text lands in the real local status file, sentinel stripped"
++}
++
++test_bridge_recovers_status_line_split_by_tool_call() {
++  # Regression for the live-verification finding (data/hv-protocol-verify/
++  # report.md): a turn that emits text, then a tool call, then more text
++  # fires exactly ONE message.start/message.complete pair for the WHOLE
++  # turn on the real server, and message.complete's own "text" field holds
++  # ONLY the last segment - an opening FIRSTMATE-STATUS line before the
++  # agent reaches for a tool would be silently dropped if the bridge
++  # trusted that field alone. The bridge must instead use the turn's full
++  # accumulated delta text, which carries both segments.
++  local port rpc_log status_file report_file inbox_dir
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc-split.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  status_file="$TMP_ROOT/status-8e.status"
++  report_file="$TMP_ROOT/status-8e-report.md"
++  inbox_dir="$TMP_ROOT/status-8e.inbox"
++  rm -f "$status_file"
++
++  start_bridge_with_protocol "$port" bridge-split "$status_file" "$report_file" "$inbox_dir"
++
++  printf 'STUB_SPLIT_ECHO:FIRSTMATE-STATUS: working: before the tool call|||FIRSTMATE-STATUS: done: after the tool call\n' >&3
++  wait_for_file_content "$status_file" 'done: after the tool call' 10 \
++    || fail "expected the second (message.complete-carried) segment to land, got: $(cat "$status_file" 2>/dev/null)"
++  wait_for_file_content "$status_file" 'working: before the tool call' 2 \
++    || fail "expected the FIRST segment (message.delta-only, absent from message.complete's own text) to also land - got: $(cat "$status_file" 2>/dev/null)"
++
++  printf '/exit\n' >&3
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
++  BRIDGE_PID=""
++  stop_drain
++  exec 3>&- 4>&-
++  stop_stub
++  pass "status protocol: a FIRSTMATE-STATUS line in an EARLIER text segment, before a tool call, still lands even though message.complete's own text field drops it"
++}
++
++test_bridge_rejects_malformed_status_line() {
++  local port rpc_log status_file report_file inbox_dir
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc-malformed.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  status_file="$TMP_ROOT/status-8b.status"
++  report_file="$TMP_ROOT/status-8b-report.md"
++  inbox_dir="$TMP_ROOT/status-8b.inbox"
++  rm -f "$status_file"
++
++  start_bridge_with_protocol "$port" bridge-malformed "$status_file" "$report_file" "$inbox_dir"
++
++  # "not-a-real-state" is not in the state vocabulary: the remote agent must
++  # never be able to make the bridge write arbitrary text to the status file
++  # merely by emitting a line that LOOKS like the sentinel shape.
++  printf 'STUB_ECHO:FIRSTMATE-STATUS: not-a-real-state: oops\n' >&3
++  wait_for_file_content "$status_file" 'malformed status line' 10 \
++    || fail "expected a bridge-authored malformed-status diagnostic, got: $(cat "$status_file" 2>/dev/null)"
++  grep -qE '^not-a-real-state:' "$status_file" 2>/dev/null \
++    && fail "the invalid state line must never be written verbatim as though it were a real status update"
++  grep -q '^blocked:' "$status_file" 2>/dev/null \
++    || fail "the malformed-status diagnostic must itself be a valid blocked: line so firstmate is woken, got: $(cat "$status_file" 2>/dev/null)"
++
++  printf '/exit\n' >&3
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
++  BRIDGE_PID=""
++  stop_drain
++  exec 3>&- 4>&-
++  stop_stub
++  pass "status protocol: a malformed FIRSTMATE-STATUS line is rejected and replaced with a bridge-authored blocked: diagnostic, never written verbatim"
++}
++
++test_bridge_report_and_inbox_over_real_socket() {
++  local port rpc_log status_file report_file inbox_dir handled_dir
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc-report.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  status_file="$TMP_ROOT/status-8c.status"
++  report_file="$TMP_ROOT/status-8c-report.md"
++  inbox_dir="$TMP_ROOT/status-8c.inbox"
++  handled_dir="$inbox_dir/handled"
++  rm -rf "$status_file" "$report_file" "$inbox_dir"
++  mkdir -p "$handled_dir"
++
++  # A steering inbox record in bin/fm-task-inbox-lib.sh's own format: header
++  # lines, a bare "--" separator, then the body verbatim - the remote agent
++  # cannot read this path itself, so the bridge must poll, deliver, and
++  # acknowledge it unassisted. The body carries a STUB_ECHO: turn that
++  # itself contains a multi-line FIRSTMATE-REPORT block plus a status line,
++  # proving embedded newlines in one forwarded record survive intact (the
++  # thing a line-oriented typed-pane input could never carry in one message).
++  printf 'schema=fm-task-inbox.v1\nat=2026-01-01T00:00:00Z\n--\nSTUB_ECHO:FIRSTMATE-REPORT-BEGIN\nfindings: it works\nline two\nFIRSTMATE-REPORT-END\nFIRSTMATE-STATUS: done: wrote the report' \
++    > "$inbox_dir/001.msg"
++
++  start_bridge_with_protocol "$port" bridge-report "$status_file" "$report_file" "$inbox_dir"
++
++  wait_for_file_content "$report_file" 'findings: it works' 10 \
++    || fail "expected the real local report file to receive the FIRSTMATE-REPORT block's content, got: $(cat "$report_file" 2>/dev/null)"
++  grep -qF 'line two' "$report_file" 2>/dev/null \
++    || fail "expected the report's second line to survive, got: $(cat "$report_file" 2>/dev/null)"
++  grep -qE '^(FIRSTMATE-REPORT-(BEGIN|END)|STUB_ECHO:)' "$report_file" 2>/dev/null \
++    && fail "the report markers/echo prefix must never leak into the real report file"
++
++  wait_for_file_content "$status_file" 'done: wrote the report' 10 \
++    || fail "expected the real local status file to receive 'done: wrote the report', got: $(cat "$status_file" 2>/dev/null)"
++
++  local tries=100
++  while [ ! -f "$handled_dir/001.msg" ] && [ "$tries" -gt 0 ]; do sleep 0.1; tries=$((tries - 1)); done
++  [ -f "$handled_dir/001.msg" ] \
++    || fail "expected the delivered inbox record to be moved to handled/ as its acknowledgement"
++  [ -f "$inbox_dir/001.msg" ] \
++    && fail "the delivered inbox record must be moved out of the inbox root, not merely copied"
++  if ! grep -q '"method": "prompt.submit"' "$rpc_log" 2>/dev/null; then
++    fail "the bridge never sent a real prompt.submit RPC to deliver the inbox record's body"
++  fi
++
++  printf '/exit\n' >&3
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
++  BRIDGE_PID=""
++  stop_drain
++  exec 3>&- 4>&-
++  stop_stub
++  pass "report + inbox protocol: the bridge polls, delivers, and acknowledges a steering record unassisted, and a FIRSTMATE-REPORT block lands in the real local report file"
++}
++
++test_bridge_suppresses_inbox_doorbell_line() {
++  local port rpc_log status_file report_file inbox_dir
++  port=$(free_port)
++  rpc_log="$TMP_ROOT/rpc-doorbell.jsonl"
++  rm -f "$rpc_log"
++  start_stub "$port" "$rpc_log"
++
++  status_file="$TMP_ROOT/status-8d.status"
++  report_file="$TMP_ROOT/status-8d-report.md"
++  inbox_dir="$TMP_ROOT/status-8d.inbox"
++  rm -f "$status_file"
++
++  start_bridge_with_protocol "$port" bridge-doorbell "$status_file" "$report_file" "$inbox_dir"
++
++  # The exact self-describing doorbell shape fm_task_inbox_doorbell_line()
++  # (bin/fm-task-inbox-lib.sh) types into every pane for a steering message -
++  # it names a LOCAL path the remote agent can never reach, so the bridge
++  # must swallow it locally rather than forward it as chat text.
++  printf ": Firstmate instruction waiting: list '/Users/someone/firstmate/state/x.inbox'/*.msg and, in numeric order, read and act on each, then mv each handled file to '/Users/someone/firstmate/state/x.inbox'/handled/.\n" >&3
++
++  # Prove the bridge is still alive and responsive with an ordinary line
++  # afterward, and that ONLY that ordinary line reached the model.
++  printf 'STUB_ECHO:FIRSTMATE-STATUS: working: still alive\n' >&3
++  wait_for_file_content "$status_file" 'working: still alive' 10 \
++    || fail "expected the bridge to remain responsive after the doorbell line, got: $(cat "$status_file" 2>/dev/null)"
++
++  local submit_count
++  submit_count=$(grep -c '"method": "prompt.submit"' "$rpc_log" 2>/dev/null || true)
++  [ "$submit_count" = 1 ] \
++    || fail "expected exactly one prompt.submit RPC (the ordinary line only, never the doorbell), got: $submit_count"
++
++  printf '/exit\n' >&3
++  local waited=0
++  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
++  BRIDGE_PID=""
++  stop_drain
++  exec 3>&- 4>&-
++  stop_stub
++  pass "the inbox doorbell line is recognized and swallowed locally, never forwarded as chat text the remote agent cannot act on"
++}
++
+ test_bridge_identity_functions
+ test_agent_process_classify_recognizes_bridge
+ test_busy_hermes_vps_agent_running_parses_status
+@@ -429,3 +705,13 @@ test_bridge_missing_brief_never_reports_false_delivery
+ stop_bridge
+ test_bridge_closes_session_on_sighup
+ stop_bridge
++test_bridge_status_line_over_real_socket
++stop_bridge
++test_bridge_recovers_status_line_split_by_tool_call
++stop_bridge
++test_bridge_rejects_malformed_status_line
++stop_bridge
++test_bridge_report_and_inbox_over_real_socket
++stop_bridge
++test_bridge_suppresses_inbox_doorbell_line
++stop_bridge
