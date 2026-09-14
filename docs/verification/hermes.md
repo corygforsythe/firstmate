@@ -231,3 +231,109 @@ bin/fm-test-run.sh tests/fm-hermes-harness.test.sh
 `tests/fm-hermes-signals-live-e2e.test.sh` (`FM_HERMES_SIGNALS_LIVE=1`, opt-in, drives the real binary over a raw PTY) exists as the required live-harness-optin companion, structured like `tests/fm-rovo-signals-live-e2e.test.sh`.
 It was written and syntax-verified in this task, and its readiness-banner and busy-footer assertions were confirmed passing live, but its full run was NOT confirmed clean end to end today: the account's pooled GitHub Copilot credential was heavily used across this task's own testing and both prior scouts, and a single turn was observed taking several minutes to produce a final response even after its 20-second tool call had long since completed - consistent with the rate-limiting this task independently hit and documented above (`HTTP 429: ... exceeded your rate limit`), not a defect in the guard's logic.
 Re-run it once the account's rate limit has cleared, and treat a clean pass as confirming this record; a failure that reproduces the exact symptom above (the tool call completing but the turn's final response taking minutes) is the account's shared quota, not this adapter.
+
+## VPS `/api/ws` gated-mode auth: the ticket-mint flow, resolved by source but not yet live-dispatched
+
+`data/hermes-serve-verify/report.md` (2026-09-13) found that the captain's real VPS (`http://vps.tail8bdd14.ts.net:9119`, Hermes Agent v0.21.2) puts `/api/ws` in gated mode (`_ws_auth_reason()` in `hermes_cli/web_server.py`) and left the ticket-minting flow uninventoried.
+This section resolves the flow itself, by reading the actual v0.21.2 upstream source (via the local install's already-fetched-but-not-checked-out git history at `~/.hermes/hermes-agent`, commit `ee4452991d17534aa561f31ee55596d082aa94e7`, since the local checkout is v0.16.0 and predates it) and confirming the two public, unauthenticated probe endpoints live against the real VPS.
+No write or state-changing call was made against the VPS; both requests below are plain `GET`s.
+
+```
+$ curl -sS http://vps.tail8bdd14.ts.net:9119/api/status
+{"version":"0.21.2", ..., "auth_required":true,"auth_providers":["basic"],"auth_flows":["cookie","native_pkce"], ...}
+$ curl -sS http://vps.tail8bdd14.ts.net:9119/api/auth/providers
+{"providers":[{"name":"basic","display_name":"Username & Password","supports_password":true}]}
+```
+
+The resolved flow (`hermes_cli/dashboard_auth/routes.py`, `hermes_cli/dashboard_auth/ws_tickets.py`, `web/src/lib/api.ts` at the commit above), all plain HTTP/JSON, no browser required:
+
+1. `POST /auth/password-login` with JSON body `{"provider": "basic", "username": "<...>", "password": "<...>", "next": ""}`.
+   On success this sets `hermes_session_at` (access) and a refresh cookie and returns `{"ok": true, "next": "/"}`; on failure it is deliberately generic (401 bad credentials, 404 unknown provider, 429 rate-limited after 10 attempts/60s per client IP - `hermes_cli/dashboard_auth/routes.py`'s `_PW_RATE_MAX_ATTEMPTS`/`_PW_RATE_WINDOW_SEC`).
+2. `POST /api/auth/ws-ticket` with those cookies attached (`credentials: include`, no body) mints a single-use, 30-second-TTL ticket: `{"ticket": "<...>", "ttl_seconds": 30}` (`ws_tickets.py`'s `mint_ticket`, in-memory, `secrets.token_urlsafe(32)`).
+3. Connect `/api/ws?ticket=<ticket>` within that 30-second window; `consume_ticket` pops it from the in-memory store on first use, so a reused or expired ticket is rejected and a fresh one must be minted per connection attempt.
+
+This is a real, scriptable, non-browser credential exchange - no PKCE round trip, no `native_pkce` flow needed, since the VPS's only registered provider (`basic`) supports direct password login.
+**What remains unresolved is not the mechanism but the credential**: exercising step 1 needs the captain's actual VPS login username and password for the `basic` provider, which is not present in any file this task can read (checked `data/captain.md`, `data/learnings.md`, `.env`, and `~/.hermes/config.yaml`) and must not be guessed or fabricated.
+Until that credential is supplied, this flow is verified by source and by the two public read-only endpoints above, but NOT yet exercised end to end against the real VPS - see `state/hermes-vps-gateway.status` for the open decision this blocks.
+
+## `bin/fm-hermes-ws.py`/`.sh`: a standalone JSON-RPC-over-WebSocket dispatch client, offline-verified
+
+Per the captain's decision on `state/hermes-vps-gateway.status`, this is a standalone dispatch primitive only - it is deliberately NOT wired into `bin/fm-spawn.sh`, `bin/fm-control.sh`, `bin/fm-crew-state.sh`, or `bin/fm-busy-lib.sh`, since those are entirely pane/text-capture-shaped (`fm_backend_capture`, `fm_backend_composer_state`, `fm_backend_send_key`, ...) and a `/api/ws` session has no pane at all.
+Fleet-dispatch wiring is deferred to a follow-up task once this primitive is proven live.
+
+The client (`bin/fm-hermes-ws.py`, stdlib-only Python - no third-party dependency, matching `bin/fm-mail.py`'s existing no-dependency stance rather than the real Hermes reference client's `pip install websockets`) implements, from scratch: the RFC 6455 client handshake and masked text-frame framing, the gated-mode `password-login -> cookie -> ws-ticket -> ?ticket=` flow above (loopback/`--insecure` mode uses a static `?token=` instead, via `FM_HERMES_WS_TOKEN`), and id-matched JSON-RPC request/response over the connection, draining the server's `gateway.ready` notification on connect.
+`bin/fm-hermes-ws.sh` is a thin wrapper resolving `FM_HERMES_WS_*` configuration from the environment, filling gaps from `$FM_HOME/.env` (env wins), matching `fm-mail.sh`'s convention - the captain's VPS login credentials belong in `$FM_HOME/.env` as `FM_HERMES_WS_USER`/`FM_HERMES_WS_PASS`, the same already-gitignored, already-documented file that holds mail-plane credentials, never in a task brief, status line, or report.
+It exposes every primitive the captain's spec named: `create`, `submit`, `status`, `history`, `steer`, `interrupt`, `close`, plus a `dispatch` convenience (create + submit + wait for `message.complete`/`error` + `history`) for smoke-testing and live verification.
+`dispatch` always sends the server a `session.close` RPC before returning, on every exit path (success, a turn's `error` event, or a client-side timeout) - not just the success path - so a failed or timed-out dispatch never leaks the server-side session; the `session.close` RPC itself is best-effort (its own failure is swallowed, since the turn's own outcome is what the caller needs reported).
+
+### Wire-protocol grounding
+
+The real Hermes source (v0.21.2, commit `ee4452991d17534aa561f31ee55596d082aa94e7` at `~/.hermes/hermes-agent`, the same git history used for the auth-ticket flow above) was read directly rather than inferred from the earlier scout report's paraphrased transcript:
+
+- `tui_gateway/ws.py`'s `handle_ws` reuses `tui_gateway.server.dispatch` verbatim and reads exactly one JSON-RPC message per `ws.receive_text()` call (confirmed by reading the function body, not just its docstring), so one WebSocket text frame carries one JSON-RPC message on this transport.
+- `handle_ws` sends `{"jsonrpc":"2.0","method":"event","params":{"type":"gateway.ready",...}}` immediately after accepting the connection - a client must drain this before its first request-scoped read, which `HermesWsSession.__init__` does.
+- `scripts/iso-certify.py`'s `WSClient` - a real first-party Hermes client for this exact endpoint, not a test double - is `HermesWsSession`'s direct structural model: drain `gateway.ready`, then id-matched request/response, and its `drive_heavy_turn` treats a submitted turn as done only on a `message.complete` event (or failed on `error`, with the message at `params.payload.message`) after a `message.start`, never on an earlier or unrelated event - `cmd_dispatch` mirrors that exact predicate.
+
+### Offline verification (no Hermes install, no VPS)
+
+`tests/fixtures/fm-hermes-ws-stub-server.py` is a from-scratch, independently-written HTTP + WebSocket double for `/auth/password-login`, `/api/auth/ws-ticket`, and `/api/ws` (its own framing code was written independently of the client's, so a shared bug would not hide behind a passing test).
+`tests/fm-hermes-ws.test.sh` drives every subcommand through `bin/fm-hermes-ws.sh` against it over a real loopback socket:
+
+```
+$ bash tests/fm-hermes-ws.test.sh
+ok - token mode: every RPC primitive round-trips over a real WebSocket
+ok - gated mode: password-login -> cookie -> ws-ticket -> /api/ws?ticket= round-trips for real
+ok - gated mode: bad credentials fail closed with no ticket minted and no leaked secret
+ok - dispatch: waits past message.start/message.delta and completes only on message.complete
+ok - dispatch: a turn's error event fails the call and surfaces its message
+ok - dispatch: a turn error still sends session.close to the server, not just a local socket close
+ok - dispatch: a timed-out turn still sends session.close to the server, not just a local socket close
+ok - config: a missing FM_HERMES_WS_BASE_URL fails closed by name, no guessed connection
+ok - config: fm-hermes-ws.sh fills missing env from $FM_HOME/.env, env still wins over it
+```
+
+Run 2026-09-14 (macOS arm64, Python 3.13.12).
+This proves the HTTP auth calls, the RFC 6455 handshake and framing, JSON-RPC id matching, event-notification handling, and the `dispatch` completion predicate all work correctly against a real socket speaking the documented wire protocol.
+The last two `dispatch` cases pin the fix on this section's own claim above: the stub's optional RPC log (`tests/fixtures/fm-hermes-ws-stub-server.py`) proves a real `session.close` RPC reaches the server on both the turn-error and client-timeout exit paths, not just success - a wire-level check, since the client's own exit code proves nothing about what it actually sent.
+
+### Live verification against the real VPS
+
+Run 2026-09-14, `FM_HERMES_WS_BASE_URL=http://vps.tail8bdd14.ts.net:9119`, credentials from `$FM_HOME/.env`, Hermes Agent v0.21.2 (`gateway_mode: multiplex`, model `claude-opus-5 (anthropic)`).
+`bin/fm-hermes-ws.py` defaults `Origin` to the base URL's own origin; the real gated connect succeeded on that default with no override needed, so `FM_HERMES_WS_ORIGIN` stays available but unexercised.
+
+Every primitive round-tripped for real:
+
+```
+$ bin/fm-hermes-ws.sh dispatch /tmp/fm-hermes-ws-live-verify \
+    "Use your terminal tool to run: pwd && cat marker.txt. Then reply with exactly the terminal output and nothing else." 120
+{"count": 4, "messages": [
+  {"role": "user", "text": "Use your terminal tool to run: pwd && cat marker.txt. ..."},
+  {"role": "tool", "name": "terminal", "args": {"command": "pwd && cat marker.txt"}},
+  {"role": "assistant", "text": "/\ncat: marker.txt: No such file or directory"}]}
+# real tool call, real streamed completion, session created/submitted/read/closed
+# over one dispatch call, end to end, in ~4s.
+
+$ bin/fm-hermes-ws.sh status "$SID"
+{"output": "Hermes TUI Status\n\n...\nAgent Running: No"}
+# and, mid-turn, on a real `sleep 20` submit:
+{"output": "...\nTitle: Run sleep 20 then echo DONE_SLEEP\n...\nAgent Running: Yes"}
+
+$ bin/fm-hermes-ws.sh steer "$SID" "Actually, stop and just reply with the word ACK."
+{"status": "queued", "text": "Actually, stop and just reply with the word ACK."}
+
+$ bin/fm-hermes-ws.sh interrupt "$SID"
+{"status": "interrupted"}
+
+$ bin/fm-hermes-ws.sh close "$SID"
+{"closed": true}
+```
+
+`session.status`'s literal `Agent Running: Yes`/`Agent Running: No` line and `session.steer`/`session.interrupt`'s real, structural (non-key) responses are exactly what `data/hermes-serve-verify/report.md` predicted from a local scratch instance - confirmed here against the captain's real deployment instead.
+This is the safety-relevant fact this whole transport exists to deliver: unlike the pane-based `hermes --cli` adapter (`../../../.agents/skills/harness-adapters/references/harness/hermes.md`'s "Interrupt: no safe key exists" - Ctrl+C kills the whole session, Escape is a no-op), `session.interrupt` here is a real RPC method with a real, distinct, non-destructive result.
+
+**One real, live-verified finding that changes a claim in the earlier scout report**: `session.create`'s `cwd` param was NOT honored on this VPS deployment.
+`session.create({"cwd": "/tmp/fm-hermes-ws-live-verify"})` returned `"info": {"cwd": "/", ...}`, and the dispatched turn's own `terminal` tool call confirmed it (`pwd` printed `/`, and `cat marker.txt` - a file that genuinely exists at the requested cwd - failed `No such file or directory`).
+`data/hermes-serve-verify/report.md`'s local scratch-instance test found solid `cwd` pinning for the `terminal` tool specifically; this VPS, on a materially newer version (v0.21.2 vs. that test's v0.16.0) and in `multiplex` gateway mode, does not reproduce that on the same tool.
+Not re-diagnosed further here (out of this task's scope), but load-bearing for any future fleet-dispatch wiring: **do not assume `cwd` pins a crewmate's working directory on this transport** without re-confirming it on the specific deployment/version in use; a follow-up wiring task needs its own answer for worktree confinement here; the file-tool "no confinement at all" finding for the pane-based adapter (same skill reference doc) is a separate, already-documented fact and is not contradicted by this.
+
+Re-run `bash tests/fm-hermes-ws.test.sh` after any change to the client or the stub; re-run a live `dispatch` after any Hermes upgrade on either the client's assumptions or the VPS's version, since the wire protocol, `cwd` handling, and the rendered `session.status` text are all vendor-controlled surfaces.
