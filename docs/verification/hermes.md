@@ -565,3 +565,55 @@ Also confirmed directly against the real bridge subprocess and stub, outside the
 `[sending...]` rendered within the same tick as the submitted line's delivery bullet on both turns - well before `[working...]`, which (as the working-indicator fix above already established) only renders once `message.start` actually arrives - and `❯` rendered once on open, never during either busy stretch, reappearing once each turn completed.
 Under this sandbox's own CPU scheduling, a further repeat of the delayed-submission run occasionally showed `[working...]` itself arriving only once the stub's sleep elapsed instead of promptly after `message.start` - the SAME class of timing variance the working-indicator fix's own test already carries as a rare environment-level flake (`docs/verification/hermes.md`'s prior section; reproduced identically against this task's unmodified baseline before any of this task's changes, so it predates and is unrelated to the sending/ready-marker work here) rather than anything introduced by this fix, since neither new marker touches `message.start` handling at all.
 No VPS credentials exist in a dispatched task's own worktree, so neither fix has yet been re-confirmed against the real VPS; re-run against a live `hermes-vps` pane the next time one is available, and update this section with that result.
+
+## hermes-vps: the sending/ready-marker fix above did not survive real-world use
+
+Fixed 2026-09-14, following a captain live-test of the fix directly above against a fresh `hermes-vps` crewmate: both regressions the prior fix targeted were still present in practice, for two different reasons neither the offline stub tests above nor a direct-pane-typing live check could have caught.
+
+**"[sending...]" not immediate.** Live-testing the merged fix by typing directly into a real `hermes-vps` pane (a raw pty, and a real tmux pane, both against the real VPS) showed `[sending...]` rendering within milliseconds of pressing Enter, exactly as the section above documented - direct pane typing was never the broken path. The captain's actual steering path is `fm-send.sh`'s durable inbox (`AGENTS.md` section 7: "Steer a worker with ordinary text through fail-closed fm-send"), delivered here by `poll_inbox()`, never by typing into this pane directly. `poll_inbox()` ran only once per `run()`'s own `select()` loop iteration, gated by `now - self._last_inbox_poll >= INBOX_POLL_INTERVAL`, and `INBOX_POLL_INTERVAL` was `EVENT_WAIT_TIMEOUT` (30s) - the SAME value `select()` itself used as its blocking timeout whenever the pane was otherwise idle. A steer landing on an idle bridge could therefore sit unnoticed for up to roughly two poll periods before `[sending...]` ever printed. Live-reproduced against the real VPS: a steering record dropped into an idle bridge's `--inbox-dir` took **38 seconds** to produce `[sending...]`.
+
+**Ready marker not inline.** `_print_ready_marker()` printed the glyph with a normal trailing newline (`print(READY_MARKER, flush=True)`), which is exactly what makes it read as a label sitting above an empty line rather than a prompt a captain types into: the cursor ends up on a fresh blank line below the marker, not beside it. Live-reproduced against the real VPS over both a raw pty and a real tmux pane; the raw bytes right after the readiness banner were `...\xe2\x9d\xaf\r\n` (glyph, then an unconditional carriage-return-newline).
+
+**Fix**: `bin/fm-hermes-vps-bridge.py`.
+
+- `INBOX_POLL_INTERVAL` is now its own constant (1.0s), decoupled from `EVENT_WAIT_TIMEOUT`, and `run()`'s `select()` call uses `min(EVENT_WAIT_TIMEOUT, INBOX_POLL_INTERVAL)` as its own timeout whenever `--inbox-dir` is armed, so an idle bridge wakes and checks the inbox on `INBOX_POLL_INTERVAL`'s cadence instead of `EVENT_WAIT_TIMEOUT`'s.
+- `_print_ready_marker()` now prints the glyph plus one trailing space with **no** trailing newline (`print(f'{READY_MARKER} ', end='', flush=True)`), so a real attached terminal's own input echo continues on the same line. Because the pane can no longer assume every earlier print left it on a fresh line, `self._prompt_pending` tracks whether the bare marker is still the last thing printed (set by `_print_ready_marker()`, cleared by `_echo()`), and `_forward()` - the one choke point every submission path shares - prepends a single newline exactly when nothing has cleared it since the marker. This matters only for `poll_inbox()`'s direct `_forward()` call, since it never calls `_echo()` first the way pane-typed input does; without it, fixing the newline would have made an inbox-delivered `[sending...]` glue onto the marker's own line instead.
+
+**Live verification against the real VPS** (not the offline stub - this task's worktree had no VPS credentials of its own, so the running firstmate home's `.env` values were exported directly into a disposable Python/tmux probe rather than copied into the worktree):
+
+Inbox-steer promptness, before the fix (raw pty, `--inbox-dir` armed, a steering record dropped in immediately after the bridge opened idle):
+
+```
+t=0.00  ready, idle
+... (nothing renders)
+t=38.48  [sending...]
+t=38.60  [working...]
+```
+
+The same probe after the fix:
+
+```
+t=0.02  Hermes VPS bridge ready. session_id=8912da10
+❯
+t=1.12  [sending...]
+[working...]
+```
+
+Ready-marker byte shape, before and after, captured with a raw pty (`repr()` of the exact bytes right after the readiness banner):
+
+```
+before: b'Hermes VPS bridge ready. session_id=...\r\n\xe2\x9d\xaf\r\n'
+after:  b'Hermes VPS bridge ready. session_id=...\r\n\xe2\x9d\xaf '
+```
+
+And confirming the marker/sending-boundary fix (an inbox-delivered steer right after the marker, raw bytes):
+
+```
+b'\r\n[sending...]\r\n[working...]\r\n...\r\n[turn complete]\r\n\xe2\x9d\xaf '
+```
+
+- the leading `\r\n` is `_forward()`'s inserted separator, proving `[sending...]` starts its own line rather than gluing onto `\xe2\x9d\xaf` (the bare marker).
+
+Also confirmed in a real tmux pane against the real VPS (not just a raw pty): a captain-typed line still produces `[sending...]` within single-digit milliseconds of pressing Enter (unaffected by this fix, matching the section above), and `tmux capture-pane` shows the marker and a subsequent typed line sharing one visual row instead of the marker occupying an empty row by itself.
+
+**Test coverage**: `tests/fm-hermes-vps-bridge.test.sh` gained `test_bridge_forwards_inbox_steer_promptly` (pins the inbox-promptness fix: a steer dropped into an idle bridge's `--inbox-dir` must produce `[sending...]` within a few seconds, not the old ~30-60s-tied cadence, and the marker/sending boundary must never glue together) and a new `expect_ready_marker` helper used by every existing ready-marker assertion, which reads the marker's exact bytes (a bare `read -r` line read cannot: the marker no longer ends in a newline) and confirms nothing - in particular no trailing newline - follows it until new input is submitted. bash 3.2 (macOS's system bash, this suite's actual runtime) has no `read -N`, so the new `read_bytes_timeout` helper drives a small `python3 os.read()`/`select()` reader against the same already-open fd instead.
