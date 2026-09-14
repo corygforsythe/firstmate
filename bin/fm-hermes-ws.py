@@ -18,9 +18,13 @@
 #   close <session_id>               -> the session.close RPC result
 #   dispatch <cwd> <text|-> [secs]   -> create + submit + wait for
 #                                        message.complete/error (default
-#                                        300s budget), then session.history
-#                                        and session.close; prints the final
-#                                        history JSON. Smoke-test/live-verify
+#                                        300s budget), then session.history;
+#                                        prints the final history JSON.
+#                                        session.close is sent on every exit
+#                                        path (success, a turn error, or a
+#                                        timeout), best-effort, so a failed
+#                                        turn never leaks the server-side
+#                                        session. Smoke-test/live-verify
 #                                        convenience, not a fleet primitive.
 # "-" for a text argument reads it from stdin, matching fm-mail.py's
 # send <to> <subject> <body|-> convention.

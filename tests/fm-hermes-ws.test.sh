@@ -19,6 +19,11 @@
 #      (docs/verification/hermes.md).
 #   4. Missing required configuration fails closed with a clear message,
 #      never a partial/guessed connection attempt.
+#   5. dispatch sends the server a real session.close RPC on a failed turn
+#      AND on a client-side timeout, not just on the success path - a
+#      failed/timed-out dispatch must not leak the server-side session.
+#      Proven via the stub's optional RPC log (a real wire artifact), since
+#      the client's own exit code proves nothing about what it sent.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -41,8 +46,8 @@ free_port() {
 }
 
 start_stub() {
-  local port=$1
-  python3 "$STUB" "$port" "$STUB_USER" "$STUB_PASS" "$STUB_TOKEN" \
+  local port=$1 rpc_log=${2:-}
+  python3 "$STUB" "$port" "$STUB_USER" "$STUB_PASS" "$STUB_TOKEN" "$rpc_log" \
     >"$TMP_ROOT/stub.out" 2>"$TMP_ROOT/stub.err" &
   STUB_PID=$!
   local tries=0
@@ -194,6 +199,48 @@ test_dispatch_surfaces_a_turn_error() {
   pass "dispatch: a turn's error event fails the call and surfaces its message"
 }
 
+test_dispatch_closes_session_on_turn_error() {
+  local port rc rpc_log
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-error.log"
+  : > "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  rc=0
+  token_env "$port" "$WRAPPER" dispatch /tmp/dispatch-worktree "TRIGGER_ERROR please" 10 \
+    >/dev/null 2>"$TMP_ROOT/dispatch-err2.txt" || rc=$?
+  [ "$rc" -ne 0 ] || fail "dispatch must fail when the turn emits an error event"
+
+  jq -e 'select(.method == "session.close" and .session_id == "test-session-1")' "$rpc_log" >/dev/null \
+    || fail "the server never received a session.close RPC after the turn's error event, got: $(cat "$rpc_log")"
+
+  stop_stub
+  pass "dispatch: a turn error still sends session.close to the server, not just a local socket close"
+}
+
+test_dispatch_closes_session_on_timeout() {
+  local port rc rpc_log
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-timeout.log"
+  : > "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  rc=0
+  token_env "$port" "$WRAPPER" dispatch /tmp/dispatch-worktree "TRIGGER_HANG please" 1 \
+    >/dev/null 2>"$TMP_ROOT/dispatch-err3.txt" || rc=$?
+  [ "$rc" -ne 0 ] || fail "dispatch must fail when the turn never completes within its budget"
+  case "$(cat "$TMP_ROOT/dispatch-err3.txt")" in
+    *"timed out"*) ;;
+    *) fail "dispatch did not report a timeout, got: $(cat "$TMP_ROOT/dispatch-err3.txt")" ;;
+  esac
+
+  jq -e 'select(.method == "session.close" and .session_id == "test-session-1")' "$rpc_log" >/dev/null \
+    || fail "the server never received a session.close RPC after dispatch timed out, got: $(cat "$rpc_log")"
+
+  stop_stub
+  pass "dispatch: a timed-out turn still sends session.close to the server, not just a local socket close"
+}
+
 test_missing_base_url_fails_closed() {
   local rc out
   rc=0
@@ -231,5 +278,7 @@ test_gated_password_ticket_flow_succeeds
 test_gated_bad_credentials_fail_closed
 test_dispatch_waits_for_message_complete
 test_dispatch_surfaces_a_turn_error
+test_dispatch_closes_session_on_turn_error
+test_dispatch_closes_session_on_timeout
 test_missing_base_url_fails_closed
 test_env_file_credentials_are_read

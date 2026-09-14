@@ -14,7 +14,14 @@
 # deliberately independent of fm-hermes-ws.py's own framing code, so a bug
 # shared by both would not hide behind a passing test.
 #
-# Usage: fm-hermes-ws-stub-server.py <port> <username> <password> <static-token>
+# Usage: fm-hermes-ws-stub-server.py <port> <username> <password> <static-token> [rpc-log-path]
+#
+# The optional rpc-log-path records every RPC method (and session_id, when
+# present) this stub receives, one JSON object per line, flushed
+# immediately. This is what lets a test prove a client actually sent an RPC
+# over the wire (e.g. session.close after an error/timeout) rather than
+# just observing the client's own exit code/stderr, which only proves what
+# the client *reported*, not what it *did*.
 import base64
 import hashlib
 import http.server
@@ -26,10 +33,21 @@ import threading
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 PORT, USERNAME, PASSWORD, STATIC_TOKEN = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+RPC_LOG = sys.argv[5] if len(sys.argv) > 5 else None
 
 _lock = threading.Lock()
 _cookies = set()
 _tickets = set()
+_log_lock = threading.Lock()
+
+
+def _log_rpc(method, params):
+    if not RPC_LOG:
+        return
+    line = json.dumps({'method': method, 'session_id': params.get('session_id')})
+    with _log_lock:
+        with open(RPC_LOG, 'a') as f:
+            f.write(line + '\n')
 
 
 def _send_frame(wfile, opcode, payload):
@@ -180,6 +198,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 continue
             req = json.loads(payload.decode('utf-8'))
             method, req_id, params = req.get('method'), req.get('id'), req.get('params') or {}
+            _log_rpc(method, params)
             if method == 'session.create':
                 _send_text(self.wfile, _rpc_result(
                     req_id, {'session_id': 'test-session-1', 'info': {'cwd': params.get('cwd')}}))
@@ -195,6 +214,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _send_text(self.wfile, json.dumps(
                         {'jsonrpc': '2.0', 'method': 'event',
                          'params': {'type': 'error', 'payload': {'message': 'stub turn error'}}}))
+                elif 'TRIGGER_HANG' in text:
+                    pass  # never send message.complete/error: the client must time out
                 else:
                     _send_text(self.wfile, json.dumps(
                         {'jsonrpc': '2.0', 'method': 'event',

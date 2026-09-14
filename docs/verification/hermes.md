@@ -263,7 +263,8 @@ Fleet-dispatch wiring is deferred to a follow-up task once this primitive is pro
 
 The client (`bin/fm-hermes-ws.py`, stdlib-only Python - no third-party dependency, matching `bin/fm-mail.py`'s existing no-dependency stance rather than the real Hermes reference client's `pip install websockets`) implements, from scratch: the RFC 6455 client handshake and masked text-frame framing, the gated-mode `password-login -> cookie -> ws-ticket -> ?ticket=` flow above (loopback/`--insecure` mode uses a static `?token=` instead, via `FM_HERMES_WS_TOKEN`), and id-matched JSON-RPC request/response over the connection, draining the server's `gateway.ready` notification on connect.
 `bin/fm-hermes-ws.sh` is a thin wrapper resolving `FM_HERMES_WS_*` configuration from the environment, filling gaps from `$FM_HOME/.env` (env wins), matching `fm-mail.sh`'s convention - the captain's VPS login credentials belong in `$FM_HOME/.env` as `FM_HERMES_WS_USER`/`FM_HERMES_WS_PASS`, the same already-gitignored, already-documented file that holds mail-plane credentials, never in a task brief, status line, or report.
-It exposes every primitive the captain's spec named: `create`, `submit`, `status`, `history`, `steer`, `interrupt`, `close`, plus a `dispatch` convenience (create + submit + wait for `message.complete`/`error` + `history` + `close`) for smoke-testing and live verification.
+It exposes every primitive the captain's spec named: `create`, `submit`, `status`, `history`, `steer`, `interrupt`, `close`, plus a `dispatch` convenience (create + submit + wait for `message.complete`/`error` + `history`) for smoke-testing and live verification.
+`dispatch` always sends the server a `session.close` RPC before returning, on every exit path (success, a turn's `error` event, or a client-side timeout) - not just the success path - so a failed or timed-out dispatch never leaks the server-side session; the `session.close` RPC itself is best-effort (its own failure is swallowed, since the turn's own outcome is what the caller needs reported).
 
 ### Wire-protocol grounding
 
@@ -285,12 +286,15 @@ ok - gated mode: password-login -> cookie -> ws-ticket -> /api/ws?ticket= round-
 ok - gated mode: bad credentials fail closed with no ticket minted and no leaked secret
 ok - dispatch: waits past message.start/message.delta and completes only on message.complete
 ok - dispatch: a turn's error event fails the call and surfaces its message
+ok - dispatch: a turn error still sends session.close to the server, not just a local socket close
+ok - dispatch: a timed-out turn still sends session.close to the server, not just a local socket close
 ok - config: a missing FM_HERMES_WS_BASE_URL fails closed by name, no guessed connection
 ok - config: fm-hermes-ws.sh fills missing env from $FM_HOME/.env, env still wins over it
 ```
 
 Run 2026-09-14 (macOS arm64, Python 3.13.12).
 This proves the HTTP auth calls, the RFC 6455 handshake and framing, JSON-RPC id matching, event-notification handling, and the `dispatch` completion predicate all work correctly against a real socket speaking the documented wire protocol.
+The last two `dispatch` cases pin the fix on this section's own claim above: the stub's optional RPC log (`tests/fixtures/fm-hermes-ws-stub-server.py`) proves a real `session.close` RPC reaches the server on both the turn-error and client-timeout exit paths, not just success - a wire-level check, since the client's own exit code proves nothing about what it actually sent.
 
 ### Live verification against the real VPS
 
