@@ -207,9 +207,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 text = params.get('text', '')
                 _send_text(self.wfile, json.dumps(
                     {'jsonrpc': '2.0', 'method': 'event', 'params': {'type': 'message.start'}}))
+                # Nested under "payload", matching the real server's _emit()
+                # shape (tui_gateway/server.py: params = {"type": event,
+                # "session_id": sid}; params["payload"] = payload when given) -
+                # confirmed by reading that source directly rather than
+                # inferred from this stub's own pre-existing (flatter) shape.
                 _send_text(self.wfile, json.dumps(
                     {'jsonrpc': '2.0', 'method': 'event',
-                     'params': {'type': 'message.delta', 'text': 'stub'}}))
+                     'params': {'type': 'message.delta', 'payload': {'text': 'stub'}}}))
                 if 'TRIGGER_ERROR' in text:
                     _send_text(self.wfile, json.dumps(
                         {'jsonrpc': '2.0', 'method': 'event',
@@ -219,7 +224,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     _send_text(self.wfile, json.dumps(
                         {'jsonrpc': '2.0', 'method': 'event',
-                         'params': {'type': 'message.complete', 'text': 'stub reply'}}))
+                         'params': {'type': 'message.complete',
+                                    'payload': {'text': 'stub reply', 'status': 'complete'}}}))
             elif method == 'session.status':
                 _send_text(self.wfile, _rpc_result(req_id, {'agent_running': False}))
             elif method == 'session.history':

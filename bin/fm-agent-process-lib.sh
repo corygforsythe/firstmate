@@ -113,6 +113,14 @@ fm_agent_process_classify() {  # <name> <argv0> <args> [pid] -> agent|shell|othe
     printf 'agent'
     return 0
   fi
+  if [ -n "$pid" ] && fm_hermes_vps_bridge_pid_is_bridge "$pid"; then
+    printf 'agent'
+    return 0
+  fi
+  if [ -n "$args" ] && fm_hermes_vps_bridge_args_are_bridge "$args"; then
+    printf 'agent'
+    return 0
+  fi
   if [ "$by_name" = shell ] && [ "$by_argv0" = shell ]; then
     printf 'shell'
   else
