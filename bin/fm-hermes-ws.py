@@ -491,28 +491,33 @@ def cmd_dispatch(args):
         session_id = created.get('session_id')
         if not session_id:
             raise HermesWsError(f'session.create returned no session_id: {created}')
-        session.rpc('prompt.submit', {'session_id': session_id, 'text': text})
-        deadline = time.monotonic() + budget
-        started = False
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise HermesWsError('dispatch timed out waiting for message.complete/error')
-            envelope = session.next_event(remaining)
-            ptype = (envelope.get('params') or {}).get('type')
-            if ptype == 'message.start':
-                started = True
-                continue
-            if not started:
-                continue
-            if ptype == 'error':
-                payload = (envelope.get('params') or {}).get('payload') or {}
-                raise HermesWsError(f'turn failed: {payload.get("message", envelope)}')
-            if ptype == 'message.complete':
-                break
-        history = session.rpc('session.history', {'session_id': session_id})
-        _print_result(history)
-        session.rpc('session.close', {'session_id': session_id})
+        try:
+            session.rpc('prompt.submit', {'session_id': session_id, 'text': text})
+            deadline = time.monotonic() + budget
+            started = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise HermesWsError('dispatch timed out waiting for message.complete/error')
+                envelope = session.next_event(remaining)
+                ptype = (envelope.get('params') or {}).get('type')
+                if ptype == 'message.start':
+                    started = True
+                    continue
+                if not started:
+                    continue
+                if ptype == 'error':
+                    payload = (envelope.get('params') or {}).get('payload') or {}
+                    raise HermesWsError(f'turn failed: {payload.get("message", envelope)}')
+                if ptype == 'message.complete':
+                    break
+            history = session.rpc('session.history', {'session_id': session_id})
+            _print_result(history)
+        finally:
+            try:
+                session.rpc('session.close', {'session_id': session_id})
+            except Exception:
+                pass
     finally:
         session.close()
 
