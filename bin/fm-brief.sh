@@ -27,6 +27,12 @@
 #   captain-hold-lifecycle completion gate to firstmate instead of the worker,
 #   since the worker cannot read that skill file or run bin/fm-captain-hold.sh
 #   either. Every other harness value is accepted and changes nothing.
+#   When --harness is passed explicitly, the generated brief records a fixed
+#   "Harness contract: harness=<harness>" line (an omitted/default harness needs
+#   no line, since it changes nothing). bin/fm-spawn.sh reads that line back and
+#   refuses to launch a ship or scout task whose own explicit --harness disagrees
+#   on whether hermes-vps applies, so a brief's hermes-vps-specific instructions
+#   and the task's actual dispatch transport cannot drift apart.
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
 #   It offers the Lavish review loop only when `fm-bootstrap.sh lavish-compatible`
@@ -168,6 +174,12 @@ for a in "$@"; do
   esac
 done
 [ -z "$want_value" ] || { echo "error: --$want_value requires a value" >&2; exit 1; }
+
+# Recorded only when --harness was passed explicitly; bin/fm-spawn.sh reads it
+# back and cross-checks it against its own explicit --harness before launch
+# (mirroring the "Delivery contract: mode=<mode>" check below).
+HARNESS_CONTRACT_LINE=""
+[ -z "$HARNESS" ] || HARNESS_CONTRACT_LINE="Harness contract: harness=$HARNESS"
 
 # Ship delivery mode is an explicit per-task decision (AGENTS.md section 7). A
 # missing or invalid value stops the scaffold rather than silently defaulting.
@@ -463,6 +475,7 @@ $TASK_SECTION
 $HERDR_SECTION
 
 # Setup
+$HARNESS_CONTRACT_LINE
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
 This is a SCOUT task: the deliverable is a written report, not a PR.
 The worktree is your laboratory - install, run, edit, and make scratch commits freely; all of it is discarded at teardown.
@@ -537,12 +550,26 @@ DOD=$(fm_dod_block "$MODE" "$ID") || exit 1
 if [ "$HARNESS" = hermes-vps ]; then
 IFS= read -r -d '' HERMES_VPS_SHIP_NOTE <<EOF || true
 
-**hermes-vps has no access to this worktree at all** (\`.agents/skills/harness-adapters/references/harness/hermes-vps.md\` "Known limitation"). The isolation, branch, and \`no-mistakes\` steps below describe LOCAL bookkeeping only; you have no shell reaching this machine, so you cannot run any of them. Do your actual work in your own remote sandbox and report through the status/report/steering protocol below instead.
+**hermes-vps has no access to this worktree at all** (\`.agents/skills/harness-adapters/references/harness/hermes-vps.md\` "Known limitation"). The isolation check, branch creation, and any \`no-mistakes\` command are LOCAL bookkeeping only, so they are omitted below; you have no shell reaching this machine and cannot run any of them. Do your actual work in your own remote sandbox and report through the status/report/steering protocol below instead.
 EOF
 else
 HERMES_VPS_SHIP_NOTE=""
 fi
 HERMES_VPS_SHIP_NOTE=${HERMES_VPS_SHIP_NOTE%$'\n'}
+
+if [ "$HARNESS" = hermes-vps ]; then
+  SETUP_ISOLATION_AND_BRANCH=""
+else
+IFS= read -r -d '' SETUP_ISOLATION_AND_BRANCH <<EOF || true
+
+**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
+The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
+If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked: launched in primary checkout, not an isolated worktree\` to the status file and stop.
+
+1. First action: create your branch: \`git checkout -b fm/$ID\`$SETUP2
+EOF
+fi
+SETUP_ISOLATION_AND_BRANCH=${SETUP_ISOLATION_AND_BRANCH%$'\n'}
 
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -552,14 +579,10 @@ $TASK_SECTION
 $HERDR_SECTION
 
 # Setup
+$HARNESS_CONTRACT_LINE
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
 $HERMES_VPS_SHIP_NOTE
-
-**Verify isolation before anything else.** Run \`pwd -P\` and \`git rev-parse --show-toplevel\`; both must resolve to the disposable task worktree you were launched in, such as a treehouse pool path or an Orca-managed worktree, not the primary checkout firstmate operates from.
-The path check is authoritative: \`git rev-parse --git-dir\` and \`git rev-parse --git-common-dir\` can help inspect the repo, but they do not prove you are outside the primary checkout.
-If the top-level path is the primary checkout or not the worktree you were launched in, STOP - do not branch or commit here - append \`blocked: launched in primary checkout, not an isolated worktree\` to the status file and stop.
-
-1. First action: create your branch: \`git checkout -b fm/$ID\`$SETUP2
+$SETUP_ISOLATION_AND_BRANCH
 
 # Rules
 $RULE1

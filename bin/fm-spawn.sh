@@ -13,7 +13,12 @@
 #   instructions and the recorded task delivery cannot drift apart; a brief
 #   scaffolded before that line existed warns once and launches on the flag. A
 #   ship or scout spawn also refuses leftover `{TASK}` / `{FIRSTMATE_SPEC}`
-#   placeholders, an empty Task, or an incomplete pair of Task subsections.
+#   placeholders, an empty Task, or an incomplete pair of Task subsections. A ship
+#   or scout spawn passing an explicit --harness also reads the brief's recorded
+#   "Harness contract: harness=<harness>" line and REFUSES a launch where exactly
+#   one side is hermes-vps (the only harness whose brief content differs), so the
+#   worker's hermes-vps-specific instructions and its actual dispatch transport
+#   cannot drift apart.
 #   Every ship or scout spawn renders `launch-brief.md`; for a no-mistakes ship
 #   it also carries the current `--intent` contract and the extracted captain
 #   intent. A legacy mixed Task is accepted there only under bin/fm-dod-lib.sh's
@@ -2574,6 +2579,25 @@ if [ "$KIND" = ship ]; then
   if [ -n "$STANDING_MODE" ] && [ "$STANDING_MODE" != no-mistakes-prod-only ] \
      && [ "$(delivery_rigor_rank "$MODE")" -lt "$(delivery_rigor_rank "$STANDING_MODE")" ]; then
     echo "notice: $ID ships mode=$MODE while the standing posture for $PROJ_NAME is $STANDING_MODE - less rigor than the captain's standing posture; proceed only on a current explicit captain instruction or an intake judgment you can state" >&2
+  fi
+fi
+
+# Brief/spawn harness agreement, checked the same way as the mode contract above.
+# fm-brief.sh records "Harness contract: harness=<harness>" only when --harness was
+# passed explicitly (an omitted/default harness renders identical brief content for
+# every harness except hermes-vps), so the check below compares the single bucket
+# that actually changes brief content - whether hermes-vps applies - rather than raw
+# harness-name equality, which would falsely flag two different ordinary harnesses
+# (e.g. brief scaffolded plain, spawned with --harness claude) as a mismatch.
+if { [ "$KIND" = ship ] || [ "$KIND" = scout ]; } && [ -n "$HARNESS_ARG" ]; then
+  BRIEF_HARNESS=$(sed -n 's/^Harness contract: harness=\(.*\)$/\1/p' "$BRIEF" | head -n 1)
+  BRIEF_IS_HERMES_VPS=0
+  [ "$BRIEF_HARNESS" = hermes-vps ] && BRIEF_IS_HERMES_VPS=1
+  SPAWN_IS_HERMES_VPS=0
+  [ "$HARNESS_ARG" = hermes-vps ] && SPAWN_IS_HERMES_VPS=1
+  if [ "$BRIEF_IS_HERMES_VPS" -ne "$SPAWN_IS_HERMES_VPS" ]; then
+    echo "error: harness mismatch for $ID: the brief was scaffolded with harness=${BRIEF_HARNESS:-<none>} but this spawn passed --harness $HARNESS_ARG; hermes-vps changes the brief's setup/status/report instructions, so this would launch a worker whose brief and actual transport disagree - correct the flag or re-scaffold the brief with the matching --harness" >&2
+    exit 1
   fi
 fi
 
