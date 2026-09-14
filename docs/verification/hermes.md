@@ -498,3 +498,32 @@ Pinned by `tests/fm-hermes-ws.test.sh`'s `test_dead_connection_fails_closed_not_
 ### Honest status: root cause not confirmed by reproduction
 
 This is a real, serious, and now-fixed robustness gap, and it is consistent with the captain's report (a connection gone stale in the time between dispatch and typing would previously crash the bridge with no visible pane signal before the captain even started typing, or mid-delivery of his line, matching "no response, no visible change"). It is **not**, however, a confirmed match: no reproduction attempt - through any path reachable via the Herdr pane API - ever produced the captain's exact failure, with or without this defect present. The pane-focus/GUI-routing hypothesis above also remains untested by anything but indirect evidence. Anyone re-investigating a future recurrence of "typed a line, pressed Enter, nothing happened" on `hermes-vps` should check first whether the pane crashed to a bare shell prompt (this defect's old signature, now fixed) versus whether the pane is still showing the bridge's own idle state (points back toward the pane-focus/GUI-routing gap this investigation could not rule in or out).
+
+A follow-up re-test found a THIRD explanation, distinct from both hypotheses above: a genuinely working but slow turn rendered nothing at all in the pane while it was in flight, indistinguishable from either failure mode above by a captain watching the pane - see "hermes-vps: working indicator for a slow in-flight turn" below.
+
+## hermes-vps: working indicator for a slow in-flight turn
+
+Fixed 2026-09-14, following a captain re-test of the pane after the fix above: a line typed directly into a live `hermes-vps` pane eventually got a real response, but the pane showed nothing at all while it was in flight - only the eventual content, with no way to tell a slow-but-working turn apart from a dead one in the meantime. This is a third, independent explanation alongside the two in the section above, not a contradiction of either: the pane genuinely had no busy/spinner/composer state of any kind (`../../.agents/skills/harness-adapters/references/harness/hermes-vps.md`'s "Composer" row already documented this as a known gap before this fix).
+
+**Fix**: `bin/fm-hermes-vps-bridge.py`'s `handle_event` now prints a bare `[working...]` line on every `message.start` event - the earliest point-in-time signal the existing event stream offers, so no new polling loop was added. `message.start` already fired unconditionally at the top of every turn (used internally to set `self.busy = True` and reset the per-turn text buffer) but was never itself rendered before this fix; only `message.delta`/`tool.start`/`message.complete`/`error` were.
+
+**Offline verification (no VPS credentials in this task's worktree)**: `tests/fixtures/fm-hermes-ws-stub-server.py` gained a `STUB_DELAY:<seconds>:<text>` `prompt.submit` trigger that sleeps server-side, real wall-clock time, between sending `message.start` and sending the delayed `message.delta`/`message.complete` - a stand-in for genuine slow-turn latency (e.g. a `sleep`-based VPS command) without slowing the suite down for real. `tests/fm-hermes-vps-bridge.test.sh`'s `test_bridge_renders_working_indicator_before_slow_response` drives the real bridge subprocess against this over a real loopback socket (never a background-`cat`-drained log file - see the test's own comment on why that specific technique is unsound for a timing assertion) and asserts, from the bridge's own stdout, that `[working...]` renders immediately after the delivery-confirmation bullet and that at least 2 of the stub's 4 configured delay seconds elapse before the delayed content itself renders:
+
+```
+$ bash tests/fm-hermes-vps-bridge.test.sh
+...
+ok - working indicator: [working...] renders immediately on message.start and nothing else renders until the delayed response lands
+```
+
+Also confirmed directly against the real bridge subprocess and stub, outside the test harness, with wall-clock timestamps on every rendered line (macOS arm64, Python 3.13.12):
+
+```
+[0.16s] READY: Hermes VPS bridge ready. session_id=test-session-1
+[0.16s] LINE: ● STUB_DELAY:4:slow reply landed
+[0.16s] LINE: [working...]
+[4.19s] LINE: slow reply landed
+[4.20s] LINE: [turn complete]
+```
+
+`[working...]` rendered within 0.02s of the delivery bullet, and the delayed content landed only once the stub's real 4-second sleep elapsed - proving the indicator is driven by `message.start` itself, not by anything that could coincide with the delayed content.
+No VPS credentials exist in a dispatched task's own worktree (only in the running firstmate home's gitignored `.env`, per `bin/fm-hermes-ws-env-lib.sh`), so this fix has not yet been re-confirmed against the real VPS; re-run against a live `hermes-vps` pane submitting a genuinely slow command (e.g. `sleep 10`) the next time one is available, and update this section with that result.

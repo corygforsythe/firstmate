@@ -45,6 +45,14 @@
 #      the remote agent could never act on. The stub server's STUB_ECHO:
 #      prefix (tests/fixtures/fm-hermes-ws-stub-server.py) is what lets these
 #      tests control message.complete's own final text over the real socket.
+#   9. Working indicator (the fix for a genuinely working but slow turn
+#      being indistinguishable from a dead one, since the pane has no
+#      composer/spinner): a bare "[working...]" line renders promptly on
+#      message.start, before any delta/tool content, and nothing else
+#      renders until the turn's real response lands - proven with the
+#      stub's STUB_DELAY: prefix, which sleeps server-side between
+#      message.start and the rest of the turn to stand in for real slow
+#      latency (e.g. a sleep-based VPS command) without slowing this suite.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -762,6 +770,90 @@ test_bridge_suppresses_inbox_doorbell_line() {
   pass "the inbox doorbell line is recognized and swallowed locally, never forwarded as chat text the remote agent cannot act on"
 }
 
+# --- 9. working indicator on a slow turn -------------------------------------
+
+test_bridge_renders_working_indicator_before_slow_response() {
+  # Captain-reported gap: the pane is a scrolling event-rendered log with no
+  # composer/spinner (references/harness/hermes-vps.md's "Composer" row), so
+  # a genuinely working but slow turn - real VPS latency, or e.g. a
+  # sleep-based command - rendered NOTHING at all until it eventually
+  # completed, indistinguishable from a dead session. STUB_DELAY stands in
+  # for that real latency without slowing this suite down for real: it
+  # sleeps server-side AFTER message.start (already sent unconditionally by
+  # the stub) and BEFORE any further event.
+  #
+  # Reads directly off the bridge's own stdout fifo (like
+  # test_bridge_lifecycle_over_real_socket), never a background `cat`
+  # redirected into a file: cat's stdout is block-buffered once redirected
+  # to a regular file, so a few-byte "[working...]" line can sit in that
+  # buffer unflushed for an arbitrary time - exactly the kind of
+  # test-only timing illusion this test exists to rule out for real.
+  local port rpc_log line
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-working.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  local in_fifo="$TMP_ROOT/bridge-working.in" out_fifo="$TMP_ROOT/bridge-working.out"
+  rm -f "$in_fifo" "$out_fifo"
+  mkfifo "$in_fifo" "$out_fifo"
+  exec 3<>"$in_fifo"
+  exec 4<>"$out_fifo"
+  env -i PATH="$PATH" \
+    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
+    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
+    python3 "$BRIDGE" --cwd /tmp/some-worktree \
+      <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-working.err" &
+  BRIDGE_PID=$!
+  line=$(read_line_timeout 4 10)
+  case "$line" in
+    'Hermes VPS bridge ready.'*) ;;
+    *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-working.err" 2>/dev/null))" ;;
+  esac
+
+  printf 'STUB_DELAY:4:slow reply landed\n' >&3
+  line=$(read_line_timeout 4 10)
+  case "$line" in
+    "● STUB_DELAY:4:slow reply landed") ;;
+    *) fail "expected the delivery-confirmation bullet for the submitted line, got: $line" ;;
+  esac
+
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[working...]' ] \
+    || fail "expected a [working...] indicator to render promptly on message.start, got: $line"
+  local t_indicator
+  t_indicator=$(date +%s)
+
+  # A bounded "nothing arrives within N seconds" race is inherently
+  # flaky under real scheduling jitter (a loaded machine can stall the
+  # reader briefly with no bearing on whether the SERVER actually
+  # delayed). Measuring elapsed wall time between the indicator and the
+  # delayed content instead proves the same fact without racing against
+  # it: a slow reader only INCREASES the measured gap, it can never
+  # shrink it, so this assertion cannot spuriously fail under load the
+  # way a tight timeout-races-content check can.
+  line=$(read_line_timeout 4 15)
+  [ "$line" = 'slow reply landed' ] \
+    || fail "expected the delayed content once the stub's delay elapsed, got: $line"
+  local t_content elapsed
+  t_content=$(date +%s)
+  elapsed=$((t_content - t_indicator))
+  [ "$elapsed" -ge 2 ] \
+    || fail "expected at least 2s between [working...] and the delayed content (stub delay is 4s), only $elapsed s elapsed - the indicator likely rendered late instead of promptly on message.start"
+
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[turn complete]' ] \
+    || fail "expected a [turn complete] marker once the delayed response landed, got: $line"
+
+  printf '/exit\n' >&3
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  BRIDGE_PID=""
+  exec 3>&- 4>&-
+  stop_stub
+  pass "working indicator: [working...] renders immediately on message.start and nothing else renders until the delayed response lands"
+}
+
 test_bridge_identity_functions
 test_agent_process_classify_recognizes_bridge
 test_busy_hermes_vps_agent_running_parses_status
@@ -782,4 +874,6 @@ stop_bridge
 test_bridge_preserves_inbox_order_on_forward_failure
 stop_bridge
 test_bridge_suppresses_inbox_doorbell_line
+stop_bridge
+test_bridge_renders_working_indicator_before_slow_response
 stop_bridge

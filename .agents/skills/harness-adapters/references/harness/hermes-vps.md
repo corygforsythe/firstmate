@@ -52,8 +52,14 @@ If the pointer's path is NOT locally readable, the bridge never echoes that line
 
 ## Rendering
 
-The bridge renders a grounded subset of the real Hermes event vocabulary (read directly from the installed Hermes source, `tui_gateway/server.py`, not inferred): `message.delta` (streamed text), `message.complete` (a `[turn <status>]` marker), `tool.start`/`tool.complete` (a one-line summary each), and `error`.
+The bridge renders a grounded subset of the real Hermes event vocabulary (read directly from the installed Hermes source, `tui_gateway/server.py`, not inferred): `message.start` (a bare `[working...]` line, see "Working indicator" below), `message.delta` (streamed text), `message.complete` (a `[turn <status>]` marker), `tool.start`/`tool.complete` (a one-line summary each), and `error`.
 Every other event type (`reasoning.available`, `subagent.*`, `tool.generating`, todo updates) is deliberately not rendered - an initial pane-rendering scope, not a wire-protocol gap.
+
+### Working indicator
+
+The pane has no composer, spinner, or busy state of any kind (see "Composer" above), so a genuinely working but slow turn - one whose first `message.delta` or `tool.start` is many seconds out, with no vendor "typing" signal on this transport - was indistinguishable from a dead session.
+The bridge now prints a bare `[working...]` line on every `message.start`, the earliest point-in-time signal the event stream offers without adding a new polling loop; it is a pane log line like every other rendered marker, never cleared in place, and the turn's own later `message.delta`/`tool.start`/`[turn <status>]` lines are what tell the reader the wait ended.
+Live-verified (offline, no VPS credentials in a task worktree - see `docs/verification/hermes.md`'s "hermes-vps: working indicator" section) with a stub-driven multi-second delay standing in for a real slow turn (e.g. a `sleep`-based VPS command): `[working...]` renders immediately after submission, nothing else renders during the delay, and the eventual content plus `[turn complete]` land once the response arrives.
 
 ## Status, report, and steering: bridged locally, not filesystem access
 

@@ -129,7 +129,11 @@
 # carries {"tool_id", "name", "summary"|"result", ...}. Every other event
 # type (reasoning.available, subagent.*, tool.generating, todo updates) is
 # deliberately not rendered - an initial pane-rendering scope, not a
-# wire-protocol gap.
+# wire-protocol gap. message.start itself carries no payload but now prints
+# a bare "[working...]" line (see handle_event) so a slow turn - one whose
+# first message.delta/tool.start is many seconds out - reads as in flight
+# rather than dead; this is the only rendering this bridge adds beyond the
+# real event stream.
 import importlib.util
 import os
 import re
@@ -472,6 +476,15 @@ class Bridge:
         if etype == 'message.start':
             self.busy = True
             self._turn_text_buf = ''
+            # Visibility fix: the pane is a scrolling event-rendered log with
+            # no composer/spinner, so a real turn that takes many seconds
+            # before its first message.delta or tool.start (no vendor
+            # "typing" signal exists on this transport) rendered nothing at
+            # all, indistinguishable from a dead session. message.start
+            # already fires as soon as the server accepts the turn, so this
+            # is the earliest point-in-time signal available without adding
+            # a new polling loop.
+            print('[working...]', flush=True)
         elif etype == 'message.delta':
             text = data.get('text', '')
             if text:

@@ -30,6 +30,7 @@ import secrets
 import struct
 import sys
 import threading
+import time
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 PORT, USERNAME, PASSWORD, STATIC_TOKEN = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -232,6 +233,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                              'params': {'type': 'error', 'payload': {'message': 'stub turn error'}}}))
                     elif 'TRIGGER_HANG' in text:
                         pass  # never send message.complete/error: the client must time out
+                    elif text.startswith('STUB_DELAY:'):
+                        # Stands in for a real slow turn (e.g. a sleep-based
+                        # VPS command) without actually sleeping the test
+                        # suite for real VPS-scale latency: sleeps a small,
+                        # test-controlled number of seconds AFTER
+                        # message.start (already sent above) and BEFORE any
+                        # further event, so a caller can assert its own
+                        # working/busy indicator renders promptly on
+                        # message.start and nothing else renders until this
+                        # delay elapses. Payload shape:
+                        # "STUB_DELAY:<seconds>:<echoed text>".
+                        _, _, rest = text.partition(':')
+                        delay_str, _, echoed = rest.partition(':')
+                        time.sleep(float(delay_str))
+                        _send_text(self.wfile, json.dumps(
+                            {'jsonrpc': '2.0', 'method': 'event',
+                             'params': {'type': 'message.delta', 'payload': {'text': echoed}}}))
+                        _send_text(self.wfile, json.dumps(
+                            {'jsonrpc': '2.0', 'method': 'event',
+                             'params': {'type': 'message.complete',
+                                        'payload': {'text': echoed, 'status': 'complete'}}}))
                     elif text.startswith('STUB_ECHO:'):
                         # Lets a test control the turn's real content, streamed as
                         # a delta exactly like the real server does (embedded
