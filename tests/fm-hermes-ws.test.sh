@@ -253,6 +253,33 @@ test_missing_base_url_fails_closed() {
   pass "config: a missing FM_HERMES_WS_BASE_URL fails closed by name, no guessed connection"
 }
 
+test_dead_connection_fails_closed_not_uncaught() {
+  # A refused connection (nothing listening on the port) raises a raw
+  # ConnectionRefusedError/OSError from socket.create_connection() inside
+  # _WSSocket.__init__ - not HermesWsError. Before the fix, main()'s
+  # `except HermesWsError` never caught it: the client crashed with an
+  # uncaught Python traceback instead of the clean
+  # "fm-hermes-ws.py: ..." message every other failure mode prints. The
+  # same unwrapped-OSError gap existed on every other raw socket call
+  # (send_text/_recv_exact/_read_http_response_head), all now routed
+  # through _WSSocket._send()/_recv(), which this pins for the
+  # connection-establishment case - the one deterministically reproducible
+  # without racing a live peer's TCP state.
+  local port rc out
+  port=$(free_port)
+  rc=0
+  out=$(token_env "$port" "$WRAPPER" create /tmp/dead-connection 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "a refused connection must fail closed, but the client exited 0"
+  case "$out" in
+    *Traceback*) fail "a refused connection crashed with an uncaught traceback instead of failing closed, got: $out" ;;
+  esac
+  case "$out" in
+    "fm-hermes-ws.py:"*) ;;
+    *) fail "a refused connection did not print the client's own clean error prefix, got: $out" ;;
+  esac
+  pass "connection error: a refused connection fails closed through the same HermesWsError path as every other failure, never an uncaught traceback"
+}
+
 test_env_file_credentials_are_read() {
   local port out home
   port=$(free_port)
@@ -281,4 +308,5 @@ test_dispatch_surfaces_a_turn_error
 test_dispatch_closes_session_on_turn_error
 test_dispatch_closes_session_on_timeout
 test_missing_base_url_fails_closed
+test_dead_connection_fails_closed_not_uncaught
 test_env_file_credentials_are_read

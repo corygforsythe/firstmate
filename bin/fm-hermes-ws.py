@@ -229,11 +229,14 @@ class _WSSocket:
         use_tls = parts.scheme in ('https', 'wss')
         host = parts.hostname
         port = parts.port or (443 if use_tls else 80)
-        raw = socket.create_connection((host, port), timeout=timeout)
-        if use_tls:
-            ctx = ssl.create_default_context()
-            raw = ctx.wrap_socket(raw, server_hostname=host)
-        raw.settimeout(timeout)
+        try:
+            raw = socket.create_connection((host, port), timeout=timeout)
+            if use_tls:
+                ctx = ssl.create_default_context()
+                raw = ctx.wrap_socket(raw, server_hostname=host)
+            raw.settimeout(timeout)
+        except OSError as exc:
+            raise HermesWsError(f'connection error while connecting: {exc}') from exc
         self._sock = raw
         self._buf = b''
         key = base64.b64encode(secrets.token_bytes(16)).decode('ascii')
@@ -250,7 +253,7 @@ class _WSSocket:
             f'Origin: {origin}',
             '', '',
         ]
-        self._sock.sendall('\r\n'.join(request_lines).encode('ascii'))
+        self._send('\r\n'.join(request_lines).encode('ascii'))
         status_line, headers = self._read_http_response_head()
         if ' 101 ' not in f' {status_line} ':
             raise HermesWsError(f'WebSocket upgrade refused: {status_line.strip()}')
@@ -259,9 +262,32 @@ class _WSSocket:
         if accept != expected:
             raise HermesWsError('WebSocket upgrade response failed the Sec-WebSocket-Accept check')
 
+    def _send(self, data):
+        """Every raw socket write funnels through here so a dead or reset
+        connection (BrokenPipeError, ConnectionResetError, a bare
+        socket.timeout, an ssl.SSLError - none of which are HermesWsError)
+        can never escape as an unwrapped exception. Uncaught, one of those
+        would propagate straight through rpc() -> Bridge._forward() (which
+        only catches HermesWsError) and out of Bridge.run()'s main loop,
+        which has no handler around handle_input_line() either - crashing
+        the whole bridge process with a bare traceback and, critically, no
+        write_status_line() call, silently ending the crewmate exactly the
+        way this bridge exists to prevent (module docstring's "Status/
+        report/inbox protocol")."""
+        try:
+            self._sock.sendall(data)
+        except OSError as exc:
+            raise HermesWsError(f'connection error while sending: {exc}') from exc
+
+    def _recv(self, nbytes):
+        try:
+            return self._sock.recv(nbytes)
+        except OSError as exc:
+            raise HermesWsError(f'connection error while receiving: {exc}') from exc
+
     def _recv_exact(self, n):
         while len(self._buf) < n:
-            chunk = self._sock.recv(max(4096, n - len(self._buf)))
+            chunk = self._recv(max(4096, n - len(self._buf)))
             if not chunk:
                 raise HermesWsError('connection closed before the expected bytes arrived')
             self._buf += chunk
@@ -271,7 +297,7 @@ class _WSSocket:
     def _read_http_response_head(self):
         head = b''
         while b'\r\n\r\n' not in head:
-            chunk = self._sock.recv(4096)
+            chunk = self._recv(4096)
             if not chunk:
                 raise HermesWsError('connection closed during the HTTP upgrade handshake')
             head += chunk
@@ -302,7 +328,7 @@ class _WSSocket:
         mask = secrets.token_bytes(4)
         header += mask
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        self._sock.sendall(bytes(header) + masked)
+        self._send(bytes(header) + masked)
 
     def _recv_frame(self):
         b0, b1 = self._recv_exact(2)
@@ -330,11 +356,11 @@ class _WSSocket:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise HermesWsError('timed out waiting for a WebSocket message')
-            self._sock.settimeout(remaining)
             try:
-                fin, opcode, payload = self._recv_frame()
-            except socket.timeout as exc:
-                raise HermesWsError('timed out waiting for a WebSocket message') from exc
+                self._sock.settimeout(remaining)
+            except OSError as exc:
+                raise HermesWsError(f'connection error while setting timeout: {exc}') from exc
+            fin, opcode, payload = self._recv_frame()
             if opcode == _OPCODE_PING:
                 self._send_control(_OPCODE_PONG, payload)
                 continue
@@ -356,12 +382,12 @@ class _WSSocket:
         mask = secrets.token_bytes(4)
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
         header = bytes([0x80 | opcode, 0x80 | len(payload)]) + mask
-        self._sock.sendall(header + masked)
+        self._send(header + masked)
 
     def close(self):
         try:
             self._send_control(_OPCODE_CLOSE, b'')
-        except OSError:
+        except HermesWsError:
             pass
         try:
             self._sock.close()
