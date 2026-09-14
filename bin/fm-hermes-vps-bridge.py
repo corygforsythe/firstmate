@@ -168,6 +168,8 @@ class Bridge:
                     return
                 self._forward(content)
                 return
+            print(f'[fm-hermes-vps-bridge] brief not found at {path}', flush=True)
+            return
         if line == '/exit':
             self.shutdown()
             return
@@ -323,6 +325,7 @@ def main(argv):
 
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT, _on_term)
+    signal.signal(signal.SIGHUP, _on_term)
     try:
         bridge.start()
     except HermesWsError as exc:
