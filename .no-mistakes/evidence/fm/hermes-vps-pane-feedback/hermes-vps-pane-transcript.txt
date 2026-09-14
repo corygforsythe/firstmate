@@ -1,0 +1,11 @@
+--- Bridge starts up: readiness banner + ready-for-input marker ---
+[t=16:26:14.3N] Hermes VPS bridge ready. session_id=test-session-1
+[t=16:26:14.3N] ❯
+--- Captain types a slow-turn line and presses Enter ---
+[t=16:26:14.3N] ● STUB_DELAY:3:the slow reply finally lands
+[t=16:26:14.3N] [sending...]
+[t=16:26:14.3N] [working...]
+--- Waiting for the delayed server content + turn complete + ready marker ---
+[t=16:26:17.3N] the slow reply finally lands
+[t=16:26:17.3N] [turn complete]
+[t=16:26:17.3N] ❯
