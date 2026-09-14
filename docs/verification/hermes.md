@@ -231,3 +231,27 @@ bin/fm-test-run.sh tests/fm-hermes-harness.test.sh
 `tests/fm-hermes-signals-live-e2e.test.sh` (`FM_HERMES_SIGNALS_LIVE=1`, opt-in, drives the real binary over a raw PTY) exists as the required live-harness-optin companion, structured like `tests/fm-rovo-signals-live-e2e.test.sh`.
 It was written and syntax-verified in this task, and its readiness-banner and busy-footer assertions were confirmed passing live, but its full run was NOT confirmed clean end to end today: the account's pooled GitHub Copilot credential was heavily used across this task's own testing and both prior scouts, and a single turn was observed taking several minutes to produce a final response even after its 20-second tool call had long since completed - consistent with the rate-limiting this task independently hit and documented above (`HTTP 429: ... exceeded your rate limit`), not a defect in the guard's logic.
 Re-run it once the account's rate limit has cleared, and treat a clean pass as confirming this record; a failure that reproduces the exact symptom above (the tool call completing but the turn's final response taking minutes) is the account's shared quota, not this adapter.
+
+## VPS `/api/ws` gated-mode auth: the ticket-mint flow, resolved by source but not yet live-dispatched
+
+`data/hermes-serve-verify/report.md` (2026-09-13) found that the captain's real VPS (`http://vps.tail8bdd14.ts.net:9119`, Hermes Agent v0.21.2) puts `/api/ws` in gated mode (`_ws_auth_reason()` in `hermes_cli/web_server.py`) and left the ticket-minting flow uninventoried.
+This section resolves the flow itself, by reading the actual v0.21.2 upstream source (via the local install's already-fetched-but-not-checked-out git history at `~/.hermes/hermes-agent`, commit `ee4452991d17534aa561f31ee55596d082aa94e7`, since the local checkout is v0.16.0 and predates it) and confirming the two public, unauthenticated probe endpoints live against the real VPS.
+No write or state-changing call was made against the VPS; both requests below are plain `GET`s.
+
+```
+$ curl -sS http://vps.tail8bdd14.ts.net:9119/api/status
+{"version":"0.21.2", ..., "auth_required":true,"auth_providers":["basic"],"auth_flows":["cookie","native_pkce"], ...}
+$ curl -sS http://vps.tail8bdd14.ts.net:9119/api/auth/providers
+{"providers":[{"name":"basic","display_name":"Username & Password","supports_password":true}]}
+```
+
+The resolved flow (`hermes_cli/dashboard_auth/routes.py`, `hermes_cli/dashboard_auth/ws_tickets.py`, `web/src/lib/api.ts` at the commit above), all plain HTTP/JSON, no browser required:
+
+1. `POST /auth/password-login` with JSON body `{"provider": "basic", "username": "<...>", "password": "<...>", "next": ""}`.
+   On success this sets `hermes_session_at` (access) and a refresh cookie and returns `{"ok": true, "next": "/"}`; on failure it is deliberately generic (401 bad credentials, 404 unknown provider, 429 rate-limited after 10 attempts/60s per client IP - `hermes_cli/dashboard_auth/routes.py`'s `_PW_RATE_MAX_ATTEMPTS`/`_PW_RATE_WINDOW_SEC`).
+2. `POST /api/auth/ws-ticket` with those cookies attached (`credentials: include`, no body) mints a single-use, 30-second-TTL ticket: `{"ticket": "<...>", "ttl_seconds": 30}` (`ws_tickets.py`'s `mint_ticket`, in-memory, `secrets.token_urlsafe(32)`).
+3. Connect `/api/ws?ticket=<ticket>` within that 30-second window; `consume_ticket` pops it from the in-memory store on first use, so a reused or expired ticket is rejected and a fresh one must be minted per connection attempt.
+
+This is a real, scriptable, non-browser credential exchange - no PKCE round trip, no `native_pkce` flow needed, since the VPS's only registered provider (`basic`) supports direct password login.
+**What remains unresolved is not the mechanism but the credential**: exercising step 1 needs the captain's actual VPS login username and password for the `basic` provider, which is not present in any file this task can read (checked `data/captain.md`, `data/learnings.md`, `.env`, and `~/.hermes/config.yaml`) and must not be guessed or fabricated.
+Until that credential is supplied, this flow is verified by source and by the two public read-only endpoints above, but NOT yet exercised end to end against the real VPS - see `state/hermes-vps-gateway.status` for the open decision this blocks.
