@@ -216,7 +216,7 @@ BRIEF="$DATA/$ID/brief.md"
 mkdir -p "$DATA/$ID"
 
 ASK_USER_BLOCK=
-if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
+if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ] && [ "$HARNESS" != hermes-vps ]; then
   ASK_USER_BLOCK=$(fm_ask_user_escalation_block "$DATA" "$ID")
 fi
 
@@ -289,6 +289,40 @@ else
   SCOUT_WORKTREE_RULE='Stay inside this worktree; the only files you may write outside it are the report and the status file below.'
   SHIP_WORKTREE_RULE='Stay inside this worktree; modify nothing outside it.'
 fi
+
+# gh-axi and chrome-devtools-axi are LOCAL command-line tools; a hermes-vps
+# remote agent has no shell reaching this machine and so cannot reach either.
+if [ "$HARNESS" = hermes-vps ]; then
+  TOOLS_RULE='gh-axi and chrome-devtools-axi are local command-line tools unreachable from this harness (you have no shell reaching this machine), so GitHub and browser work is not available to you here.'
+else
+  TOOLS_RULE='Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.'
+fi
+
+# `no-mistakes daemon status`/`no-mistakes axi status` are LOCAL commands a
+# hermes-vps remote agent cannot run either; the Definition of done above
+# already routes it away from the pipeline entirely.
+if [ "$HARNESS" = hermes-vps ]; then
+IFS= read -r -d '' DAEMON_RULE <<'EOF' || true
+You have no local shell to run any no-mistakes command at all - not `no-mistakes daemon status`, not `no-mistakes axi status`, nothing.
+   If this task's mode needed the pipeline, the Definition of done above already explains what to do instead.
+EOF
+else
+IFS= read -r -d '' DAEMON_RULE <<'EOF' || true
+Never stop, restart, or update the shared `no-mistakes` daemon - it is one instance serving
+   every lane/home, so restarting it kills other lanes' in-flight pipeline runs; only firstmate
+   manages the daemon.
+   Before you append `blocked:` about the pipeline, run `no-mistakes daemon status` and
+   `no-mistakes axi status`. If the daemon socket refuses connections or is missing, append
+   `blocked: {the daemon error}` and stop even when the local run record still says running or
+   fixing, because that record can be stale after the daemon exits. A run record failed with a
+   daemon error is also a real block.
+   Only after ruling out socket refusal, if the run is still running or fixing, reattach and keep
+   going. A drive-call error, timeout, slow read, or generic unreachability is NOT a daemon error:
+   the daemon accepts `respond` immediately and runs the round in the background, so a killed or
+   timed-out call was only waiting for a read while the run kept working.
+EOF
+fi
+DAEMON_RULE=${DAEMON_RULE%$'\n'}
 
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
@@ -484,7 +518,7 @@ The report is the only thing that survives, so anything worth keeping must be in
 # Rules
 1. Never push to any remote and never open a PR.
 2. $SCOUT_WORKTREE_RULE
-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+3. $TOOLS_RULE
 4. $STATUS_REPORT_INTRO
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
@@ -504,18 +538,7 @@ The report is the only thing that survives, so anything worth keeping must be in
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
-7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs; only firstmate
-   manages the daemon.
-   Before you append \`blocked:\` about the pipeline, run \`no-mistakes daemon status\` and
-   \`no-mistakes axi status\`. If the daemon socket refuses connections or is missing, append
-   \`blocked: {the daemon error}\` and stop even when the local run record still says running or
-   fixing, because that record can be stale after the daemon exits. A run record failed with a
-   daemon error is also a real block.
-   Only after ruling out socket refusal, if the run is still running or fixing, reattach and keep
-   going. A drive-call error, timeout, slow read, or generic unreachability is NOT a daemon error:
-   the daemon accepts \`respond\` immediately and runs the round in the background, so a killed or
-   timed-out call was only waiting for a read while the run kept working.
+7. $DAEMON_RULE
 
 $INBOX_SECTION
 
@@ -545,7 +568,7 @@ case "$MODE" in
     RULE1='1. Never push to the default branch. Never merge a PR.'
     ;;
 esac
-DOD=$(fm_dod_block "$MODE" "$ID") || exit 1
+DOD=$(fm_dod_block "$MODE" "$ID" "$HARNESS") || exit 1
 
 if [ "$HARNESS" = hermes-vps ]; then
 IFS= read -r -d '' HERMES_VPS_SHIP_NOTE <<EOF || true
@@ -571,6 +594,25 @@ EOF
 fi
 SETUP_ISOLATION_AND_BRANCH=${SETUP_ISOLATION_AND_BRANCH%$'\n'}
 
+# fm-ensure-agents-md.sh is a LOCAL script operating on the worktree; a
+# hermes-vps remote agent has no access to either.
+if [ "$HARNESS" = hermes-vps ]; then
+IFS= read -r -d '' PROJECT_MEMORY_SECTION <<'EOF' || true
+# Project memory
+Project-memory capture is not reachable from this harness (no local worktree access), so it is skipped.
+EOF
+else
+IFS= read -r -d '' PROJECT_MEMORY_SECTION <<EOF || true
+# Project memory
+If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
+Record only project knowledge useful to almost every future session.
+For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
+If you touch a project \`AGENTS.md\`, follow \`$FM_ROOT/bin/fm-ensure-agents-md.sh\`'s self-governance contract in the same pass.
+Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+EOF
+fi
+PROJECT_MEMORY_SECTION=${PROJECT_MEMORY_SECTION%$'\n'}
+
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
 
@@ -587,7 +629,7 @@ $SETUP_ISOLATION_AND_BRANCH
 # Rules
 $RULE1
 2. $SHIP_WORKTREE_RULE
-3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
+3. $TOOLS_RULE
 4. $STATUS_REPORT_INTRO
    States: working, needs-decision, blocked, $PAUSED_VERB, done, failed.
    Each append wakes firstmate, so report sparingly: only phase changes a supervisor
@@ -609,27 +651,11 @@ $RULE1
 $ASK_USER_BLOCK
    A decision or blocker you opened stays open until a \`resolved\` line carrying its exact key lands; a later \`done:\` or \`working:\` line never closes it, even when the answer is what started that work.
    Firstmate's reply normally writes that closing line at answer time; when a blocker or wait clears WITHOUT a firstmate reply, append \`resolved: {how it cleared}\` yourself (same \`[key=<slug>]\` if you opened it with one) as you resume.
-7. Never stop, restart, or update the shared \`no-mistakes\` daemon - it is one instance serving
-   every lane/home, so restarting it kills other lanes' in-flight pipeline runs; only firstmate
-   manages the daemon.
-   Before you append \`blocked:\` about the pipeline, run \`no-mistakes daemon status\` and
-   \`no-mistakes axi status\`. If the daemon socket refuses connections or is missing, append
-   \`blocked: {the daemon error}\` and stop even when the local run record still says running or
-   fixing, because that record can be stale after the daemon exits. A run record failed with a
-   daemon error is also a real block.
-   Only after ruling out socket refusal, if the run is still running or fixing, reattach and keep
-   going. A drive-call error, timeout, slow read, or generic unreachability is NOT a daemon error:
-   the daemon accepts \`respond\` immediately and runs the round in the background, so a killed or
-   timed-out call was only waiting for a read while the run kept working.
+7. $DAEMON_RULE
 
 $INBOX_SECTION
 
-# Project memory
-If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durable project-intrinsic knowledge, run \`$FM_ROOT/bin/fm-ensure-agents-md.sh .\` in the worktree.
-Record only project knowledge useful to almost every future session.
-For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
-If you touch a project \`AGENTS.md\`, follow \`$FM_ROOT/bin/fm-ensure-agents-md.sh\`'s self-governance contract in the same pass.
-Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+$PROJECT_MEMORY_SECTION
 
 $DOD
 EOF

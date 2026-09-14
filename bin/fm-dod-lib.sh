@@ -5,9 +5,14 @@
 # receives. Both paths must hand the worker the same contract: a promoted
 # no-mistakes worker that never received the ask-user escalation rule or the
 # `--yes` ban is the exact delivery hole this single owner exists to close.
-# fm_dod_block <no-mistakes|direct-PR|local-only> <task-id> prints the block on
-# stdout with no trailing blank line. The caller validates the mode; an unknown
-# mode is refused rather than silently rendered as the pipeline contract.
+# fm_dod_block <no-mistakes|direct-PR|local-only> <task-id> [<harness>] prints
+# the block on stdout with no trailing blank line. The caller validates the
+# mode; an unknown mode is refused rather than silently rendered as the
+# pipeline contract. The optional third argument defaults to empty for every
+# existing caller (bin/fm-promote.sh never passes it, unchanged); when it is
+# exactly "hermes-vps", every mode renders the same harness-conditional block
+# instead of its normal mode-specific text, since all three modes equally need
+# local git/shell access that harness structurally does not have.
 # The block opens with the fixed machine-readable "Delivery contract: mode=<mode>"
 # line that bin/fm-spawn.sh checks a ship brief against.
 # This file is the one owner of the no-mistakes `--intent` contract: only the
@@ -190,8 +195,28 @@ fm_ask_user_escalation_block() {  # <data-dir> <task-id>
 EOF
 }
 
-fm_dod_block() {  # <mode> <task-id>
-  local mode=$1 id=$2
+fm_dod_block() {  # <mode> <task-id> [<harness>]
+  local mode=$1 id=$2 harness=${3:-}
+  case "$mode" in
+    direct-PR|local-only|no-mistakes) ;;
+    *)
+      echo "error: fm_dod_block: unknown delivery mode '$mode'" >&2
+      return 1 ;;
+  esac
+  if [ "$harness" = hermes-vps ]; then
+    cat <<EOF
+# Definition of done
+Delivery contract: mode=$mode
+You have no access to this machine's filesystem or any local shell at all, so you cannot push a branch, open a PR, commit locally, or drive no-mistakes - every one of this mode's actual completion mechanics needs local git/shell you do not have. This ship task should not have been dispatched on harness=hermes-vps for that reason.
+Do not attempt to push a branch, open a PR, commit locally, or run no-mistakes; none of them are reachable from your remote sandbox.
+Instead, in the plain text of one of your own chat replies, wrap your COMPLETE findings between two bare marker lines on their own, with nothing else on those two lines:
+FIRSTMATE-REPORT-BEGIN
+<what you were asked to build, and whatever you determined or accomplished inside your own remote sandbox>
+FIRSTMATE-REPORT-END
+Then include a \`FIRSTMATE-STATUS: blocked: this ship task cannot be completed on harness=hermes-vps (no local git/shell access to push, open a PR, or drive no-mistakes)\` line, and stop.
+EOF
+    return 0
+  fi
   case "$mode" in
     direct-PR)
       cat <<EOF
@@ -248,8 +273,5 @@ Two firstmate-specific rules layer on top of that guidance:
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
 EOF
       ;;
-    *)
-      echo "error: fm_dod_block: unknown delivery mode '$mode'" >&2
-      return 1 ;;
   esac
 }

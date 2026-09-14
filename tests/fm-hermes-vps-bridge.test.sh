@@ -655,6 +655,72 @@ test_bridge_report_and_inbox_over_real_socket() {
   pass "report + inbox protocol: the bridge polls, delivers, and acknowledges a steering record unassisted, and a FIRSTMATE-REPORT block lands in the real local report file"
 }
 
+test_bridge_preserves_inbox_order_on_forward_failure() {
+  # Regression for poll_inbox()'s FIFO order guarantee: a record whose
+  # forward permanently fails (both the initial attempt and the
+  # reconnect-retry) must stop the sweep, not let a later, deliverable
+  # record jump ahead of it. TRIGGER_RPC_ERROR (tests/fixtures/
+  # fm-hermes-ws-stub-server.py) makes the stub fail the RPC itself,
+  # synchronously - unlike TRIGGER_ERROR, which only fails later, mid-turn,
+  # as an async event _forward() never waits for.
+  local port rpc_log status_file report_file inbox_dir handled_dir submit_count
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-order.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  status_file="$TMP_ROOT/status-8g.status"
+  report_file="$TMP_ROOT/status-8g-report.md"
+  inbox_dir="$TMP_ROOT/status-8g.inbox"
+  handled_dir="$inbox_dir/handled"
+  rm -rf "$status_file" "$report_file" "$inbox_dir"
+  mkdir -p "$handled_dir"
+
+  printf 'schema=fm-task-inbox.v1\nat=2026-01-01T00:00:00Z\n--\nTRIGGER_RPC_ERROR' \
+    > "$inbox_dir/001.msg"
+  printf 'schema=fm-task-inbox.v1\nat=2026-01-01T00:00:01Z\n--\nSTUB_ECHO:should never be delivered' \
+    > "$inbox_dir/002.msg"
+
+  start_bridge_with_protocol "$port" bridge-order "$status_file" "$report_file" "$inbox_dir"
+
+  # Wait for both of 001's forward attempts (initial + reconnect-retry) to
+  # reach the stub before asserting the sweep stopped there.
+  local tries=100
+  while :; do
+    submit_count=$(grep -c '"method": "prompt.submit"' "$rpc_log" 2>/dev/null || true)
+    [ -n "$submit_count" ] || submit_count=0
+    [ "$submit_count" -ge 2 ] && break
+    tries=$((tries - 1))
+    [ "$tries" -gt 0 ] || fail "expected both of 001's forward attempts (initial + reconnect-retry) to reach the stub, got: $(cat "$rpc_log" 2>/dev/null)"
+    sleep 0.1
+  done
+
+  # Give a regressed continue-past-failure path time to also process 002.
+  sleep 1
+
+  [ -f "$inbox_dir/001.msg" ] \
+    || fail "001 must stay in the inbox root after its forward permanently fails, not be dropped"
+  [ -f "$handled_dir/001.msg" ] \
+    && fail "001's forward failed, so it must never be acknowledged into handled/"
+  [ -f "$inbox_dir/002.msg" ] \
+    || fail "a later record must not be delivered while an earlier one is still stalled - 002 was removed from the inbox root"
+  [ -f "$handled_dir/002.msg" ] \
+    && fail "002 must not jump ahead of a still-pending 001 and be delivered/acknowledged out of order"
+  submit_count=$(grep -c '"method": "prompt.submit"' "$rpc_log" 2>/dev/null || true)
+  [ -n "$submit_count" ] || submit_count=0
+  [ "$submit_count" -eq 2 ] \
+    || fail "002 must never be forwarded to the remote session while 001 is still pending, got $submit_count prompt.submit calls: $(cat "$rpc_log" 2>/dev/null)"
+
+  printf '/exit\n' >&3
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  BRIDGE_PID=""
+  stop_drain
+  exec 3>&- 4>&-
+  stop_stub
+  pass "report + inbox protocol: a failed forward blocks the sweep so a later record cannot jump ahead of a still-pending one"
+}
+
 test_bridge_suppresses_inbox_doorbell_line() {
   local port rpc_log status_file report_file inbox_dir
   port=$(free_port)
@@ -712,6 +778,8 @@ stop_bridge
 test_bridge_rejects_malformed_status_line
 stop_bridge
 test_bridge_report_and_inbox_over_real_socket
+stop_bridge
+test_bridge_preserves_inbox_order_on_forward_failure
 stop_bridge
 test_bridge_suppresses_inbox_doorbell_line
 stop_bridge
