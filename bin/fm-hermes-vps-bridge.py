@@ -132,8 +132,39 @@
 # wire-protocol gap. message.start itself carries no payload but now prints
 # a bare "[working...]" line (see handle_event) so a slow turn - one whose
 # first message.delta/tool.start is many seconds out - reads as in flight
-# rather than dead; this is the only rendering this bridge adds beyond the
-# real event stream.
+# rather than dead; this is one of three renderings this bridge adds beyond
+# the real event stream, alongside "[sending...]" and the "❯" ready marker
+# documented next.
+#
+# Local-submit and ready-for-input rendering (both pane-rendering only, no
+# RPC/protocol change): the pane is a scrolling event log with no composer,
+# so pressing Enter locally produced no feedback at all until the earliest
+# server signal (message.start) - a captain-visible gap on a slow network
+# hop even before the VPS turn itself starts. _forward() now prints a bare
+# "[sending...]" line the instant it is about to issue prompt.submit or
+# session.steer, before that RPC call, distinct from "[working...]" (which
+# still means the SERVER has confirmed the turn is running): the two states
+# are genuinely different - a line typed into a dead connection prints
+# "[sending...]" and then a delivery-failed diagnostic, never "[working...]".
+# _forward() is the one choke point every submission path already shares
+# (pane-typed input, brief-content delivery, inbox-polled steers), so this
+# is never printed for input that never reaches it - the doorbell line, a
+# brief pointer whose path does not exist, /exit, /interrupt (a distinct RPC
+# with its own "[interrupted]" outcome line, untouched here). Symmetrically,
+# a bare "❯" line renders once whenever the session becomes idle and ready
+# for a new line: after start()'s readiness banner, and after every
+# message.complete/error event resets self.busy to False. Because this is
+# an append-only scrollback, "absent while a submission is in flight" means
+# no NEW "❯" line is printed between a "[sending...]" and the next idle
+# transition - the same tail-is-current-state convention
+# bin/fm-composer-lib.sh's own AGENT_PROMPT_GLYPHS comment documents for
+# every composer-having harness, reused here for a pane that has no real
+# composer to classify. The glyph itself matches that same fleet-wide
+# convention (bin/fm-composer-lib.sh: "Real claude 2.x draws its EMPTY
+# composer as exactly `❯`"); hermes-vps's own busy classification
+# (fm_busy_hermes_vps_agent_running) never reads pane text, so neither new
+# marker can be mistaken for a busy/idle signal by anything that classifies
+# this task's state.
 import importlib.util
 import os
 import re
@@ -161,6 +192,8 @@ READY_PREFIX = 'Hermes VPS bridge ready.'
 BRIEF_POINTER_PREFIX = 'Read the brief at '
 BRIEF_POINTER_SUFFIX = ' and follow it exactly.'
 BULLET = '●'
+SENDING_LINE = '[sending...]'
+READY_MARKER = '❯'
 EVENT_WAIT_TIMEOUT = 30.0
 RECONNECT_ATTEMPTS = 5
 RECONNECT_BACKOFF = 2.0
@@ -226,6 +259,14 @@ def _echo(line):
     print(f'{BULLET} {line}', flush=True)
 
 
+def _print_ready_marker():
+    """Renders once per idle transition - see the module docstring's
+    "Local-submit and ready-for-input rendering" section. Never gates
+    anything: hermes-vps busy classification is a live session.status RPC
+    (fm_busy_hermes_vps_agent_running), not pane text."""
+    print(READY_MARKER, flush=True)
+
+
 def _inbox_record_body(raw):
     """Body of one fm-task-inbox-lib.sh record: header lines, a bare "--"
     separator line, then the message text verbatim. Returns None when no
@@ -260,6 +301,7 @@ class Bridge:
         if not self.session_id:
             raise HermesWsError(f'session.create returned no session_id: {created}')
         print(f'{READY_PREFIX} session_id={self.session_id}', flush=True)
+        _print_ready_marker()
 
     def _forward(self, text):
         """Submit or steer <text> depending on the last-observed turn state.
@@ -267,7 +309,13 @@ class Bridge:
         a captain steering a wedged session needs to see that, not silence.
         Returns True once the RPC is confirmed sent, False otherwise, so a
         caller with its own delivery-then-acknowledge contract (the inbox
-        poll below) never acknowledges a delivery that never happened."""
+        poll below) never acknowledges a delivery that never happened.
+        Prints SENDING_LINE first: this is the one choke point every
+        submission path shares, so it is the earliest point-in-time local
+        signal available without inventing a second one per caller - see the
+        module docstring's "Local-submit and ready-for-input rendering"
+        section for why this is distinct from message.start's "[working...]"."""
+        print(SENDING_LINE, flush=True)
         try:
             method = 'session.steer' if self.busy else 'prompt.submit'
             self.session.rpc(method, {'session_id': self.session_id, 'text': text})
@@ -512,6 +560,7 @@ class Bridge:
             text = self._turn_text_buf or (data.get('text') or '')
             if text:
                 self._process_turn_text(text)
+            _print_ready_marker()
         elif etype == 'tool.start':
             name = data.get('name', '?')
             context = data.get('context', '')
@@ -524,6 +573,7 @@ class Bridge:
             self.busy = False
             message = data.get('message', envelope)
             print(f'\n[error] {message}', flush=True)
+            _print_ready_marker()
 
     def shutdown(self):
         if self._shutdown:

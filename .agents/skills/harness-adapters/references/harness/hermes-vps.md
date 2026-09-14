@@ -27,7 +27,7 @@ The pane's foreground process is always this bridge (a python script), never the
 | Trust dialog | None observed (no vendor UI at all). |
 | Environment marker | None needed: the bridge is a distinct tracked script (`fm-hermes-vps-bridge.py`), matched structurally by `../../../../bin/fm-hermes-lib.sh`'s `fm_hermes_vps_bridge_*` functions, the same interpreter-argv[1] pattern bare hermes's own identity check uses. |
 | Process name | Always the python interpreter (`python3`/`python3.*`), with `fm-hermes-vps-bridge.py` as argv[1] - see Detection. |
-| Composer | None. The pane is a scrolling event-rendered log, not a composer; there is deliberately no composer-emptiness half in the readiness/delivery gates. |
+| Composer | None. The pane is a scrolling event-rendered log, not a composer; there is deliberately no composer-emptiness half in the readiness/delivery gates. A bare `❯` line now renders once whenever the session is idle (see "Ready-for-input marker" below) - a visual signal only, not a real composer a gate could classify. |
 | Effort | None - see Models. |
 
 ## Detection
@@ -54,12 +54,28 @@ If the pointer's path is NOT locally readable, the bridge never echoes that line
 
 The bridge renders a grounded subset of the real Hermes event vocabulary (read directly from the installed Hermes source, `tui_gateway/server.py`, not inferred): `message.start` (a bare `[working...]` line, see "Working indicator" below), `message.delta` (streamed text), `message.complete` (a `[turn <status>]` marker), `tool.start`/`tool.complete` (a one-line summary each), and `error`.
 Every other event type (`reasoning.available`, `subagent.*`, `tool.generating`, todo updates) is deliberately not rendered - an initial pane-rendering scope, not a wire-protocol gap.
+Two further lines are rendered locally by the bridge itself, never from a server event: a `[sending...]` line the instant a line reaches `_forward()` (see "Sending indicator" below), and a bare `❯` whenever the session becomes idle (see "Ready-for-input marker" below).
 
 ### Working indicator
 
 The pane has no composer, spinner, or busy state of any kind (see "Composer" above), so a genuinely working but slow turn - one whose first `message.delta` or `tool.start` is many seconds out, with no vendor "typing" signal on this transport - was indistinguishable from a dead session.
 The bridge now prints a bare `[working...]` line on every `message.start`, the earliest point-in-time signal the event stream offers without adding a new polling loop; it is a pane log line like every other rendered marker, never cleared in place, and the turn's own later `message.delta`/`tool.start`/`[turn <status>]` lines are what tell the reader the wait ended.
 Live-verified (offline, no VPS credentials in a task worktree - see `docs/verification/hermes.md`'s "hermes-vps: working indicator" section) with a stub-driven multi-second delay standing in for a real slow turn (e.g. a `sleep`-based VPS command): `[working...]` renders immediately after submission, nothing else renders during the delay, and the eventual content plus `[turn complete]` land once the response arrives.
+
+### Sending indicator
+
+`[working...]` itself only ever rendered once the SERVER confirmed the turn (`message.start`), i.e. after the full round trip to the VPS had already begun - a captain pressing Enter got no feedback at all until that round trip completed, worse on a slow network hop.
+`_forward()` (the one choke point every submission path shares - pane-typed input, brief-content delivery, and inbox-polled steers alike) now prints a bare `[sending...]` line the instant it is about to issue `prompt.submit`/`session.steer`, before that RPC call - a genuinely distinct, earlier signal from `[working...]`, which still means the server has confirmed the turn is running.
+Never printed for input that never reaches `_forward()` (the doorbell line, a brief pointer whose path does not exist, `/exit`, `/interrupt`), so a local read/parse failure before submission never falsely claims a send was attempted.
+Live-verified (offline, same methodology as "Working indicator" above) both on the ordinary fast path and against the stub's multi-second delay: `[sending...]` renders immediately after the delivery-confirmation bullet, well before `[working...]`, which still only renders once `message.start` actually arrives.
+
+### Ready-for-input marker
+
+The pane had no visible signal that it was idle and ready to accept a line at all, unlike every other verified harness's own composer.
+A bare `❯` (the same idle-composer glyph `bin/fm-composer-lib.sh` already documents for claude) now renders once whenever the bridge becomes idle: right after the readiness banner, and after every `message.complete`/`error` event resets `self.busy` to `False`.
+Because the pane is an append-only scrollback with no way to erase a prior line, "absent while a submission is in flight" means exactly that no NEW `❯` line is printed between a `[sending...]` and the next idle transition - the reader judges the pane's current state from its tail, the same convention every composer-having harness already uses.
+This is a rendering-only signal: `hermes-vps`'s own busy classification (`fm_busy_hermes_vps_agent_running`) is a live `session.status` RPC and never reads pane text, so neither this marker nor `[sending...]` can be mistaken for a structural busy/idle source by anything that classifies this task's state.
+Live-verified (offline, same methodology as above): `❯` renders once right after the readiness banner, no `❯` line appears anywhere during a submission's busy stretch (bullet, `[sending...]`, `[working...]`, streamed content, `[turn <status>]`), and it reappears exactly once more right after the turn completes.
 
 ## Status, report, and steering: bridged locally, not filesystem access
 

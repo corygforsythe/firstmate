@@ -527,3 +527,41 @@ Also confirmed directly against the real bridge subprocess and stub, outside the
 
 `[working...]` rendered within 0.02s of the delivery bullet, and the delayed content landed only once the stub's real 4-second sleep elapsed - proving the indicator is driven by `message.start` itself, not by anything that could coincide with the delayed content.
 No VPS credentials exist in a dispatched task's own worktree (only in the running firstmate home's gitignored `.env`, per `bin/fm-hermes-ws-env-lib.sh`), so this fix has not yet been re-confirmed against the real VPS; re-run against a live `hermes-vps` pane submitting a genuinely slow command (e.g. `sleep 10`) the next time one is available, and update this section with that result.
+
+## hermes-vps: local-submit ("sending") signal and a ready-for-input marker
+
+Fixed 2026-09-14, following a captain live-test of the `[working...]` fix above: two further real gaps in the same pane. First, `[working...]` itself only ever rendered once the SERVER confirmed the turn (`message.start`), i.e. after the full round trip to the VPS had already begun - a captain pressing Enter got no feedback at all until that round trip completed. Second, the pane had no visible signal that it was idle and ready to accept a line at all, unlike every other verified harness's own composer.
+
+**Fix**: `bin/fm-hermes-vps-bridge.py`'s `_forward()` - the one choke point every submission path already shares (pane-typed input, brief-content delivery, inbox-polled steers) - now prints a bare `[sending...]` line the instant it is about to issue `prompt.submit`/`session.steer`, before that RPC call; this is deliberately a distinct signal from `[working...]`, which still means the server has confirmed the turn is running, not just that this bridge tried to send it. Symmetrically, `handle_event` now prints a bare `❯` (the same idle-composer glyph `bin/fm-composer-lib.sh` already documents for claude) once whenever the bridge becomes idle: right after `start()`'s readiness banner, and after every `message.complete`/`error` event resets `self.busy` to `False`. Neither addition touches the RPC protocol, the status/report/inbox bridge, or fleet-dispatch wiring - both are pane-rendering only, and `hermes-vps`'s own busy classification (`fm_busy_hermes_vps_agent_running`) remains a live `session.status` RPC that never reads pane text, so neither marker can be mistaken for a structural busy/idle source.
+
+**Offline verification (no VPS credentials in this task's worktree, same constraint as the working-indicator fix above)**: `tests/fm-hermes-vps-bridge.test.sh` gained two new tests exercising the real bridge subprocess against the real stub server over a real loopback socket - `test_bridge_renders_sending_indicator_before_working_on_ordinary_submit` (proves the print order `● <line>` -> `[sending...]` -> `[working...]` on the ordinary fast path, no artificial delay) and `test_bridge_renders_ready_marker_when_idle_and_absent_while_busy` (proves `❯` renders once on idle, never mid-turn across an entire busy stretch, and reappears exactly once after `[turn complete]`) - plus updates to the three existing tests whose exact-line-sequence assertions now need to account for the new markers (`test_bridge_lifecycle_over_real_socket`, `test_bridge_missing_brief_never_reports_false_delivery`, `test_bridge_renders_working_indicator_before_slow_response`):
+
+```
+$ bash tests/fm-hermes-vps-bridge.test.sh
+...
+ok - sending indicator: [sending...] renders on local submit before [working...] confirms the server round trip is in flight
+ok - ready marker: ❯ renders when idle and never mid-turn, reappearing once the turn completes
+```
+
+Also confirmed directly against the real bridge subprocess and stub, outside the test harness, with wall-clock timestamps on every rendered line (macOS arm64, Python 3.13.12) - an ordinary fast submission, then a `STUB_DELAY:3` slow one:
+
+```
+[0.06s] READY: Hermes VPS bridge ready. session_id=test-session-1
+[0.06s] LINE: ❯
+[0.06s] LINE: ● hello captain
+[0.06s] LINE: [sending...]
+[0.06s] LINE: [working...]
+[0.06s] LINE: stub
+[0.06s] LINE: [turn complete]
+[0.06s] LINE: ❯
+[0.11s] LINE: ● STUB_DELAY:3:slow reply landed
+[0.11s] LINE: [sending...]
+[0.12s] LINE: [working...]
+[3.15s] LINE: slow reply landed
+[3.15s] LINE: [turn complete]
+[3.15s] LINE: ❯
+```
+
+`[sending...]` rendered within the same tick as the submitted line's delivery bullet on both turns - well before `[working...]`, which (as the working-indicator fix above already established) only renders once `message.start` actually arrives - and `❯` rendered once on open, never during either busy stretch, reappearing once each turn completed.
+Under this sandbox's own CPU scheduling, a further repeat of the delayed-submission run occasionally showed `[working...]` itself arriving only once the stub's sleep elapsed instead of promptly after `message.start` - the SAME class of timing variance the working-indicator fix's own test already carries as a rare environment-level flake (`docs/verification/hermes.md`'s prior section; reproduced identically against this task's unmodified baseline before any of this task's changes, so it predates and is unrelated to the sending/ready-marker work here) rather than anything introduced by this fix, since neither new marker touches `message.start` handling at all.
+No VPS credentials exist in a dispatched task's own worktree, so neither fix has yet been re-confirmed against the real VPS; re-run against a live `hermes-vps` pane the next time one is available, and update this section with that result.

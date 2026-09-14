@@ -53,6 +53,19 @@
 #      stub's STUB_DELAY: prefix, which sleeps server-side between
 #      message.start and the rest of the turn to stand in for real slow
 #      latency (e.g. a sleep-based VPS command) without slowing this suite.
+#  10. Sending indicator (the fix for [working...] itself printing too LATE
+#      - only once the server confirms the turn, after the full round trip
+#      has already begun): a bare "[sending...]" line renders the instant a
+#      submitted line reaches _forward(), before the RPC call, distinct from
+#      "[working...]" which still means the server has confirmed the turn is
+#      running - proven on the ordinary fast path (no delay) so the two
+#      really are separate renders in order, not one renamed.
+#  11. Ready-for-input marker (the fix for no visible signal that the pane
+#      was idle and ready to accept a line, unlike every other verified
+#      harness's composer): a bare "❯" renders once whenever the bridge
+#      becomes idle (readiness, and after every message.complete/error), and
+#      never renders again until the next such transition - proven by
+#      scanning an entire busy stretch for a stray mid-turn "❯".
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -262,6 +275,11 @@ Do the real work."
   esac
   [ -n "$session_id" ] || fail "readiness banner carried no session_id"
 
+  # A fresh session opens idle: the ready-for-input marker renders once,
+  # right after the banner, before any input is sent.
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the bridge opened idle, got: $line"
+
   # Brief delivery: the exact pointer sentence fm-spawn.sh types into every
   # launch-then-send harness's pane, with a LOCAL path the bridge can read -
   # this must forward the FILE'S CONTENT, never the sentence itself, because
@@ -293,6 +311,11 @@ Do the real work."
   done
   [ "$saw_stub_delta" = 1 ] || fail "the bridge never rendered the stub's streamed message.delta text"
   [ "$saw_turn_complete" = 1 ] || fail "the bridge never rendered a [turn complete] marker on message.complete"
+
+  # The ready marker renders once more right after the turn completes, since
+  # the session is idle and ready for a new line again.
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the turn completed, got: $line"
 
   # Interrupt: a local command, not a chat message - must never reach the
   # model as a submitted line, and must call the real RPC.
@@ -360,6 +383,9 @@ test_bridge_missing_brief_never_reports_false_delivery() {
     'Hermes VPS bridge ready. session_id='*) ;;
     *) fail "expected the readiness banner, got: $line" ;;
   esac
+
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the bridge opened idle, got: $line"
 
   printf 'Read the brief at %s and follow it exactly.\n' "$missing_path" >&3
   line=$(read_line_timeout 4 10)
@@ -811,12 +837,22 @@ test_bridge_renders_working_indicator_before_slow_response() {
     *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-working.err" 2>/dev/null))" ;;
   esac
 
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the bridge opened idle, got: $line"
+
   printf 'STUB_DELAY:4:slow reply landed\n' >&3
   line=$(read_line_timeout 4 10)
   case "$line" in
     "● STUB_DELAY:4:slow reply landed") ;;
     *) fail "expected the delivery-confirmation bullet for the submitted line, got: $line" ;;
   esac
+
+  # The local "sending" signal renders the instant the line is handed to
+  # _forward(), before any RPC round trip - so it must appear here even
+  # though the server is about to sit on this turn for 4s.
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[sending...]' ] \
+    || fail "expected a [sending...] indicator immediately on local submit, before any server confirmation, got: $line"
 
   line=$(read_line_timeout 4 10)
   [ "$line" = '[working...]' ] \
@@ -854,6 +890,136 @@ test_bridge_renders_working_indicator_before_slow_response() {
   pass "working indicator: [working...] renders immediately on message.start and nothing else renders until the delayed response lands"
 }
 
+# --- 10. sending indicator on local submit -----------------------------------
+
+test_bridge_renders_sending_indicator_before_working_on_ordinary_submit() {
+  # Captain-reported gap: [working...] only ever rendered once the SERVER
+  # confirmed the turn (message.start), i.e. after the full round trip to
+  # the VPS had already begun - a captain pressing Enter got no feedback at
+  # all until that round trip completed. _forward() now prints a bare
+  # "[sending...]" line the instant it is about to issue the RPC, before the
+  # RPC call, distinct from "[working...]" (server-confirmed). This pins the
+  # ORDER on the ordinary fast path (no STUB_DELAY): echo, then
+  # "[sending...]", then "[working...]" once message.start actually arrives
+  # - proving the two are genuinely separate signals, not one renamed.
+  local port rpc_log line
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-sending.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  local in_fifo="$TMP_ROOT/bridge-sending.in" out_fifo="$TMP_ROOT/bridge-sending.out"
+  rm -f "$in_fifo" "$out_fifo"
+  mkfifo "$in_fifo" "$out_fifo"
+  exec 3<>"$in_fifo"
+  exec 4<>"$out_fifo"
+  env -i PATH="$PATH" \
+    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
+    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
+    python3 "$BRIDGE" --cwd /tmp/some-worktree \
+      <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-sending.err" &
+  BRIDGE_PID=$!
+
+  line=$(read_line_timeout 4 10)
+  case "$line" in
+    'Hermes VPS bridge ready.'*) ;;
+    *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-sending.err" 2>/dev/null))" ;;
+  esac
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the bridge opened idle, got: $line"
+
+  printf 'hello captain\n' >&3
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '● hello captain' ] || fail "expected the delivery-confirmation bullet for the submitted line, got: $line"
+
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[sending...]' ] \
+    || fail "expected [sending...] immediately after the submitted line is echoed, before any server confirmation, got: $line"
+
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[working...]' ] \
+    || fail "expected [working...] once message.start actually confirms the turn is running, got: $line"
+
+  if ! grep -q '"method": "prompt.submit"' "$rpc_log" 2>/dev/null; then
+    fail "the bridge never sent a real prompt.submit RPC for the submitted line"
+  fi
+
+  printf '/exit\n' >&3
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  BRIDGE_PID=""
+  exec 3>&- 4>&-
+  stop_stub
+  pass "sending indicator: [sending...] renders on local submit before [working...] confirms the server round trip is in flight"
+}
+
+# --- 11. ready-for-input marker ----------------------------------------------
+
+test_bridge_renders_ready_marker_when_idle_and_absent_while_busy() {
+  # Captain-reported gap: the pane had no visible signal that it was idle and
+  # ready to accept a line, unlike every other verified harness's composer.
+  # A bare "❯" now renders once whenever the bridge becomes idle (readiness,
+  # and after every message.complete/error resets busy to False), and - since
+  # this is an append-only scrollback with no way to erase a prior line - the
+  # regression this pins is that NO new "❯" appears anywhere between a
+  # submission and the turn completing: the busy stretch's own lines
+  # (bullet, [sending...], [working...], streamed content, [turn complete])
+  # are exactly what's on screen, with the marker only reappearing once more
+  # after the turn is done.
+  local port rpc_log line
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-ready.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  local in_fifo="$TMP_ROOT/bridge-ready.in" out_fifo="$TMP_ROOT/bridge-ready.out"
+  rm -f "$in_fifo" "$out_fifo"
+  mkfifo "$in_fifo" "$out_fifo"
+  exec 3<>"$in_fifo"
+  exec 4<>"$out_fifo"
+  env -i PATH="$PATH" \
+    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
+    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
+    python3 "$BRIDGE" --cwd /tmp/some-worktree \
+      <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-ready.err" &
+  BRIDGE_PID=$!
+
+  line=$(read_line_timeout 4 10)
+  case "$line" in
+    'Hermes VPS bridge ready.'*) ;;
+    *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-ready.err" 2>/dev/null))" ;;
+  esac
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the bridge opened idle, got: $line"
+
+  printf 'hello captain\n' >&3
+
+  # Every line from here through [turn complete] is the busy stretch: none
+  # of them may be a bare "❯", or the marker would be lying about being
+  # ready for input while a submission is still in flight.
+  local saw_turn_complete=0 tries=0
+  while [ "$tries" -lt 20 ]; do
+    if IFS= read -r -t 2 -u 4 line; then
+      [ "$line" = '❯' ] && fail "a ready marker (❯) rendered mid-turn, while a submission was in flight: line was '$line'"
+      [ "$line" = '[turn complete]' ] && { saw_turn_complete=1; break; }
+    fi
+    tries=$((tries + 1))
+  done
+  [ "$saw_turn_complete" = 1 ] || fail "never saw [turn complete] while scanning for a stray mid-turn ready marker"
+
+  # The marker reappears exactly once more, right after the turn completes.
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '❯' ] || fail "expected a ready marker (❯) once the turn completed, got: $line"
+
+  printf '/exit\n' >&3
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+  BRIDGE_PID=""
+  exec 3>&- 4>&-
+  stop_stub
+  pass "ready marker: ❯ renders when idle and never mid-turn, reappearing once the turn completes"
+}
+
 test_bridge_identity_functions
 test_agent_process_classify_recognizes_bridge
 test_busy_hermes_vps_agent_running_parses_status
@@ -876,4 +1042,8 @@ stop_bridge
 test_bridge_suppresses_inbox_doorbell_line
 stop_bridge
 test_bridge_renders_working_indicator_before_slow_response
+stop_bridge
+test_bridge_renders_sending_indicator_before_working_on_ordinary_submit
+stop_bridge
+test_bridge_renders_ready_marker_when_idle_and_absent_while_busy
 stop_bridge
