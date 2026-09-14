@@ -405,7 +405,7 @@ class Bridge:
                 )
                 continue
             if not self._forward(body):
-                continue  # left in place; retried on the next poll
+                break  # left in place; retried on the next poll
             handled_dir = self._inbox_handled_dir()
             try:
                 os.makedirs(handled_dir, exist_ok=True)
