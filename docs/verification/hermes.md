@@ -364,10 +364,9 @@ Two real, load-bearing bugs were found and fixed only by driving the bridge agai
 
 ### Brief delivery: content, not a pointer
 
-Every other launch-then-send harness (kimi/rovo/hermes) receives `Read the brief at <path> and follow it exactly.` and opens that path itself.
-A VPS-hosted Hermes session cannot: it runs on a different machine with no access to this one's filesystem.
-The bridge - which does run locally - special-cases exactly the first line it receives matching that shape: it reads the file itself and forwards its CONTENT via `prompt.submit`, echoing the original pointer line with a leading `●` (matching bare hermes's own accepted-message convention) so `bin/fm-spawn.sh`'s delivery gate can grep for the identical marker.
+`../../.agents/skills/harness-adapters/references/harness/hermes-vps.md`'s "Brief delivery" section owns the mechanism, including the missing-brief-path invariant added after review.
 Live-verified: `bin/fm-spawn.sh hvfinal <project> --scout --harness hermes-vps` against a real VPS session correctly delivered a brief whose `## Captain's intent` instructed `pwd && echo HERMES_VPS_LIVE_VERIFY_MARKER`; the VPS agent ran it via its own `terminal` tool and replied with `/` and `HERMES_VPS_LIVE_VERIFY_MARKER` exactly.
+The missing-brief-path fix described there is pinned by a portable regression in `tests/fm-hermes-vps-bridge.test.sh` (`test_bridge_missing_brief_never_reports_false_delivery`) rather than by further live-VPS evidence, since it is a local-process behavior that does not depend on the real gateway.
 
 ### Fleet wiring landed
 
@@ -405,6 +404,7 @@ fm-hermes-ws.py: session.status: {'code': 4001, 'message': 'session not found'}
 ```
 
 Every VPS session this task created (via the bridge directly, via `fm-spawn.sh`, and via ad hoc `fm-hermes-ws.sh` probes) was independently confirmed closed or already-gone by the end of the task - `session.close`/`session.interrupt`/`session.status` against a stale id consistently answered `session not found` rather than ever leaving a live orphan.
+That guarantee did not originally extend to a post-readiness spawn failure, since `hermes_vps_spawn_fail`'s pane teardown delivers SIGHUP rather than SIGTERM/SIGINT and the bridge did not yet trap it; the bridge now traps SIGHUP identically (`../../.agents/skills/harness-adapters/references/harness/hermes-vps.md`'s "Exit command" row owns the current fact), pinned by `tests/fm-hermes-vps-bridge.test.sh`'s `test_bridge_closes_session_on_sighup`.
 
 ### Herdr pane visibility
 

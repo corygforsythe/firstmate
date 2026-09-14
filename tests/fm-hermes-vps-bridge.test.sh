@@ -301,8 +301,131 @@ Do the real work."
   pass "bridge lifecycle: readiness, brief-content delivery, event rendering, /interrupt, and /exit all round-trip over a real socket"
 }
 
+test_bridge_missing_brief_never_reports_false_delivery() {
+  # Regression for the false-delivery finding: when the brief pointer names a
+  # path that does not exist, the bridge must NOT echo the pointer sentence
+  # back with a leading bullet, because bin/fm-spawn.sh's
+  # hermes_vps_delivery_is_confirmed (bin/fm-spawn.sh:3424) treats any pane
+  # line matching `^●[[:space:]]*Read the brief at` as proof the brief was
+  # delivered. Echoing it here would mark the task CONFIRMED/dispatched while
+  # the VPS agent never received real brief content, so the real delivery
+  # gate must instead see nothing and eventually time out.
+  local port rpc_log missing_path line
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-missing-brief.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  missing_path="$TMP_ROOT/does-not-exist-$$.md"
+  rm -f "$missing_path"
+
+  local in_fifo out_fifo
+  in_fifo="$TMP_ROOT/bridge-missing.in"
+  out_fifo="$TMP_ROOT/bridge-missing.out"
+  rm -f "$in_fifo" "$out_fifo"
+  mkfifo "$in_fifo" "$out_fifo"
+  exec 3<>"$in_fifo"
+  exec 4<>"$out_fifo"
+
+  env -i PATH="$PATH" \
+    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
+    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
+    python3 "$BRIDGE" --cwd /tmp/some-worktree <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-missing.err" &
+  BRIDGE_PID=$!
+
+  line=$(read_line_timeout 4 10)
+  case "$line" in
+    'Hermes VPS bridge ready. session_id='*) ;;
+    *) fail "expected the readiness banner, got: $line" ;;
+  esac
+
+  printf 'Read the brief at %s and follow it exactly.\n' "$missing_path" >&3
+  line=$(read_line_timeout 4 10)
+  case "$line" in
+    '●'*) fail "the bridge echoed a bullet-prefixed line for an unreadable brief, which fm-spawn.sh's hermes_vps_delivery_is_confirmed would treat as CONFIRMED delivery: $line" ;;
+    *'brief not found'*) ;;
+    *) fail "expected a 'brief not found' diagnostic for a missing brief path, got: $line" ;;
+  esac
+
+  if grep -q '"method": "prompt.submit"' "$rpc_log" 2>/dev/null; then
+    fail "the bridge sent a real prompt.submit RPC for a brief path that does not exist"
+  fi
+
+  printf '/exit\n' >&3
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  kill -0 "$BRIDGE_PID" 2>/dev/null && fail "the bridge process did not exit after /exit"
+  BRIDGE_PID=""
+  exec 3>&- 4>&-
+  stop_stub
+
+  pass "missing brief: the bridge reports a diagnostic instead of echoing the delivery-confirmation bullet, and never forwards the pointer sentence as a submitted message"
+}
+
+test_bridge_closes_session_on_sighup() {
+  # Regression for the SIGHUP-leaks-session finding: bin/fm-spawn.sh's
+  # hermes_vps_spawn_fail (bin/fm-spawn.sh:~3440) tears the tmux window down
+  # via rovo_endpoint_cleanup on any post-readiness launch failure, and
+  # bin/backends/tmux.sh's `tmux kill-window` delivers SIGHUP to the bridge's
+  # foreground process group. Before this fix, Python's default SIGHUP
+  # disposition killed the process immediately, bypassing bridge.shutdown()
+  # (and its real session.close RPC) entirely and orphaning a live VPS
+  # session. This proves SIGHUP now runs the same clean-shutdown path SIGTERM
+  # already used.
+  local port rpc_log line
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-sighup.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  local in_fifo out_fifo
+  in_fifo="$TMP_ROOT/bridge-sighup.in"
+  out_fifo="$TMP_ROOT/bridge-sighup.out"
+  rm -f "$in_fifo" "$out_fifo"
+  mkfifo "$in_fifo" "$out_fifo"
+  exec 3<>"$in_fifo"
+  exec 4<>"$out_fifo"
+
+  env -i PATH="$PATH" \
+    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
+    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
+    python3 "$BRIDGE" --cwd /tmp/some-worktree <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-sighup.err" &
+  BRIDGE_PID=$!
+
+  line=$(read_line_timeout 4 10)
+  case "$line" in
+    'Hermes VPS bridge ready. session_id='*) ;;
+    *) fail "expected the readiness banner, got: $line" ;;
+  esac
+
+  kill -HUP "$BRIDGE_PID"
+
+  local waited=0
+  while kill -0 "$BRIDGE_PID" 2>/dev/null && [ "$waited" -lt 50 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  kill -0 "$BRIDGE_PID" 2>/dev/null && fail "the bridge process did not exit after SIGHUP"
+  BRIDGE_PID=""
+  exec 3>&- 4>&-
+
+  if ! grep -q '"method": "session.close"' "$rpc_log" 2>/dev/null; then
+    fail "the bridge never sent a real session.close RPC when killed with SIGHUP"
+  fi
+
+  stop_stub
+  pass "SIGHUP: the bridge runs the same clean-shutdown path as SIGTERM, sending a real session.close RPC before exiting"
+}
+
 test_bridge_identity_functions
 test_agent_process_classify_recognizes_bridge
 test_busy_hermes_vps_agent_running_parses_status
 test_bridge_lifecycle_over_real_socket
+stop_bridge
+test_bridge_missing_brief_never_reports_false_delivery
+stop_bridge
+test_bridge_closes_session_on_sighup
 stop_bridge
