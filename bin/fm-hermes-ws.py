@@ -33,7 +33,7 @@
 # through argv, so a secret never appears in argv, a status line, or a
 # process listing (the same contract as FM_MAIL_USER/FM_MAIL_PASS in
 # fm-mail.py):
-#   FM_HERMES_WS_BASE_URL   Required. e.g. http://vps.tail8bdd14.ts.net:9119
+#   FM_HERMES_WS_BASE_URL   Required. e.g. http://your-vps-host:9119
 #   FM_HERMES_WS_TOKEN      Loopback/--insecure static session token
 #                            (?token=). Mutually exclusive with USER/PASS.
 #   FM_HERMES_WS_USER       Gated-mode username (POST /auth/password-login).
