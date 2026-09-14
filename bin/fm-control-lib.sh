@@ -60,10 +60,14 @@ fm_control_verb_allowed() {  # <verb>
 
 # The harnesses whose control mechanics are verified. Mirrors AGENTS.md
 # section 4's verified-adapter list; an unverified adapter is refused rather
-# than guessed at, exactly as a spawn on it would be.
+# than guessed at, exactly as a spawn on it would be. hermes-vps (the
+# VPS-bridged transport, references/harness/hermes-vps.md) is deliberately
+# NOT in the same boat as its pane-based hermes sibling above: it has a
+# real, structural session.interrupt RPC, so it is supported here even
+# though bare `hermes` remains absent.
 fm_control_harness_supported() {  # <harness>
   case "${1-}" in
-    claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy) return 0 ;;
+    claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes-vps) return 0 ;;
   esac
   return 1
 }
@@ -92,6 +96,7 @@ fm_control_harness_family() {  # <recorded-harness>
     gemini*) printf 'gemini' ;;
     muse*) printf 'muse' ;;
     rovo*) printf 'rovo' ;;
+    hermes-vps) printf 'hermes-vps' ;;
     *) return 1 ;;
   esac
 }
@@ -106,7 +111,7 @@ fm_control_harness_supports_kind() {  # <harness> <kind>
   local harness=${1-} kind=${2-}
   fm_control_harness_supported "$harness" || return 1
   case "$harness" in
-    muse|gemini|rovo|agy) [ "$kind" != secondmate ] || return 1 ;;
+    muse|gemini|rovo|agy|hermes-vps) [ "$kind" != secondmate ] || return 1 ;;
   esac
   return 0
 }
@@ -125,6 +130,22 @@ fm_control_interrupt_key() {  # <harness>
   case "${1-}" in
     claude|codex|opencode|pi|pi-signed|omp|kimi|cursor|gemini|muse|rovo|agy) printf 'Escape' ;;
     grok) printf 'C-c' ;;
+    *) return 1 ;;
+  esac
+}
+
+# fm_control_interrupt_via_text: for a harness whose interrupt is a plain
+# submitted line rather than a named terminal key, the exact text to submit.
+# hermes-vps is the one case today: its bridge (bin/fm-hermes-vps-bridge.py)
+# recognizes this exact line locally and calls the VPS's real
+# session.interrupt RPC instead of forwarding it to the model, because this
+# transport has no pane composer for a key like Escape to act on in the
+# first place. Prints nothing and returns 1 for every key-based harness, so
+# fm-control.sh's send_interrupt_keys checks this FIRST and falls through to
+# the key tables above unchanged for everyone else.
+fm_control_interrupt_via_text() {  # <harness>
+  case "${1-}" in
+    hermes-vps) printf '/interrupt' ;;
     *) return 1 ;;
   esac
 }
@@ -171,14 +192,25 @@ fm_control_interrupt_ack_source() {  # <harness>
     # claude/cursor this stays 'none': the ack is a rendered string, not a
     # recorded state source, and rovo has no busy wiring to confirm against.
     claude|codex|opencode|pi|pi-signed|omp|grok|kimi|cursor|gemini|rovo|agy) printf 'none' ;;
+    # hermes-vps's session.interrupt RPC returns a real, synchronous
+    # {"status": "interrupted"} result inside the bridge (see
+    # bin/fm-hermes-vps-bridge.py), but fm-control.sh only ever sees that
+    # the text was delivered into the pane, not the RPC's own return value,
+    # so it stays 'none' like every non-muse harness rather than claiming a
+    # confirmation this plane cannot actually observe.
+    hermes-vps) printf 'none' ;;
     *) return 1 ;;
   esac
 }
 
-# The command that exits the agent from its own composer.
+# The command that exits the agent from its own composer. hermes-vps's
+# bridge recognizes this exact line locally and closes the VPS session
+# (session.close) before exiting the local process - see
+# bin/fm-hermes-vps-bridge.py - so the ordinary text-submit exit path below
+# needs no separate branch for it, unlike interrupt.
 fm_control_exit_command() {  # <harness>
   case "${1-}" in
-    claude|opencode|grok|kimi|cursor|muse|rovo) printf '/exit' ;;
+    claude|opencode|grok|kimi|cursor|muse|rovo|hermes-vps) printf '/exit' ;;
     codex|pi|pi-signed|omp|gemini|agy) printf '/quit' ;;
     *) return 1 ;;
   esac

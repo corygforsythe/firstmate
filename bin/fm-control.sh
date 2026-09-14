@@ -355,7 +355,14 @@ require_state_verified_backend() {  # <verb>
 # an interrupt that cancels the turn but leaves the restored prompt in the
 # composer would make the next submitted line concatenate onto it.
 send_interrupt_keys() {
-  local key repeat clear i=0
+  local key repeat clear i=0 text verdict
+  if text=$(fm_control_interrupt_via_text "$HARNESS" 2>/dev/null); then
+    verdict=$(fm_backend_send_text_submit "$BACKEND" "$T" "$text" 1 "$POLL" 0.5 "$LABEL") \
+      || die "interrupt command $text could not be sent to task $ID on $BACKEND"
+    [ "$verdict" != send-failed ] \
+      || die "interrupt command $text could not be sent to task $ID on $BACKEND"
+    return 0
+  fi
   key=$(fm_control_interrupt_key "$HARNESS")
   repeat=$(fm_control_interrupt_repeat "$HARNESS")
   clear=$(fm_control_interrupt_clear_key "$HARNESS")

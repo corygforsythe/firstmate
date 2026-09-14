@@ -133,7 +133,7 @@
 #   profile consultation. A --secondmate spawn is exempt and resolves the SECONDMATE
 #   harness (config/secondmate-harness -> config/crew-harness -> own), so the
 #   secondmate-vs-crewmate split is DURABLE across every respawn (recovery,
-#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes)
+#   /updatefirstmate, restart). A bare adapter name (claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes|hermes-vps)
 #   overrides it for this spawn (either kind). A non-flag string containing
 #   whitespace is treated as a RAW launch command - the escape hatch for verifying
 #   new adapters. For pi and pi-signed, fm-spawn resolves the selected executable
@@ -1415,7 +1415,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   }
 elif [ "$KIND" = secondmate ]; then
   case "${POS[1]:-}" in
-    ''|claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes)
+    ''|claude|codex|opencode|pi|pi-signed|grok|kimi|cursor|gemini|muse|rovo|omp|agy|hermes|hermes-vps)
       ARG3=${POS[1]:-}
       ;;
     *' '*)
@@ -1758,6 +1758,19 @@ launch_template() {
     # see docs/verification/hermes.md for the live evidence and the
     # open captain decision this leaves.
     hermes) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESBIN__ --cli --yolo __MODELFLAG__' ;;
+    # hermes-vps (the VPS-bridged transport, docs/verification/hermes.md
+    # "hermes-vps"): the pane never runs the real `hermes` binary at all - it
+    # runs bin/fm-hermes-vps-bridge.py, a local process that creates a
+    # session against the captain's remote VPS gateway
+    # (bin/fm-hermes-ws.py's /api/ws JSON-RPC client) and renders that
+    # session's conversation into this pane. __WORKTREE__ is passed as the
+    # bridge's own --cwd (best-effort only: session.create's cwd param is
+    # NOT honored on the real VPS, live-verified, so it does not confine the
+    # VPS agent's own tools to this worktree - see the bridge's own header
+    # and hermes-vps.md's "Known limitation" for what that means for a task
+    # that needs local repo access). No model/effort flag exists for this
+    # transport (record-and-omit, matching hermes/kimi below).
+    hermes-vps) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESVPSBRIDGE__ --cwd __WORKTREE__' ;;
     *) return 1 ;;
   esac
 }
@@ -1835,6 +1848,18 @@ fi
 # exited, or relaunched through the control plane is refused outright.
 if [ "$KIND" = secondmate ] && [ "$HARNESS" = hermes ]; then
   echo "error: hermes is a verified crewmate/scout adapter only and cannot run a secondmate; it has no primary supervision protocol. Select a harness verified for secondmates." >&2
+  exit 1
+fi
+
+# hermes-vps has real control-plane mechanics (a real session.interrupt RPC,
+# unlike bare hermes above), but it shares hermes's OTHER gap: no primary
+# supervision protocol exists for it (docs/supervision-protocols/ carries no
+# hermes-vps wake protocol), and its bridge process has no turn-end hook to
+# arm one from. A secondmate is a firstmate instance that must itself be
+# supervised, so it is refused for the same reason as its pane-based
+# sibling, independent of the interrupt-support difference.
+if [ "$KIND" = secondmate ] && [ "$HARNESS" = hermes-vps ]; then
+  echo "error: hermes-vps is a verified crewmate/scout adapter only and cannot run a secondmate; it has no primary supervision protocol. Select a harness verified for secondmates." >&2
   exit 1
 fi
 
@@ -2154,7 +2179,10 @@ effort_flag_for_harness() {
     # hermes exposes no effort/reasoning-level concept at all (checked against
     # v0.16.0 --help and a grep of both hermes --help and hermes chat --help
     # for effort/reasoning); the requested axis stays in task metadata only,
-    # same record-and-omit contract as kimi.
+    # same record-and-omit contract as kimi. hermes-vps shares the same gap:
+    # session.create's own RPC signature carries no model or effort param
+    # (docs/verification/hermes.md), so both axes stay record-and-omit for it
+    # too - neither harness gets a case in model_flag_for_harness either.
   esac
 }
 
@@ -2202,6 +2230,15 @@ case "$LAUNCH" in
   *__HERMESBIN__*)
     HERMES_BIN=$(resolve_hermes_binary) || exit 1
     LAUNCH=${LAUNCH//__HERMESBIN__/$(shell_quote "$HERMES_BIN")}
+    ;;
+esac
+
+case "$LAUNCH" in
+  *__HERMESVPSBRIDGE__*)
+    # A fixed, tracked script inside this firstmate install, not a PATH
+    # search like every resolve_*_binary above (there is no vendor binary to
+    # find - see the hermes-vps launch_template case).
+    LAUNCH=${LAUNCH//__HERMESVPSBRIDGE__/$(shell_quote "$FM_ROOT/bin/fm-hermes-vps-bridge.sh")}
     ;;
 esac
 
@@ -3347,6 +3384,65 @@ hermes_spawn_fail() {  # <detail>
   rovo_endpoint_cleanup
 }
 
+# harness=hermes-vps: the VPS-bridged transport (docs/verification/hermes.md
+# "hermes-vps"). bin/fm-hermes-vps-bridge.py owns the pane, not the real
+# `hermes` binary, so its readiness/delivery signals are markers THIS bridge
+# prints itself rather than anything the vendor CLI renders - a stronger,
+# fully-controlled proof than every launch-then-send harness above, which
+# must infer readiness/delivery from vendor UI text. There is deliberately
+# no composer-emptiness half here: a scrolling event log has no composer for
+# bin/fm-composer-lib.sh to classify.
+hermes_vps_capture() {
+  fm_backend_capture "$BACKEND" "$T" 120 "$W" 2>/dev/null || true
+}
+
+hermes_vps_wait_for_ready() {
+  local pane i=0 max=${FM_HERMES_VPS_READY_POLLS:-60} interval=${FM_HERMES_VPS_POLL_INTERVAL:-0.5}
+  while [ "$i" -lt "$max" ]; do
+    pane=$(hermes_vps_capture)
+    printf '%s\n' "$pane" | grep -Fq 'Hermes VPS bridge ready.' && return 0
+    i=$((i + 1))
+    [ "$i" -ge "$max" ] || sleep "$interval"
+  done
+  return 1
+}
+
+# hermes_vps_session_id: the session_id the bridge minted via session.create,
+# read back from its own printed readiness line (never guessed, never
+# re-derived) so it can be recorded in state/<id>.meta for
+# bin/fm-busy-lib.sh's live status pull and bin/fm-control.sh's lifecycle
+# verbs to use.
+hermes_vps_session_id() {
+  local pane line
+  pane=$(hermes_vps_capture)
+  line=$(printf '%s\n' "$pane" | grep -F 'Hermes VPS bridge ready.' | tail -n1)
+  case "$line" in
+    *'session_id='*) printf '%s' "${line#*session_id=}" ;;
+  esac
+}
+
+hermes_vps_delivery_is_confirmed() {  # <plain-pane-capture>
+  local pane=$1
+  printf '%s\n' "$pane" | grep -qE '^●[[:space:]]*Read the brief at'
+}
+
+hermes_vps_wait_for_delivery() {
+  local pane i=0 max=${FM_HERMES_VPS_DELIVERY_POLLS:-40} interval=${FM_HERMES_VPS_POLL_INTERVAL:-0.5}
+  while [ "$i" -lt "$max" ]; do
+    pane=$(hermes_vps_capture)
+    hermes_vps_delivery_is_confirmed "$pane" && return 0
+    i=$((i + 1))
+    [ "$i" -ge "$max" ] || sleep "$interval"
+  done
+  return 1
+}
+
+hermes_vps_spawn_fail() {  # <detail>
+  printf 'failed: %s\n' "$1" >> "$STATE/$ID.status"
+  echo "error: $1; inspect window $T" >&2
+  rovo_endpoint_cleanup
+}
+
 # The launch-then-confirm gates run after the task record is published, when
 # ORCA_ABORT_CLEANUP is already cleared and neither the abort trap nor a
 # teardown owns this endpoint yet, so a gate failure must close the launched
@@ -4235,7 +4331,7 @@ case "$HARNESS" in
 esac
 LAUNCH=${LAUNCH//__WORKTREE__/$sq_worktree}
 case "$HARNESS" in
-  claude|codex|opencode|pi|pi-signed|grok|kimi|gemini|muse|rovo|agy|hermes)
+  claude|codex|opencode|pi|pi-signed|grok|kimi|gemini|muse|rovo|agy|hermes|hermes-vps)
     LAUNCH="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI $LAUNCH"
     ;;
 esac
@@ -4290,6 +4386,35 @@ spawn_record_traceparent() {
   if [ ! -f "$meta" ] || [ ! -w "$meta" ] \
      || ! awk -F= '$1 != "traceparent"' "$meta" > "$SPAWN_META_TMP" \
      || ! printf 'traceparent=%s\n' "$SPAWN_TRACEPARENT" >> "$SPAWN_META_TMP" \
+     || ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$meta" "task record" "$STATE"; then
+    status=1
+    rm -f "$SPAWN_META_TMP" 2>/dev/null || true
+  fi
+  SPAWN_META_TMP=
+  if [ "$acquired" = 1 ]; then
+    fm_lock_release "$SPAWN_META_LOCK" || status=1
+    SPAWN_META_LOCK_HELD=0
+  fi
+  return "$status"
+}
+
+# hermes_vps_record_session_id: the VPS session_id is only known once the
+# bridge's readiness line has actually been captured, well after task
+# metadata was first published (SPAWN_META_TMP/lock above), so it is folded
+# in with the same lock-then-atomic-rewrite idiom spawn_record_traceparent
+# uses for the same reason (a value discovered after publication).
+hermes_vps_record_session_id() {  # <session-id>
+  local sid=$1 meta="$STATE/$ID.meta" status=0 acquired=0
+  if [ "$SPAWN_META_LOCK_HELD" != 1 ]; then
+    SPAWN_META_LOCK=$(fm_meta_lock_path "$meta") || return 1
+    fm_lock_acquire_wait "$SPAWN_META_LOCK"
+    SPAWN_META_LOCK_HELD=1
+    acquired=1
+  fi
+  SPAWN_META_TMP="$STATE/.$ID.meta.hermesvps.${BASHPID:-$$}"
+  if [ ! -f "$meta" ] || [ ! -w "$meta" ] \
+     || ! awk -F= '$1 != "hermes_vps_session_id"' "$meta" > "$SPAWN_META_TMP" \
+     || ! printf 'hermes_vps_session_id=%s\n' "$sid" >> "$SPAWN_META_TMP" \
      || ! fm_backlog_atomic_transition publish "$SPAWN_META_TMP" "$meta" "task record" "$STATE"; then
     status=1
     rm -f "$SPAWN_META_TMP" 2>/dev/null || true
@@ -4428,6 +4553,39 @@ if [ "$HARNESS" = hermes ]; then
   fi
   if ! hermes_wait_for_delivery; then
     hermes_spawn_fail "hermes brief pointer delivery was not confirmed in window $T"
+    exit 1
+  fi
+fi
+if [ "$HARNESS" = hermes-vps ]; then
+  if ! hermes_vps_wait_for_ready; then
+    hermes_vps_spawn_fail "hermes-vps bridge did not show a verified ready signal before brief delivery in window $T"
+    exit 1
+  fi
+  HERMES_VPS_SESSION_ID=$(hermes_vps_session_id)
+  if [ -z "$HERMES_VPS_SESSION_ID" ]; then
+    hermes_vps_spawn_fail "hermes-vps bridge's readiness line carried no session_id in window $T"
+    exit 1
+  fi
+  HERMES_VPS_POINTER="Read the brief at $BRIEF_REAL and follow it exactly."
+  HERMES_VPS_SUBMIT_RETRIES=${FM_HERMES_VPS_SUBMIT_RETRIES:-3}
+  HERMES_VPS_SUBMIT_SLEEP=${FM_HERMES_VPS_SUBMIT_SLEEP:-${FM_HERMES_VPS_POLL_INTERVAL:-0.5}}
+  HERMES_VPS_SUBMIT_SETTLE=${FM_HERMES_VPS_SUBMIT_SETTLE:-0}
+  if ! HERMES_VPS_SUBMIT_VERDICT=$(fm_backend_send_text_submit \
+      "$BACKEND" "$T" "$HERMES_VPS_POINTER" "$HERMES_VPS_SUBMIT_RETRIES" \
+      "$HERMES_VPS_SUBMIT_SLEEP" "$HERMES_VPS_SUBMIT_SETTLE" "$W"); then
+    hermes_vps_spawn_fail "hermes-vps brief pointer could not be submitted into window $T"
+    exit 1
+  fi
+  if [ "$HERMES_VPS_SUBMIT_VERDICT" = send-failed ]; then
+    hermes_vps_spawn_fail "hermes-vps brief pointer could not be submitted into window $T"
+    exit 1
+  fi
+  if ! hermes_vps_wait_for_delivery; then
+    hermes_vps_spawn_fail "hermes-vps brief pointer delivery was not confirmed in window $T"
+    exit 1
+  fi
+  if ! hermes_vps_record_session_id "$HERMES_VPS_SESSION_ID"; then
+    hermes_vps_spawn_fail "hermes-vps session $HERMES_VPS_SESSION_ID could not be recorded in this task's durable record"
     exit 1
   fi
 fi

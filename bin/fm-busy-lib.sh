@@ -43,28 +43,34 @@
 #   fm-recovery      a documented recovery reset after relaunch
 # Classifier-only sources (never written into a record):
 #   endpoint-gone, herdr-native, grok-regex, rovo-regex, agy-regex, hermes-regex,
-#   muse-session-log, cursor-transcript, missing, malformed, gen-mismatch,
-#   source-mismatch, kimi-unverified, codex-unverified, capture-failed, no-target
+#   muse-session-log, cursor-transcript, hermes-vps-status, missing, malformed,
+#   gen-mismatch, source-mismatch, kimi-unverified, codex-unverified,
+#   capture-failed, no-target
 #
 # Classification (fm_busy_classify): busy | idle | unknown | dead, always
 # with the producing source as the second token. Precedence:
 #   1. dead endpoint (fm_busy_classify_live only) -> dead endpoint-gone
 #   2. standalone Kimi before verification       -> unknown kimi-unverified
-#   3. a valid, gen-matching, source-trusted record -> its state and source
-#   4. no record at all: herdr's native busy verdict is trusted as busy
+#   3. hermes-vps: a live pull, see fm_busy_hermes_vps_agent_running
+#   4. a valid, gen-matching, source-trusted record -> its state and source
+#   5. no record at all: herdr's native busy verdict is trusted as busy
 #      (generation state is sufficient for busy, not for idle), then the
 #      muse session-log and cursor transcript pull sources, then the
 #      Grok/Rovo/AGY temporary regex fallbacks classify a grok, rovo, or agy
 #      task from its rendered tail, then unknown missing
-#   5. malformed, stale, or untrusted records -> unknown, never a fallback
-# Grok, Rovo, AGY, and Hermes are the ONLY rendered-text classifications that
-# survive the redesign, because none of their structured lifecycles was
-# credited-live-verified in the approved audit (Rovo's clean ACP stopReason
-# lives outside the TUI path firstmate drives, see references/harness/rovo.md;
-# agy 1.2.0 exposes no hook surface at all, see references/harness/agy.md;
-# hermes's own hooks surface was not confirmed to carry a turn-granularity
-# signal, see references/harness/hermes.md); each is scoped to its own
-# harness= and can never classify another adapter. The delivery
+#   6. malformed, stale, or untrusted records -> unknown, never a fallback
+# Grok, Rovo, AGY, and hermes (the pane-based `hermes --cli` adapter) are the
+# ONLY rendered-text classifications that survive the redesign, because none
+# of their structured lifecycles was credited-live-verified in the approved
+# audit (Rovo's clean ACP stopReason lives outside the TUI path firstmate
+# drives, see references/harness/rovo.md; agy 1.2.0 exposes no hook surface
+# at all, see references/harness/agy.md; hermes's own hooks surface was not
+# confirmed to carry a turn-granularity signal, see
+# references/harness/hermes.md); each is scoped to its own harness= and can
+# never classify another adapter. hermes-vps (the VPS-bridged transport,
+# references/harness/hermes-vps.md) is NOT a rendered-text classification: it
+# pulls session.status's own structural "Agent Running" field over a live
+# RPC, the same pull-source shape as muse/cursor above. The delivery
 # guards in bin/fm-composer-lib.sh match rendered footers for submit
 # acknowledgement and away-mode supervisor injection only; neither is a
 # recorded worker state source.
@@ -862,6 +868,28 @@ fm_busy_rovo_tail_busy() {
 # turn-end hook and no structural busy/idle signal was found (`hermes hooks`/
 # --accept-hooks exist but were not confirmed to carry one), so this
 # fallback, like rovo's, is the only source; it is never armed as a semantic
+# fm_busy_hermes_vps_agent_running: a live, structural busy pull for the
+# VPS-bridged transport (harness=hermes-vps), grounded in session.status's
+# own literal "Agent Running: Yes"/"Agent Running: No" line - the same
+# rendered-but-authoritative field docs/verification/hermes.md's live VPS
+# transcript confirms, and a strictly better signal than every other
+# hermes-vps sibling's rendered-tail fallback because it comes from a real
+# RPC, not a captured pane. One WS round trip per call (gated-mode auth
+# included), so this is a POLL-rate cost, not a per-classification-call cost
+# that matters at fm-watch.sh's cadence. Prints yes|no|unknown.
+fm_busy_hermes_vps_agent_running() {  # <meta-file>
+  local meta=$1 sid dir out
+  sid=$(fm_meta_get "$meta" hermes_vps_session_id)
+  [ -n "$sid" ] || { printf 'unknown'; return 0; }
+  dir="${FM_BACKEND_LIB_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+  out=$("$dir/fm-hermes-ws.sh" status "$sid" 2>/dev/null) || { printf 'unknown'; return 0; }
+  case "$out" in
+    *'Agent Running: Yes'*) printf 'yes' ;;
+    *'Agent Running: No'*) printf 'no' ;;
+    *) printf 'unknown' ;;
+  esac
+}
+
 # writer (fm_busy_sources_for_harness trusts nothing for hermes). The
 # distinguishing token `msg=interrupt` is matched rather than the whole hint
 # line so glyph/spacing drift across versions cannot silently break the
@@ -923,6 +951,17 @@ fm_busy_classify() {  # <backend> <target> <harness> <id> <state-dir> [tail40]
         busy) printf 'busy cursor-transcript' ;;
         settled) printf 'idle cursor-transcript' ;;
         *) printf 'unknown cursor-transcript' ;;
+      esac
+      return 0
+      ;;
+    hermes-vps*)
+      # Live and structural, unlike every other rendered-tail hermes* fallback
+      # below: pulled straight from the VPS's own session.status RPC rather
+      # than this pane's captured text. See fm_busy_hermes_vps_agent_running.
+      case "$(fm_busy_hermes_vps_agent_running "$state/$id.meta" 2>/dev/null)" in
+        yes) printf 'busy hermes-vps-status' ;;
+        no) printf 'idle hermes-vps-status' ;;
+        *) printf 'unknown hermes-vps-status' ;;
       esac
       return 0
       ;;

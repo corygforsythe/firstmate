@@ -18,7 +18,8 @@
 # back to the repo root when unset. Required: FM_HERMES_WS_BASE_URL, plus
 # either FM_HERMES_WS_TOKEN (loopback/--insecure) or FM_HERMES_WS_USER +
 # FM_HERMES_WS_PASS (gated mode) - fm-hermes-ws.py enforces this and never
-# logs a credential.
+# logs a credential. The env/.env resolution itself is shared with
+# bin/fm-hermes-vps-bridge.sh (bin/fm-hermes-ws-env-lib.sh is the one owner).
 
 set -euo pipefail
 
@@ -27,35 +28,10 @@ FM_HOME="${FM_HOME:-}"
 if [ -z "$FM_HOME" ]; then
   FM_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
 fi
-ENV_FILE="$FM_HOME/.env"
 
-# One KEY=VALUE lookup from a .env-style file: last assignment wins,
-# tolerates a leading "export ", surrounding whitespace, and one layer of
-# matching quotes. Prints nothing when the file or key is absent.
-_hermes_ws_env_get() {
-  local key=$1 file=$2 line val
-  [ -f "$file" ] || return 0
-  line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -n1) || return 0
-  [ -n "$line" ] || return 0
-  val=${line#*=}
-  val=${val#"${val%%[![:space:]]*}"}
-  val=${val%"${val##*[![:space:]]}"}
-  case "$val" in
-    \"*\") val=${val#\"}; val=${val%\"} ;;
-    \'*\') val=${val#\'}; val=${val%\'} ;;
-  esac
-  printf '%s' "$val"
-}
-
-for var in FM_HERMES_WS_BASE_URL FM_HERMES_WS_TOKEN FM_HERMES_WS_USER FM_HERMES_WS_PASS \
-           FM_HERMES_WS_PROVIDER FM_HERMES_WS_ORIGIN FM_HERMES_WS_TIMEOUT; do
-  if [ -z "${!var:-}" ]; then
-    val=$(_hermes_ws_env_get "$var" "$ENV_FILE")
-    if [ -n "$val" ]; then
-      export "$var=$val"
-    fi
-  fi
-done
+# shellcheck source=bin/fm-hermes-ws-env-lib.sh
+. "$SCRIPT_DIR/fm-hermes-ws-env-lib.sh"
+fm_hermes_ws_load_env "$FM_HOME"
 
 PY="$(command -v python3 || true)"
 if [ -z "$PY" ]; then

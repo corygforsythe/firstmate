@@ -333,6 +333,33 @@ EOF
 $(fm_backend_tmux_foreground_args "$target")
 EOF
 
+  # harness=hermes-vps's bridge is the same python-interpreter-argv[1] shape
+  # as Gemini's node-bundle and bare hermes's own script: comm/argv0 alone
+  # (the loops above) never carry its identity, so it needs the same
+  # pid/args-preserving check the Gemini rule already gets. Unlike bare
+  # hermes - which never reaches this classifier because it has no
+  # fm-control.sh lifecycle support to prove alive/dead for - hermes-vps DOES
+  # need a real `alive` verdict here for interrupt/exit to work at all.
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    if fm_hermes_vps_bridge_pid_is_bridge "$pid"; then
+      printf 'alive'
+      return 0
+    fi
+  done <<EOF
+$(fm_backend_tmux_foreground_pids "$target")
+EOF
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if fm_hermes_vps_bridge_args_are_bridge "$name"; then
+      printf 'alive'
+      return 0
+    fi
+  done <<EOF
+$(fm_backend_tmux_foreground_args "$target")
+EOF
+
   comm=$(fm_backend_tmux_current_command "$target") || {
     printf 'unreadable'
     return 0

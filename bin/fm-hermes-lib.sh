@@ -108,3 +108,71 @@ fm_hermes_args_are_hermes() {  # <args>
   done
   return 1
 }
+
+# --- harness=hermes-vps: the VPS-bridged transport's own process identity ---
+#
+# bin/fm-hermes-vps-bridge.py is a distinct python-interpreter-shaped script
+# from the real `hermes` CLI above (it never execs the vendor binary at all -
+# see docs/verification/hermes.md's "hermes-vps" section), so it needs its
+# own structural match rather than widening fm_hermes_path_is_hermes. Both
+# harnesses share the same interpreter-argv[1] shape, so the same
+# skip-flags-then-check-the-script-path pattern applies verbatim.
+
+fm_hermes_vps_bridge_path_is_bridge() {  # <path>
+  local path=$1
+  [ -n "$path" ] || return 1
+  case "$path" in
+    -*) return 1 ;;
+  esac
+  case "${path##*/}" in
+    fm-hermes-vps-bridge.py) return 0 ;;
+  esac
+  return 1
+}
+
+fm_hermes_vps_bridge_pid_is_bridge() {  # <pid>
+  local pid=$1 token argv0='' index=0
+  [ -r "/proc/$pid/cmdline" ] || return 1
+  while IFS= read -r -d '' token; do
+    if [ "$index" -eq 0 ]; then
+      argv0=$token
+      fm_hermes_vps_bridge_path_is_bridge "$argv0" && return 0
+      case "${argv0##*/}" in
+        python3|python3.*|python|Python) ;;
+        *) return 1 ;;
+      esac
+    else
+      case "$token" in
+        -*) ;;
+        *) fm_hermes_vps_bridge_path_is_bridge "$token" && return 0; return 1 ;;
+      esac
+    fi
+    index=$((index + 1))
+  done < "/proc/$pid/cmdline"
+  return 1
+}
+
+fm_hermes_vps_bridge_args_are_bridge() {  # <args>
+  local args=$1 argv0 rest token
+  [ -n "$args" ] || return 1
+  args=${args#"${args%%[![:space:]]*}"}
+  argv0=${args%%[[:space:]]*}
+  fm_hermes_vps_bridge_path_is_bridge "$argv0" && return 0
+  case "${argv0##*/}" in
+    python3|python3.*|python|Python) ;;
+    *) return 1 ;;
+  esac
+  rest=${args#"$argv0"}
+  while [ -n "$rest" ]; do
+    rest=${rest#"${rest%%[![:space:]]*}"}
+    [ -n "$rest" ] || break
+    token=${rest%%[[:space:]]*}
+    rest=${rest#"$token"}
+    case "$token" in
+      -*) continue ;;
+    esac
+    fm_hermes_vps_bridge_path_is_bridge "$token" && return 0
+    return 1
+  done
+  return 1
+}
