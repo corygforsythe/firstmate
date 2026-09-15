@@ -78,6 +78,17 @@
 #      few seconds, cleanly separated from the ready marker's own
 #      newline-less bytes by a leading newline _forward() supplies itself,
 #      never glued onto the marker's line.
+#  13. Submit-first delivery (the fix for a captain-reported hang: a laptop
+#      sleep dropped the connection mid-turn, and the next steered line sat
+#      at [sending...] forever with no response). _submit_or_steer always
+#      tries prompt.submit first and falls back to session.steer only on
+#      the server's own "session busy" rejection (RPC error code 4009),
+#      instead of trusting a local busy flag a lost completion event can
+#      leave stale forever: a message forwarded while that flag is stale
+#      still starts a real, fully-rendered turn (TRIGGER_HANG stands in for
+#      the lost completion event), and a message forwarded while a turn
+#      genuinely is running server-side (TRIGGER_BUSY) still falls back to
+#      session.steer and is reported delivered, not failed.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -1170,6 +1181,154 @@ test_bridge_forwards_inbox_steer_promptly() {
   pass "inbox-steer promptness: a durable fm-send.sh-style steer on an idle bridge produces [sending...] within a few seconds, cleanly separated from the ready marker, not the old ~30-60s-tied cadence"
 }
 
+test_bridge_recovers_from_stale_busy_after_reconnect() {
+  # Captain-reported bug: after a laptop sleep dropped the WS connection
+  # mid-turn, the reconnected bridge left a bare "status" line stuck at
+  # "[sending...]" forever with no response. Root cause: the OLD code chose
+  # prompt.submit vs session.steer from a local self.busy flag that a
+  # message.start sets True and only message.complete/error ever clears -
+  # a connection drop that loses that completion event (TRIGGER_HANG below
+  # stands in for exactly this: the turn never completes) leaves self.busy
+  # wrongly True forever, so the NEXT forwarded line took the steer path.
+  # session.steer's real server behavior (AIAgent.steer) just stashes the
+  # text in memory for the next tool batch to drain - and when there is no
+  # such batch (the turn is really gone), the RPC still succeeds with no
+  # error and no further event ever fires, hanging the pane exactly as
+  # reported. The fix (_submit_or_steer) always tries prompt.submit first
+  # regardless of any locally-tracked busy state; this test proves a SECOND
+  # message forwarded while the first is (falsely, from the old flag's
+  # perspective) still "busy" gets a real, fully-rendered turn instead of
+  # silence - the stub is stateless per RPC, so the only way this second
+  # turn's content can appear at all is if prompt.submit was actually used.
+  local port rpc_log line
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-stale-busy.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  local in_fifo="$TMP_ROOT/bridge-stale-busy.in" out_fifo="$TMP_ROOT/bridge-stale-busy.out"
+  rm -f "$in_fifo" "$out_fifo"
+  mkfifo "$in_fifo" "$out_fifo"
+  exec 3<>"$in_fifo"
+  exec 4<>"$out_fifo"
+  env -i PATH="$PATH" \
+    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
+    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
+    python3 "$BRIDGE" --cwd /tmp/some-worktree \
+      <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-stale-busy.err" &
+  BRIDGE_PID=$!
+
+  line=$(read_line_timeout 4 10)
+  case "$line" in
+    'Hermes VPS bridge ready.'*) ;;
+    *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-stale-busy.err" 2>/dev/null))" ;;
+  esac
+  expect_ready_marker 4 10
+
+  # First turn: never completes (stands in for the completion event lost to
+  # a dropped connection), leaving the OLD code's self.busy stuck True.
+  printf 'TRIGGER_HANG first\n' >&3
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '● TRIGGER_HANG first' ] || fail "expected the delivery-confirmation bullet for the first line, got: $line"
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[sending...]' ] || fail "expected [sending...] for the first line, got: $line"
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[working...]' ] || fail "expected [working...] once the first turn's message.start arrives, got: $line"
+
+  # Second line, forwarded while the first turn is still (falsely) "busy".
+  printf 'second message\n' >&3
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '● second message' ] || fail "expected the delivery-confirmation bullet for the second line, got: $line"
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[sending...]' ] || fail "expected [sending...] for the second line, got: $line"
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[working...]' ] \
+    || fail "expected a SECOND [working...] proving the second message started a real turn via prompt.submit instead of silently vanishing into session.steer, got: $line"
+
+  line=$(read_line_timeout 4 10)
+  [ "$line" = 'stub' ] || fail "expected the second turn's streamed delta content, got: $line"
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[turn complete]' ] || fail "expected the second turn to actually complete, got: $line"
+
+  local submit_count steer_count
+  submit_count=$(grep -c '"method": "prompt.submit"' "$rpc_log" 2>/dev/null || true)
+  steer_count=$(grep -c '"method": "session.steer"' "$rpc_log" 2>/dev/null || true)
+  [ "$submit_count" -eq 2 ] \
+    || fail "expected both the first (hung) and second message to use prompt.submit (2 total), got $submit_count - $(cat "$rpc_log" 2>/dev/null)"
+  [ "$steer_count" -eq 0 ] \
+    || fail "expected session.steer never to be called (the server never reported busy), got $steer_count - a stale local busy flag is routing into steer again"
+
+  kill "$BRIDGE_PID" >/dev/null 2>&1 || true
+  wait "$BRIDGE_PID" 2>/dev/null || true
+  BRIDGE_PID=""
+  exec 3>&- 4>&-
+  stop_stub
+  pass "stale busy after reconnect: a second message sent while a lost/never-completed turn left the old busy flag stuck True still starts a real turn (prompt.submit tried first), instead of silently vanishing into session.steer forever"
+}
+
+test_bridge_falls_back_to_steer_when_server_reports_busy() {
+  # The other half of the fix: prompt.submit-first must not break the
+  # legitimate case where a turn really IS still running server-side. The
+  # stub's TRIGGER_BUSY marker mirrors the real server's own prompt.submit
+  # rejection (RPC error code 4009 "session busy") - _submit_or_steer must
+  # catch exactly this code and fall back to session.steer, and _forward
+  # must report the message delivered (no "delivery failed"), not treat the
+  # first rejection as a hard failure.
+  local port rpc_log line
+  port=$(free_port)
+  rpc_log="$TMP_ROOT/rpc-busy-fallback.jsonl"
+  rm -f "$rpc_log"
+  start_stub "$port" "$rpc_log"
+
+  local in_fifo="$TMP_ROOT/bridge-busy-fallback.in" out_fifo="$TMP_ROOT/bridge-busy-fallback.out"
+  rm -f "$in_fifo" "$out_fifo"
+  mkfifo "$in_fifo" "$out_fifo"
+  exec 3<>"$in_fifo"
+  exec 4<>"$out_fifo"
+  env -i PATH="$PATH" \
+    FM_HERMES_WS_BASE_URL="http://127.0.0.1:$port" \
+    FM_HERMES_WS_TOKEN="$STUB_TOKEN" \
+    python3 "$BRIDGE" --cwd /tmp/some-worktree \
+      <"$in_fifo" >"$out_fifo" 2>"$TMP_ROOT/bridge-busy-fallback.err" &
+  BRIDGE_PID=$!
+
+  line=$(read_line_timeout 4 10)
+  case "$line" in
+    'Hermes VPS bridge ready.'*) ;;
+    *) fail "expected the readiness banner, got: $line (stderr: $(cat "$TMP_ROOT/bridge-busy-fallback.err" 2>/dev/null))" ;;
+  esac
+  expect_ready_marker 4 10
+
+  printf 'TRIGGER_BUSY steer me\n' >&3
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '● TRIGGER_BUSY steer me' ] || fail "expected the delivery-confirmation bullet, got: $line"
+  line=$(read_line_timeout 4 10)
+  [ "$line" = '[sending...]' ] || fail "expected [sending...], got: $line"
+
+  # No further pane output is expected on this path (session.steer's own
+  # stub reply carries no event) - the regression this guards against is a
+  # "delivery failed" line, so give it a bounded window to appear and fail
+  # if it does.
+  if line=$(read_bytes_timeout 4 200 3) && [ -n "$line" ]; then
+    case "$line" in
+      *'delivery failed'*) fail "expected the server-busy rejection to fall back to session.steer and succeed, got a delivery-failed line: $line" ;;
+    esac
+  fi
+
+  local submit_count steer_count
+  submit_count=$(grep -c '"method": "prompt.submit"' "$rpc_log" 2>/dev/null || true)
+  steer_count=$(grep -c '"method": "session.steer"' "$rpc_log" 2>/dev/null || true)
+  [ "$submit_count" -eq 1 ] || fail "expected exactly one prompt.submit attempt before the fallback, got $submit_count"
+  [ "$steer_count" -eq 1 ] || fail "expected exactly one session.steer fallback after the server reported busy, got $steer_count"
+
+  kill "$BRIDGE_PID" >/dev/null 2>&1 || true
+  wait "$BRIDGE_PID" 2>/dev/null || true
+  BRIDGE_PID=""
+  exec 3>&- 4>&-
+  stop_stub
+  pass "server-reported busy: prompt.submit's own 4009 rejection falls back to session.steer and is reported as delivered, not failed"
+}
+
 test_bridge_identity_functions
 test_agent_process_classify_recognizes_bridge
 test_busy_hermes_vps_agent_running_parses_status
@@ -1198,4 +1357,8 @@ stop_bridge
 test_bridge_renders_ready_marker_when_idle_and_absent_while_busy
 stop_bridge
 test_bridge_forwards_inbox_steer_promptly
+stop_bridge
+test_bridge_recovers_from_stale_busy_after_reconnect
+stop_bridge
+test_bridge_falls_back_to_steer_when_server_reports_busy
 stop_bridge

@@ -95,7 +95,16 @@ _OPCODE_PONG = 0xA
 
 class HermesWsError(Exception):
     """A config, auth, protocol, or RPC-level failure. The message is safe to
-    print: no code path here ever interpolates a credential into it."""
+    print: no code path here ever interpolates a credential into it.
+    `code` is the server's own JSON-RPC error code (e.g. 4009 "session
+    busy") when this came from an id-matched RPC error reply, None for
+    every other failure (connection, protocol, timeout) - a caller that
+    needs to react to one specific server-declared condition should check
+    `code` rather than pattern-matching the message text."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def _env_timeout():
@@ -455,7 +464,9 @@ class HermesWsSession:
                     self._pending.append(msg)
                     continue
             if 'error' in msg and msg['error'] is not None:
-                raise HermesWsError(f'{method}: {msg["error"]}')
+                err = msg['error']
+                code = err.get('code') if isinstance(err, dict) else None
+                raise HermesWsError(f'{method}: {err}', code=code)
             return msg.get('result')
 
     def close(self):
