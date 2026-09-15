@@ -374,16 +374,19 @@ class Bridge:
         tool batch left to drain it into. No further event ever fires, so
         the pane hangs at "[sending...]" indefinitely with nothing to show
         it - live-reproduced against the captain's real VPS after a laptop
-        sleep dropped the connection mid-turn. Trying prompt.submit first
-        also gets its own transport rebind (current_transport() ->
-        session["transport"]) even when the server rejects it as busy,
-        which session.steer's handler never does, so a turn that genuinely
-        is still running after a reconnect gets its remaining events routed
-        to the new connection too, instead of only the fallback steer text
-        landing with no rebind - confirmed by reading the vendor server
-        source (docs/verification/hermes.md, "prompt.submit's transport
-        rebind fires before the busy check"), since this is vendor-controlled
-        server behavior no test in this repo can portably prove."""
+        sleep dropped the connection mid-turn. On the local v0.16.0 dev
+        install's source, trying prompt.submit first also gets its own
+        transport rebind (current_transport() -> session["transport"])
+        even when the server rejects it as busy, which session.steer's
+        handler never does, so a turn that genuinely is still running
+        after a reconnect gets its remaining events routed to the new
+        connection too, instead of only the fallback steer text landing
+        with no rebind - see docs/verification/hermes.md, "prompt.submit's
+        transport rebind fires before the busy check on v0.16.0 - NOT
+        confirmed on the real v0.21.2 VPS", for why this ordering is
+        read from vendor source rather than tested, and why it is not yet
+        confirmed for the v0.21.2 deployment this bridge actually talks
+        to in production."""
         try:
             self.session.rpc('prompt.submit', {'session_id': self.session_id, 'text': text})
         except HermesWsError as exc:
