@@ -24,10 +24,11 @@
 #     server-pushed `event` notifications and renders them into this pane's
 #     scrollback (message.delta/message.complete, tool.start/tool.complete,
 #     error), and forwards each line typed into this pane to the VPS
-#     session (prompt.submit while idle, session.steer while a turn is in
-#     flight - the same idle/busy distinction bin/fm-busy-lib.sh's
-#     hermes-vps classifier separately confirms via a live session.status
-#     RPC, never from this bridge's own in-memory flag).
+#     session by always trying prompt.submit first, falling back to
+#     session.steer only when the server itself rejects the submit as
+#     "session busy" (RPC error code 4009) - see _submit_or_steer's
+#     docstring for why this asks the server instead of trusting a local
+#     busy flag across a reconnect.
 #   - This pane never runs the real `hermes` binary and never touches this
 #     machine's terminal/file tools for the VPS session's own turns; the
 #     ONE exception is the launch brief itself (see "Brief delivery"
@@ -175,8 +176,8 @@
 #
 # A bare "❯" line renders once whenever the session becomes idle and ready
 # for a new line: after start()'s readiness banner, and after every
-# message.complete/error event resets self.busy to False. Because this is
-# an append-only scrollback, "absent while a submission is in flight" means
+# message.complete/error event. Because this is an append-only scrollback,
+# "absent while a submission is in flight" means
 # no NEW "❯" line is printed between a "[sending...]" and the next idle
 # transition - the same tail-is-current-state convention
 # bin/fm-composer-lib.sh's own AGENT_PROMPT_GLYPHS comment documents for
@@ -321,7 +322,6 @@ class Bridge:
         self.inbox_dir = inbox_dir
         self.session = HermesWsSession()
         self.session_id = None
-        self.busy = False
         self.brief_delivered = False
         self._shutdown = False
         self._stdin_fd = sys.stdin.fileno()
@@ -358,13 +358,44 @@ class Bridge:
         print(f'{READY_PREFIX} session_id={self.session_id}', flush=True)
         self._print_ready_marker()
 
+    def _submit_or_steer(self, text):
+        """Always tries prompt.submit first, falling back to session.steer
+        only when the server rejects the submit as busy (RPC error code
+        4009, "session busy" - tui_gateway/server.py's prompt.submit
+        handler). This asks the SERVER for the real turn state instead of
+        trusting a locally-tracked busy flag, which a dropped/reconnected
+        connection can leave stale: a turn that finished, errored, or was
+        lost server-side while this bridge was disconnected leaves no
+        signal that would clear a local flag, so a steer sent on that stale
+        belief lands on session.steer's own real behavior (AIAgent.steer:
+        "the text lands on the last tool result of the next tool batch") -
+        an RPC that succeeds and returns {"status": "queued"} with no error
+        at all, but the text sits in memory forever because there is no
+        tool batch left to drain it into. No further event ever fires, so
+        the pane hangs at "[sending...]" indefinitely with nothing to show
+        it - live-reproduced against the captain's real VPS after a laptop
+        sleep dropped the connection mid-turn. Trying prompt.submit first
+        also gets its own transport rebind (current_transport() ->
+        session["transport"]), which session.steer's handler never does, so
+        a turn that genuinely is still running after a reconnect gets its
+        remaining events routed to the new connection too, instead of only
+        the fallback steer text landing with no rebind."""
+        try:
+            self.session.rpc('prompt.submit', {'session_id': self.session_id, 'text': text})
+        except HermesWsError as exc:
+            if exc.code == 4009:
+                self.session.rpc('session.steer', {'session_id': self.session_id, 'text': text})
+                return
+            raise
+
     def _forward(self, text):
-        """Submit or steer <text> depending on the last-observed turn state.
-        A real RPC failure is printed into the pane rather than swallowed -
-        a captain steering a wedged session needs to see that, not silence.
-        Returns True once the RPC is confirmed sent, False otherwise, so a
-        caller with its own delivery-then-acknowledge contract (the inbox
-        poll below) never acknowledges a delivery that never happened.
+        """Deliver <text> to the VPS session (see _submit_or_steer for the
+        submit-vs-steer choice). A real RPC failure is printed into the pane
+        rather than swallowed - a captain steering a wedged session needs to
+        see that, not silence. Returns True once the RPC is confirmed sent,
+        False otherwise, so a caller with its own delivery-then-acknowledge
+        contract (the inbox poll below) never acknowledges a delivery that
+        never happened.
         Prints SENDING_LINE first: this is the one choke point every
         submission path shares, so it is the earliest point-in-time local
         signal available without inventing a second one per caller - see the
@@ -378,8 +409,7 @@ class Bridge:
         self._prompt_pending = False
         print(f'{prefix}{SENDING_LINE}', flush=True)
         try:
-            method = 'session.steer' if self.busy else 'prompt.submit'
-            self.session.rpc(method, {'session_id': self.session_id, 'text': text})
+            self._submit_or_steer(text)
             return True
         except HermesWsError as exc:
             # One reconnect-and-retry: the connection may have dropped (see
@@ -388,7 +418,7 @@ class Bridge:
                 print(f'[fm-hermes-vps-bridge] delivery failed: {exc}', flush=True)
                 return False
             try:
-                self.session.rpc(method, {'session_id': self.session_id, 'text': text})
+                self._submit_or_steer(text)
                 return True
             except HermesWsError as exc2:
                 print(f'[fm-hermes-vps-bridge] delivery failed: {exc2}', flush=True)
@@ -583,7 +613,6 @@ class Bridge:
         etype = payload.get('type')
         data = payload.get('payload') or {}
         if etype == 'message.start':
-            self.busy = True
             self._turn_text_buf = ''
             # Visibility fix: the pane is a scrolling event-rendered log with
             # no composer/spinner, so a real turn that takes many seconds
@@ -601,7 +630,6 @@ class Bridge:
                 sys.stdout.flush()
                 self._turn_text_buf += text
         elif etype == 'message.complete':
-            self.busy = False
             status = data.get('status', 'complete')
             print(f'\n[turn {status}]', flush=True)
             # message.complete's own "text" field is NOT reliably the turn's
@@ -631,7 +659,6 @@ class Bridge:
             summary = data.get('summary') or ''
             print(f'[tool complete] {name} {summary}'.rstrip(), flush=True)
         elif etype == 'error':
-            self.busy = False
             message = data.get('message', envelope)
             print(f'\n[error] {message}', flush=True)
             self._print_ready_marker()

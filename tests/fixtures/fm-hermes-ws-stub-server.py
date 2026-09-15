@@ -215,6 +215,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     _send_text(self.wfile, json.dumps(
                         {'jsonrpc': '2.0', 'id': req_id,
                          'error': {'code': -32000, 'message': 'stub rpc error'}}))
+                elif 'TRIGGER_BUSY' in text:
+                    # Mirrors the real server's own rejection when a turn is
+                    # already running (tui_gateway/server.py's prompt.submit
+                    # handler: session["running"] truthy -> error 4009
+                    # "session busy"), never sending message.start at all -
+                    # used by tests/fm-hermes-vps-bridge.test.sh to prove the
+                    # bridge falls back to session.steer only on this exact
+                    # server-declared condition, not on a locally-guessed one.
+                    _send_text(self.wfile, json.dumps(
+                        {'jsonrpc': '2.0', 'id': req_id,
+                         'error': {'code': 4009, 'message': 'session busy'}}))
                 else:
                     _send_text(self.wfile, _rpc_result(req_id, {'status': 'streaming'}))
                     _send_text(self.wfile, json.dumps(

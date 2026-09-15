@@ -62,6 +62,11 @@ The pane has no composer, spinner, or busy state of any kind (see "Composer" abo
 The bridge now prints a bare `[working...]` line on every `message.start`, the earliest point-in-time signal the event stream offers without adding a new polling loop; it is a pane log line like every other rendered marker, never cleared in place, and the turn's own later `message.delta`/`tool.start`/`[turn <status>]` lines are what tell the reader the wait ended.
 Live-verified (offline, no VPS credentials in a task worktree - see `docs/verification/hermes.md`'s "hermes-vps: working indicator" section) with a stub-driven multi-second delay standing in for a real slow turn (e.g. a `sleep`-based VPS command): `[working...]` renders immediately after submission, nothing else renders during the delay, and the eventual content plus `[turn complete]` land once the response arrives.
 
+### Submit-vs-steer delivery
+
+`_forward()` delivers through `_submit_or_steer()` (`bin/fm-hermes-vps-bridge.py`'s own docstring is the owner of the mechanism): it always tries `prompt.submit` first and falls back to `session.steer` only on the server's own "session busy" rejection (RPC error code 4009), never from a locally-tracked busy flag.
+A dropped/reconnected connection can lose the `message.complete`/`error` event that would otherwise clear such a flag, and `session.steer`'s real server behavior queues text for a tool batch that may never arrive - an RPC that succeeds with no error, but a pane that hangs at `[sending...]` forever with nothing to show for it; live-reproduced against the captain's real VPS after a laptop sleep dropped the connection mid-turn.
+
 ### Sending indicator
 
 `[working...]` itself only ever rendered once the SERVER confirmed the turn (`message.start`), i.e. after the full round trip to the VPS had already begun - a captain pressing Enter got no feedback at all until that round trip completed, worse on a slow network hop.
@@ -73,7 +78,7 @@ Direct pane-typed input was always immediate (proven within milliseconds against
 ### Ready-for-input marker
 
 The pane had no visible signal that it was idle and ready to accept a line at all, unlike every other verified harness's own composer.
-A bare `❯` (the same idle-composer glyph `bin/fm-composer-lib.sh` already documents for claude), followed by a trailing space and **no newline**, renders once whenever the bridge becomes idle: right after the readiness banner, and after every `message.complete`/`error` event resets `self.busy` to `False`.
+A bare `❯` (the same idle-composer glyph `bin/fm-composer-lib.sh` already documents for claude), followed by a trailing space and **no newline**, renders once whenever the bridge becomes idle: right after the readiness banner, and after every `message.complete`/`error` event.
 No trailing newline is deliberate: a real attached terminal's own input echo continues on the marker's own line, so it reads as an inline prompt rather than a label sitting over an empty line below it (live-verified against the real VPS, both a raw pty and a real tmux pane - `docs/verification/hermes.md`'s "did not survive real-world use" section has the exact before/after bytes).
 Because the pane can no longer assume every earlier print left it on a fresh line, `self._prompt_pending` tracks whether the bare marker is still the last thing printed; `_forward()` prepends one newline exactly when nothing has cleared it since the marker (only `poll_inbox()`'s direct `_forward()` call needs this, since it never echoes the line first the way pane-typed input does), so an inbox-delivered `[sending...]` still starts its own line instead of gluing onto the marker's.
 Because the pane is an append-only scrollback with no way to erase a prior line, "absent while a submission is in flight" means exactly that no NEW `❯` line is printed between a `[sending...]` and the next idle transition - the reader judges the pane's current state from its tail, the same convention every composer-having harness already uses.
