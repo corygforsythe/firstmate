@@ -376,10 +376,14 @@ class Bridge:
         it - live-reproduced against the captain's real VPS after a laptop
         sleep dropped the connection mid-turn. Trying prompt.submit first
         also gets its own transport rebind (current_transport() ->
-        session["transport"]), which session.steer's handler never does, so
-        a turn that genuinely is still running after a reconnect gets its
-        remaining events routed to the new connection too, instead of only
-        the fallback steer text landing with no rebind."""
+        session["transport"]) even when the server rejects it as busy,
+        which session.steer's handler never does, so a turn that genuinely
+        is still running after a reconnect gets its remaining events routed
+        to the new connection too, instead of only the fallback steer text
+        landing with no rebind - confirmed by reading the vendor server
+        source (docs/verification/hermes.md, "prompt.submit's transport
+        rebind fires before the busy check"), since this is vendor-controlled
+        server behavior no test in this repo can portably prove."""
         try:
             self.session.rpc('prompt.submit', {'session_id': self.session_id, 'text': text})
         except HermesWsError as exc:

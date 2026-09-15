@@ -617,3 +617,31 @@ b'\r\n[sending...]\r\n[working...]\r\n...\r\n[turn complete]\r\n\xe2\x9d\xaf '
 Also confirmed in a real tmux pane against the real VPS (not just a raw pty): a captain-typed line still produces `[sending...]` within single-digit milliseconds of pressing Enter (unaffected by this fix, matching the section above), and `tmux capture-pane` shows the marker and a subsequent typed line sharing one visual row instead of the marker occupying an empty row by itself.
 
 **Test coverage**: `tests/fm-hermes-vps-bridge.test.sh` gained `test_bridge_forwards_inbox_steer_promptly` (pins the inbox-promptness fix: a steer dropped into an idle bridge's `--inbox-dir` must produce `[sending...]` within a few seconds, not the old ~30-60s-tied cadence, and the marker/sending boundary must never glue together) and a new `expect_ready_marker` helper used by every existing ready-marker assertion, which reads the marker's exact bytes (a bare `read -r` line read cannot: the marker no longer ends in a newline) and confirms nothing - in particular no trailing newline - follows it until new input is submitted. bash 3.2 (macOS's system bash, this suite's actual runtime) has no `read -N`, so the new `read_bytes_timeout` helper drives a small `python3 os.read()`/`select()` reader against the same already-open fd instead.
+
+## hermes-vps: `prompt.submit`'s transport rebind fires before the busy check - confirmed by source, not by test
+
+Confirmed 2026-09-15 by reading the installed vendor source directly (`~/.hermes/hermes-agent/tui_gateway/server.py`, the same v0.16.0 install this record's "Subject" section pins), in response to a review finding that `bin/fm-hermes-vps-bridge.py`'s `_submit_or_steer` docstring asserted a rebind-on-reject behavior neither the offline stub server nor any test in this repo could prove.
+
+The `prompt.submit` RPC handler (`tui_gateway/server.py:4526-4540`):
+
+```python
+@method("prompt.submit")
+def _(rid, params: dict) -> dict:
+    sid, text = params.get("session_id", ""), params.get("text", "")
+    ...
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    # Re-bind to the current client transport for this request. This keeps
+    # streaming events on the active websocket even if an earlier disconnect
+    # or fallback moved the session transport to stdio.
+    if (t := current_transport()) is not None:
+        session["transport"] = t
+    with session["history_lock"]:
+        if session.get("running"):
+            return _err(rid, 4009, "session busy")
+```
+
+The transport rebind (`session["transport"] = t`) runs unconditionally on every `prompt.submit` call that resolves a session, strictly before the `session.get("running")` check that returns the `4009 "session busy"` error. So a `prompt.submit` rejected as busy still rebinds the session's transport to the caller's current connection first - a turn genuinely still running server-side after a reconnect gets its remaining events routed to the new connection even though the submit itself was rejected.
+
+This is vendor-controlled server behavior, not something `bin/fm-hermes-vps-bridge.py` causes or enforces, and the offline stub server used by `tests/fm-hermes-vps-bridge.test.sh` has no session/transport-routing model that could prove this without reimplementing a meaningful slice of the real server's session internals - so this fact is recorded here by source inspection, the same way the `session.create` `cwd`-not-honored finding above is, rather than pinned by an executable test. Re-confirm against the installed source if `~/.hermes/hermes-agent` is upgraded past v0.16.0, since this ordering is vendor-controlled and could change.
