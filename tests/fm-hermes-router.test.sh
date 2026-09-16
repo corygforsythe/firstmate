@@ -198,6 +198,7 @@ test_host_env_file_wins_over_home_env() {
   printf 'FM_HERMES_WS_BASE_URL=http://home-env:9119\nFM_HERMES_WS_TOKEN=hometoken\n' > "$home/.env"
   printf 'FM_HERMES_WS_BASE_URL=http://resolved-host:9119\n' > "$TMP_ROOT/envprecedence-hostfile"
 
+  # shellcheck disable=SC2016 # single quotes are deliberate: ENV_LIB/TMP_ROOT/home expand via the outer quote break-out, not in the child shell
   out=$(env -i PATH="$PATH" bash -c '
     set -eu
     . "'"$ENV_LIB"'"
@@ -208,6 +209,7 @@ test_host_env_file_wins_over_home_env() {
   assert_contains "$out" "BASE_URL=http://resolved-host:9119" "the resolved host's base_url did not win over .env"
   assert_contains "$out" "TOKEN=hometoken" ".env should still fill a field the host file left unset"
 
+  # shellcheck disable=SC2016 # single quotes are deliberate: ENV_LIB/home expand via the outer quote break-out, not in the child shell
   out=$(env -i PATH="$PATH" bash -c '
     set -eu
     . "'"$ENV_LIB"'"
