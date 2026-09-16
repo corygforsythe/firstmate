@@ -143,8 +143,8 @@ fm_hermes_router_write_host_env() {
 # fm_hermes_router_host_present <fm-home> <host-id> -> success when
 # <host-id> is "default" or is present in the registry, failure otherwise.
 # Used by a relaunch to prove a previously recorded host has not been
-# removed from the registry before reusing it (AGENTS.md's "never silently
-# move hosts on relaunch" contract) without writing anything.
+# removed from the registry before reusing it (this router's own contract:
+# never silently move hosts on relaunch) without writing anything.
 fm_hermes_router_host_present() {
   local fm_home=$1 host_id=$2 hosts_json
   [ "$host_id" != default ] || return 0

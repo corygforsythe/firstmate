@@ -73,12 +73,15 @@
 #   registered host's capabilities are a superset of the given tags rather
 #   than silently dispatching to a mismatched host. Refused when the
 #   resolved harness is not hermes-vps, and refused on --relaunch, which
-#   always reuses the task's already-recorded hermes_host= instead (AGENTS.md
-#   section 7's "never silently move hosts on relaunch" contract) -
+#   always reuses the task's already-recorded hermes_host= instead (this
+#   router's own contract: never silently move hosts on relaunch) -
 #   bin/fm-hermes-router-lib.sh's fm_hermes_router_host_present proves that
 #   recorded host is still registered before reuse. Omitted or empty matches
-#   every host with no declared capabilities, including the single implicit
-#   host used when the registry is absent or empty.
+#   any registered host whose capabilities are a superset of the (empty)
+#   requirement - i.e. any host, including ones with declared capabilities
+#   like "gpu" - with ties broken by first-listed-wins in
+#   config/hermes-hosts.json; the single implicit host is used when the
+#   registry is absent or empty.
 #   Spawn-capable backends are the reference tmux adapter and experimental
 #   herdr, zellij, orca, and cmux. Orca owns both the task worktree and
 #   terminal, so ship/scout Orca spawns do not run treehouse get; cmux is a
