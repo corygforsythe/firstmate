@@ -1,0 +1,71 @@
+$ FM_HOME=<multi-host-fm-home> bin/fm-hermes-router.sh list
+[
+  {
+    "id": "vps-general",
+    "base_url": "http://vps.example.com:9119",
+    "token": "tok-vps",
+    "user": null,
+    "pass": null,
+    "provider": null,
+    "origin": null,
+    "timeout": null,
+    "capabilities": []
+  },
+  {
+    "id": "gpu-box",
+    "base_url": "http://gpu.example.com:9119",
+    "token": "tok-gpu",
+    "user": null,
+    "pass": null,
+    "provider": null,
+    "origin": null,
+    "timeout": null,
+    "capabilities": [
+      "gpu"
+    ]
+  },
+  {
+    "id": "airgap-lab",
+    "base_url": "http://10.0.0.5:9119",
+    "token": "tok-airgap",
+    "user": null,
+    "pass": null,
+    "provider": null,
+    "origin": null,
+    "timeout": null,
+    "capabilities": [
+      "air-gapped"
+    ]
+  },
+  {
+    "id": "gpu-airgap-lab",
+    "base_url": "http://10.0.0.9:9119",
+    "token": "tok-gpu-airgap",
+    "user": null,
+    "pass": null,
+    "provider": null,
+    "origin": null,
+    "timeout": null,
+    "capabilities": [
+      "gpu",
+      "air-gapped"
+    ]
+  }
+]
+
+
+$ bin/fm-hermes-router.sh select   # no capability requirement
+fm-hermes-router: 4 hosts match [] (vps-general, gpu-box, airgap-lab, gpu-airgap-lab) - picked the first-listed, 'vps-general'; this is a naive v1 tie-break, not final routing policy
+vps-general
+
+$ bin/fm-hermes-router.sh select gpu
+fm-hermes-router: 2 hosts match [gpu] (gpu-box, gpu-airgap-lab) - picked the first-listed, 'gpu-box'; this is a naive v1 tie-break, not final routing policy
+gpu-box
+
+$ bin/fm-hermes-router.sh select gpu air-gapped
+fm-hermes-router: selected host 'gpu-airgap-lab' for required capabilities [gpu,air-gapped]
+gpu-airgap-lab
+
+$ bin/fm-hermes-router.sh select quantum   # no host has this capability
+error: no registered Hermes host carries every required capability [quantum]; registered hosts: [{"id":"vps-general","capabilities":[]},{"id":"gpu-box","capabilities":["gpu"]},{"id":"airgap-lab","capabilities":["air-gapped"]},{"id":"gpu-airgap-lab","capabilities":["gpu","air-gapped"]}]
+exit status: 1
