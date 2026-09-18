@@ -475,7 +475,7 @@ Absent or empty, behavior is unchanged from the pre-registry single-host path: t
 ]
 ```
 
-The file is a JSON array; every entry needs a non-empty, unique string `id`, and every other field is optional exactly like its `FM_HERMES_WS_*` counterpart in `bin/fm-hermes-ws.py`'s own header contract - a field a host omits falls through to `$FM_HOME/.env` at launch, the same "first setter wins" convention `fm_hermes_ws_load_env_file` already uses.
+The file is a JSON array; every entry needs a non-empty, unique string `id` other than the reserved `"default"` (which means the implicit pre-registry single host and is refused if used here), and every other field is optional exactly like its `FM_HERMES_WS_*` counterpart in `bin/fm-hermes-ws.py`'s own header contract - a field a host omits falls through to `$FM_HOME/.env` at launch, the same "first setter wins" convention `fm_hermes_ws_load_env_file` already uses.
 `capabilities` is an optional array of free-form string tags; an omitted array means the host declares none.
 
 `bin/fm-spawn.sh --hermes-capabilities <tag[,tag...]>` requests a host whose `capabilities` are a superset of the given tags for a fresh (non-relaunch) `harness=hermes-vps` spawn, refused for every other harness.

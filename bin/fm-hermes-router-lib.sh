@@ -36,8 +36,8 @@ fm_hermes_router_registry_path() {
 # every registered host (id, capabilities, and whichever FM_HERMES_WS_*
 # fields it set, each null when unset), or "[]" when the registry is absent
 # or empty. Refuses loudly (nonzero, message on stderr) on malformed JSON, a
-# missing/empty "id", a duplicate id, or a non-array-of-strings
-# "capabilities".
+# missing/empty "id", a duplicate id, the reserved id "default", or a
+# non-array-of-strings "capabilities".
 fm_hermes_router_hosts_json() {
   local fm_home=$1 reg
   reg=$(fm_hermes_router_registry_path "$fm_home")
@@ -52,6 +52,10 @@ fm_hermes_router_hosts_json() {
   fi
   if ! jq -e '(map(.id) | length) == (map(.id) | unique | length)' "$reg" >/dev/null 2>&1; then
     echo "error: $reg has duplicate host \"id\" values" >&2
+    return 1
+  fi
+  if jq -e 'any(.[]; .id == "default")' "$reg" >/dev/null 2>&1; then
+    echo "error: $reg: \"default\" is a reserved host id (it means the implicit pre-router single host) and cannot be used for a registered host" >&2
     return 1
   fi
   if ! jq -e 'all(.[]; (.capabilities // []) | type == "array" and all(.[]; type == "string"))' \

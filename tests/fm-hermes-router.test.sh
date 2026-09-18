@@ -10,8 +10,9 @@
 #   2. Capability selection matches by superset, refuses loudly when no host
 #      qualifies, and reports (never silently resolves) a multi-match
 #      tie-break.
-#   3. Malformed registries (duplicate id, non-array capabilities) refuse
-#      loudly rather than being parsed partially.
+#   3. Malformed registries (duplicate id, non-array capabilities, the
+#      reserved "default" id) refuse loudly rather than being parsed
+#      partially.
 #   4. fm_hermes_router_write_host_env writes only a resolved host's set
 #      fields, nothing for "default", and refuses an unregistered host id.
 #   5. bin/fm-hermes-ws-env-lib.sh's generic fm_hermes_ws_load_env_file: a
@@ -137,7 +138,15 @@ test_malformed_registry_refuses_loudly() {
   status=$?
   [ "$status" -ne 0 ] || fail "a host with no id should refuse rather than being silently skipped"
 
-  pass "router: malformed registries (duplicate id, non-array capabilities, missing id) refuse loudly"
+  home="$TMP_ROOT/malformed-reserved-default"
+  mkdir -p "$home"
+  write_registry "$home" '[{"id":"default","base_url":"http://gpu-host:9119","token":"secrettoken","capabilities":["gpu"]}]'
+  err=$(fm_hermes_router_hosts_json "$home" 2>&1 >/dev/null)
+  status=$?
+  [ "$status" -ne 0 ] || fail "a registered host using the reserved id 'default' should refuse rather than silently mis-routing credentials"
+  assert_contains "$err" "default" "the reserved-id refusal did not name the problem"
+
+  pass "router: malformed registries (duplicate id, non-array capabilities, missing id, reserved 'default' id) refuse loudly"
 }
 
 # --- write_host_env --------------------------------------------------------
