@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--hermes-capabilities <tag[,tag...]>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] [--hermes-capabilities <tag[,tag...]>]
 #        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
@@ -66,6 +66,22 @@
 #   bin/fm-backend.sh's fm_backend_detect, with cmux fallback details in
 #   docs/cmux-backend.md),
 #   then tmux.
+#   --hermes-capabilities <tag[,tag...]> selects a specific Hermes host for a
+#   fresh (non-relaunch) hermes-vps spawn: bin/fm-hermes-router-lib.sh
+#   resolves it against config/hermes-hosts.json (docs/configuration.md
+#   "Hermes hosts" owns the registry schema), refusing loudly when no
+#   registered host's capabilities are a superset of the given tags rather
+#   than silently dispatching to a mismatched host. Refused when the
+#   resolved harness is not hermes-vps, and refused on --relaunch, which
+#   always reuses the task's already-recorded hermes_host= instead (this
+#   router's own contract: never silently move hosts on relaunch) -
+#   bin/fm-hermes-router-lib.sh's fm_hermes_router_host_present proves that
+#   recorded host is still registered before reuse. Omitted or empty matches
+#   any registered host whose capabilities are a superset of the (empty)
+#   requirement - i.e. any host, including ones with declared capabilities
+#   like "gpu" - with ties broken by first-listed-wins in
+#   config/hermes-hosts.json; the single implicit host is used when the
+#   registry is absent or empty.
 #   Spawn-capable backends are the reference tmux adapter and experimental
 #   herdr, zellij, orca, and cmux. Orca owns both the task worktree and
 #   terminal, so ship/scout Orca spawns do not run treehouse get; cmux is a
@@ -299,6 +315,13 @@
 #                  hermes-vps bridge so it polls and delivers steering messages the
 #                  remote agent cannot read itself (.agents/skills/harness-adapters/
 #                  references/harness/hermes-vps.md "Status, report, and steering")
+#     __HERMESVPSHOSTENVFILE__ absolute path to state/<task-id>.hermes-host-env,
+#                  written by this script (bin/fm-hermes-router-lib.sh's
+#                  fm_hermes_router_write_host_env) with the resolved host's
+#                  FM_HERMES_WS_* values, or left empty for the single implicit
+#                  host; the bridge loads it before $FM_HOME/.env so it wins
+#                  exactly like an already-exported env var would
+#                  (docs/configuration.md "Hermes hosts")
 # Verified per-harness turn-end hooks are installed automatically where enabled; some live outside the worktree.
 # Kimi uses one surgically installed Firstmate region in $HOME/.kimi-code/config.toml,
 # a firstmate-owned global hook and registry, and a gitignored per-task pointer.
@@ -519,6 +542,8 @@ fm_backlog_directory_present "$STATE" "state directory" || {
 . "$SCRIPT_DIR/fm-dod-lib.sh"
 # shellcheck source=bin/fm-trace-context-lib.sh
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
+# shellcheck source=bin/fm-hermes-router-lib.sh
+. "$SCRIPT_DIR/fm-hermes-router-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
 # shellcheck source=bin/fm-timeout-lib.sh
@@ -538,6 +563,7 @@ BACKEND_ARG=
 MODE=
 YOLO=
 TRACEPARENT_ARG=
+HERMES_CAPS_ARG=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
@@ -545,6 +571,7 @@ BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
 TRACEPARENT_SET=0
+HERMES_CAPS_SET=0
 RELAUNCH=0
 POS=()
 want_value=
@@ -561,6 +588,7 @@ for a in "$@"; do
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
       traceparent) TRACEPARENT_ARG=$a; TRACEPARENT_SET=1 ;;
+      hermes_capabilities) HERMES_CAPS_ARG=$a; HERMES_CAPS_SET=1 ;;
       *) echo "error: internal parser state for --$want_value" >&2; exit 1 ;;
     esac
     want_value=
@@ -584,6 +612,8 @@ for a in "$@"; do
     --yolo=*) YOLO=${a#--yolo=}; YOLO_SET=1 ;;
     --traceparent) want_value=traceparent ;;
     --traceparent=*) TRACEPARENT_ARG=${a#--traceparent=}; TRACEPARENT_SET=1 ;;
+    --hermes-capabilities) want_value=hermes_capabilities ;;
+    --hermes-capabilities=*) HERMES_CAPS_ARG=${a#--hermes-capabilities=}; HERMES_CAPS_SET=1 ;;
     *) POS+=("$a") ;;
   esac
 done
@@ -595,6 +625,7 @@ done
 [ "$MODE_SET" -eq 0 ] || [ -n "$MODE" ] || { echo "error: --mode requires a non-empty value" >&2; exit 1; }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || { echo "error: --yolo requires a non-empty value" >&2; exit 1; }
 [ "$TRACEPARENT_SET" -eq 0 ] || [ -n "$TRACEPARENT_ARG" ] || { echo "error: --traceparent requires a non-empty value" >&2; exit 1; }
+[ "$HERMES_CAPS_SET" -eq 0 ] || [ -n "$HERMES_CAPS_ARG" ] || { echo "error: --hermes-capabilities requires a non-empty value" >&2; exit 1; }
 # A parent-delivered carrier replaces this home's own resolution, so it is
 # refused unless it is a secondmate spawn carrying a strictly valid W3C value.
 # Nothing else may reach the pane's TRACEPARENT export.
@@ -622,6 +653,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
   [ "$KIND_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded kind; --scout/--secondmate cannot override it" >&2; exit 1; }
   [ "$MODE_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded delivery mode; --mode cannot override it" >&2; exit 1; }
   [ "$YOLO_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded yolo posture; --yolo cannot override it" >&2; exit 1; }
+  [ "$HERMES_CAPS_SET" -eq 0 ] || { echo "error: --relaunch reuses the task's recorded Hermes host; --hermes-capabilities cannot override it" >&2; exit 1; }
 else
   # Delivery contract (AGENTS.md section 7). A ship task's mode and yolo are
   # firstmate's per-task decision, so they are required and closed-set validated
@@ -1208,6 +1240,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
+  [ "$HERMES_CAPS_SET" -eq 0 ] || shared_args+=(--hermes-capabilities "$HERMES_CAPS_ARG")
   # One delivery contract applies to every pair in a batch, exactly like the shared
   # harness. Each pair still re-validates it against its own brief, so a batch
   # spanning several modes is two invocations rather than a silent mixed dispatch.
@@ -1354,6 +1387,7 @@ RAW_LAUNCH=0
 # validation teardown uses, so a malformed, ambiguous, or foreign record
 # refuses here exactly as it refuses there.
 RELAUNCH_PRIOR_HARNESS=
+RELAUNCH_HERMES_HOST=
 if [ "$RELAUNCH" -eq 1 ]; then
   [ "${#POS[@]}" -eq 1 ] || {
     echo "error: --relaunch takes the task id only; its project or home comes from the task's own record" >&2
@@ -1393,6 +1427,7 @@ if [ "$RELAUNCH" -eq 1 ]; then
     exit 1
   }
   RELAUNCH_PRIOR_HARNESS=$(fm_meta_get "$RELAUNCH_META" harness)
+  RELAUNCH_HERMES_HOST=$(fm_meta_get "$RELAUNCH_META" hermes_host)
   KIND=$(fm_meta_get "$RELAUNCH_META" kind)
   [ -n "$KIND" ] || KIND=ship
   MODE=$(fm_meta_get "$RELAUNCH_META" mode)
@@ -1792,7 +1827,7 @@ launch_template() {
     # the contract) - the remote VPS agent has no path back to this Mac's
     # filesystem at all, so the bridge, which runs locally, is the one
     # process that ever touches these paths on its behalf.
-    hermes-vps) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESVPSBRIDGE__ --cwd __WORKTREE__ --status-file __HERMESVPSSTATUSFILE__ --report-file __HERMESVPSREPORTFILE__ --inbox-dir __HERMESVPSINBOXDIR__' ;;
+    hermes-vps) printf '%s' 'env -u CLAUDECODE -u PI_CODING_AGENT -u GROK_AGENT -u FM_PI_HARNESS __HERMESVPSBRIDGE__ --cwd __WORKTREE__ --status-file __HERMESVPSSTATUSFILE__ --report-file __HERMESVPSREPORTFILE__ --inbox-dir __HERMESVPSINBOXDIR__ --host-env-file __HERMESVPSHOSTENVFILE__' ;;
     *) return 1 ;;
   esac
 }
@@ -1833,6 +1868,28 @@ case "$ARG3" in
     LAUNCH=$(launch_template "$HARNESS" "$KIND") || { echo "error: unknown harness '$HARNESS'; pass a raw launch command to use an unverified adapter" >&2; exit 1; }
     ;;
 esac
+
+# Multi-host Hermes routing (bin/fm-hermes-router-lib.sh, docs/configuration.md
+# "Hermes hosts"): resolved once HARNESS is final so it applies identically
+# whichever way HARNESS got here (explicit flag, dispatch config, or a
+# relaunch's recorded value). HERMES_HOST_ID stays empty for every other
+# harness, where this whole layer is a no-op.
+HERMES_HOST_ID=
+if [ -n "$HERMES_CAPS_ARG" ] && [ "$HARNESS" != hermes-vps ]; then
+  echo "error: --hermes-capabilities applies only to harness=hermes-vps; resolved harness is '$HARNESS'" >&2
+  exit 1
+fi
+if [ "$HARNESS" = hermes-vps ]; then
+  if [ "$RELAUNCH" -eq 1 ]; then
+    HERMES_HOST_ID=${RELAUNCH_HERMES_HOST:-default}
+    fm_hermes_router_host_present "$FM_HOME" "$HERMES_HOST_ID" || {
+      echo "error: task $ID was recorded on Hermes host '$HERMES_HOST_ID', which is no longer present in config/hermes-hosts.json; fix the registry rather than relaunch onto a different host implicitly" >&2
+      exit 1
+    }
+  else
+    HERMES_HOST_ID=$(fm_hermes_router_select "$FM_HOME" "$HERMES_CAPS_ARG") || exit 1
+  fi
+fi
 
 # muse, gemini, and agy are verified as CREWMATE/SCOUT adapters only. A secondmate is
 # a firstmate instance, so it needs a primary supervision protocol.
@@ -2267,6 +2324,16 @@ case "$LAUNCH" in
     LAUNCH=${LAUNCH//__HERMESVPSSTATUSFILE__/$(shell_quote "$STATE/$ID.status")}
     LAUNCH=${LAUNCH//__HERMESVPSREPORTFILE__/$(shell_quote "$DATA/$ID/report.md")}
     LAUNCH=${LAUNCH//__HERMESVPSINBOXDIR__/$(shell_quote "$STATE/$ID.inbox")}
+    # The resolved host's FM_HERMES_WS_* values (bin/fm-hermes-router-lib.sh),
+    # written to a private per-task file rather than typed into the pane or
+    # placed on argv - the bridge loads this file itself, ahead of
+    # $FM_HOME/.env, so it wins exactly like an already-exported env var
+    # would (bin/fm-hermes-ws-env-lib.sh's "first setter wins" contract).
+    # Empty for the "default" implicit host, which is what keeps this
+    # byte-identical to the pre-router single-host path.
+    HERMES_HOST_ENV_FILE="$STATE/$ID.hermes-host-env"
+    fm_hermes_router_write_host_env "$FM_HOME" "$HERMES_HOST_ID" "$HERMES_HOST_ENV_FILE" || exit 1
+    LAUNCH=${LAUNCH//__HERMESVPSHOSTENVFILE__/$(shell_quote "$HERMES_HOST_ENV_FILE")}
     ;;
 esac
 
@@ -4200,7 +4267,7 @@ SPAWN_META_PATH=$SPAWN_META_TMP
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen spawn_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx hermes_host", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -4247,6 +4314,15 @@ preserve_relaunch_meta() {
   if [ "$KIND" = secondmate ]; then
     echo "home=$PROJ_ABS"
     echo "projects=$SECONDMATE_PROJECTS"
+  fi
+  # hermes_host= is the multi-host router's continuity record
+  # (bin/fm-hermes-router-lib.sh, docs/configuration.md "Hermes hosts"): a
+  # later relaunch reuses this exact value instead of re-running the router,
+  # so a task never silently moves Hermes hosts. Written as "default" for
+  # the single implicit host, not omitted, so every hermes-vps task's
+  # resolved host is traceable.
+  if [ "$HARNESS" = hermes-vps ]; then
+    echo "hermes_host=$HERMES_HOST_ID"
   fi
   if [ "$RELAUNCH" -eq 1 ]; then
     preserve_relaunch_meta

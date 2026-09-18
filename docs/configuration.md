@@ -454,6 +454,36 @@ Malformed JSON, an empty or malformed rule/default array, an unverified harness,
 While the file remains present, no crewmate or scout spawn may proceed without an explicit resolved harness; malformed configuration must be reported and corrected rather than selected around.
 Secondmate homes inherit this file from the primary, so a secondmate's own crewmates apply the same dispatch profile behavior.
 
+## Hermes hosts (config/hermes-hosts.json)
+
+The optional local, gitignored `config/hermes-hosts.json` registers more than one destination Hermes host for a `harness=hermes-vps` crewmate or scout (for example a future GPU-equipped host alongside today's VPS), and is the schema owner for `bin/fm-hermes-router-lib.sh`'s capability-based selection.
+Absent or empty, behavior is unchanged from the pre-registry single-host path: the one implicit host, resolved entirely from `FM_HERMES_WS_*`/`$FM_HOME/.env` by `bin/fm-hermes-ws-env-lib.sh`, matches only an empty capability requirement.
+
+```json
+[
+  {
+    "id": "<unique host id>",
+    "base_url": "<FM_HERMES_WS_BASE_URL value, optional>",
+    "token": "<FM_HERMES_WS_TOKEN value, optional>",
+    "user": "<FM_HERMES_WS_USER value, optional>",
+    "pass": "<FM_HERMES_WS_PASS value, optional>",
+    "provider": "<FM_HERMES_WS_PROVIDER value, optional>",
+    "origin": "<FM_HERMES_WS_ORIGIN value, optional>",
+    "timeout": "<FM_HERMES_WS_TIMEOUT value, optional>",
+    "capabilities": ["<free-form tag, e.g. \"gpu\" or \"air-gapped\">"]
+  }
+]
+```
+
+The file is a JSON array; every entry needs a non-empty, unique string `id` other than the reserved `"default"` (which means the implicit pre-registry single host and is refused if used here), and every other field is optional exactly like its `FM_HERMES_WS_*` counterpart in `bin/fm-hermes-ws.py`'s own header contract - a field a host omits falls through to `$FM_HOME/.env` at launch, the same "first setter wins" convention `fm_hermes_ws_load_env_file` already uses.
+`capabilities` is an optional array of free-form string tags; an omitted array means the host declares none.
+
+`bin/fm-spawn.sh --hermes-capabilities <tag[,tag...]>` requests a host whose `capabilities` are a superset of the given tags for a fresh (non-relaunch) `harness=hermes-vps` spawn, refused for every other harness.
+`fm_hermes_router_select` (`bin/fm-hermes-router-lib.sh`) matches hosts by that superset rule and refuses loudly, rather than silently dispatching to a mismatched host, when none match; when several match, it picks the first one listed in the registry and says so - a deliberately naive v1 tie-break, not final routing policy, since ranking matched hosts by anything smarter is future work.
+The resolved host id is recorded as `hermes_host=` in `state/<id>.meta` and reused verbatim by a later relaunch instead of re-running the router, so a task never silently moves Hermes hosts; a relaunch refuses instead of falling back if its recorded host has since been removed from the registry.
+The resolved host's connection values reach the launched bridge process (`bin/fm-hermes-vps-bridge.sh`) through a private per-task file, never through the launch command or pane text, keeping credentials out of argv and status lines exactly like the single-host path.
+`bin/fm-hermes-router.sh list|select [<capability>...]` is a standalone CLI for inspecting the registry and exercising selection without spawning a task.
+
 ## Toolchain
 
 On session start the first mate detects what its required toolchain is missing or too old and lists each problem with either an exact install command or manual instructions.
