@@ -1,0 +1,6 @@
+== before: worker pid 45130 argv length: 236 chars
+   pgrep -f 'pwd -P' matches worker? YES
+   after pkill -f 'pwd -P': worker KILLED
+== after: worker pid 45465 argv length: 400 chars
+   pgrep -f 'pwd -P' matches worker? no
+   after pkill -f 'pwd -P': worker ALIVE

@@ -1,0 +1,2 @@
+spawned fm-test-launch-stub-claude-30370 harness=claude kind=scout window=firstmate:fm-fm-test-launch-stub-claude-30370 worktree=/private/var/folders/sv/xkrl1yhd5fd38rqbk75060vh0000gn/T/fm-launch-brief-stub-live.ROzB3Y/treehouse/.treehouse/probe-cf885d/1/probe
+ok - claude 2.1.282 (Claude Code) reads its brief file on turn one from a stub-only argv
