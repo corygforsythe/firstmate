@@ -285,13 +285,19 @@
 #   restart, and it is inherited into secondmate homes (bin/fm-config-inherit-lib.sh).
 #   Launch templates live in launch_template() below; placeholders replaced before launch:
 #     __LAUNCHPROMPT__ the typed launch-brief operational input the harness
-#                  receives as its first turn. Its body is only a short stub naming
-#                  the absolute path of the brief file (data/<task-id>/launch-brief.md,
-#                  or a secondmate's charter brief.md) and telling the worker to
-#                  read that whole file now and follow it. The brief body itself
-#                  never rides the agent's argv: `pkill -f`/`pgrep -f` match a
-#                  process's full command line, so shell-shaped brief prose there
-#                  let unrelated pattern kills on the machine SIGTERM live workers.
+#                  receives as its first turn. For a harness in the stub allowlist
+#                  (launch_brief_stub_verified below; today claude only) its body is
+#                  only a short stub naming the absolute path of the brief file
+#                  (data/<task-id>/launch-brief.md, or a secondmate's charter) and
+#                  telling the worker to read that whole file now and follow it, so
+#                  the brief body never rides the agent's argv: `pkill -f`/`pgrep -f`
+#                  match a process's full command line, and shell-shaped brief prose
+#                  there let unrelated pattern kills on the machine SIGTERM live
+#                  workers. Every other positional harness still receives the full
+#                  brief ("$(<opinput> encode launch-brief < <brief>)") because its
+#                  first-turn read of a file outside its workspace is unverified.
+#                  Promote a harness by adding it to the allowlist only after
+#                  tests/fm-launch-brief-stub-live-e2e.test.sh passes for it live.
 #                  The stub still names the home path and task id, so a pattern
 #                  matching those still matches; that is far narrower than prose.
 #     __CLAUDEPERMFLAG__ the claude permission flag selected by config/claude-permission-mode
@@ -1581,6 +1587,16 @@ agy_model_validate() {  # <agy-bin> <model>
   fi
   echo "error: agy model '$model' is not listed by 'agy models'; choose a listed id or omit --model" >&2
   return 1
+}
+
+# launch_brief_stub_verified <harness>: succeeds for a harness live-verified to
+# read its out-of-worktree brief file from the launch-brief stub (header:
+# __LAUNCHPROMPT__).
+launch_brief_stub_verified() {
+  case "$1" in
+    claude) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # The verified launch command per adapter. The knowledge half of each adapter
@@ -4428,6 +4444,7 @@ fi
 "$SCRIPT_DIR/fm-home-summary-refresh.sh" --best-effort || true
 [ "$BACKEND" = orca ] && ORCA_ABORT_CLEANUP=0
 
+sq_brief=$(shell_quote "$BRIEF")
 sq_launchstub=$(shell_quote "Your complete task instructions are in the file named at the end of this message. Read that whole file now, before anything else, and follow it as your task brief: $BRIEF")
 sq_turnend=$(shell_quote "$TURNEND")
 sq_piext=$(shell_quote "$STATE/$ID.pi-ext.ts")
@@ -4456,8 +4473,12 @@ LAUNCH=${LAUNCH//__PIWATCH__/$sq_piwatch}
 LAUNCH=${LAUNCH//__OMPEXT__/$sq_ompext}
 LAUNCH=${LAUNCH//__OMPWORKERCFG__/$sq_ompcfg}
 # The encoder runs in the pane shell, as before, so the typed line stays ASCII;
-# only the short stub (header: __LAUNCHPROMPT__) reaches the agent's argv.
-LAUNCHPROMPT="\"\$(printf '%s' $sq_launchstub | $sq_opinput encode launch-brief)\""
+# only an allowlisted harness gets the short stub (header: __LAUNCHPROMPT__).
+if launch_brief_stub_verified "$HARNESS"; then
+  LAUNCHPROMPT="\"\$(printf '%s' $sq_launchstub | $sq_opinput encode launch-brief)\""
+else
+  LAUNCHPROMPT="\"\$($sq_opinput encode launch-brief < $sq_brief)\""
+fi
 LAUNCH=${LAUNCH//__LAUNCHPROMPT__/"$LAUNCHPROMPT"}
 case "$HARNESS" in
   pi|pi-signed) LAUNCH=${LAUNCH//__PIBIN__/"$(shell_quote "$PI_BIN")"} ;;

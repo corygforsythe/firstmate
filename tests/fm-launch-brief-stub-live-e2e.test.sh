@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Opt-in live guard for the launch-brief stub (bin/fm-spawn.sh header,
-# __LAUNCHPROMPT__): every positional-launch harness receives only a short typed
-# stub naming its brief file on its argv, and must read that file on its first
-# turn. For each INSTALLED positional-launch harness this drives the real
+# __LAUNCHPROMPT__): a harness in the stub allowlist (launch_brief_stub_verified)
+# receives only a short typed stub naming its brief file on its argv, and must
+# read that file on its first turn. It is also the promotion check: add a
+# harness to the allowlist, then run this guard with
+# FM_LAUNCH_BRIEF_STUB_HARNESSES=<harness> before landing it. For each INSTALLED
+# harness checked, this drives the real
 # fm-spawn through a scout in an isolated FM_HOME on a private tmux server,
 # requires the worker to act on a token that exists only inside the brief file,
 # and requires the live agent processes' argv to carry the brief path but none
@@ -18,16 +21,18 @@ set -u
 
 fm_live_gate opt-in FM_LAUNCH_BRIEF_STUB_LIVE tmux git python3
 
-# Positional-launch harnesses and the executable each resolves. kimi, rovo,
-# hermes, and hermes-vps launch bare and receive a typed pointer after a
-# readiness gate instead, so they never carried the brief on argv.
+# The executable each positional-launch harness resolves. kimi, rovo, hermes,
+# and hermes-vps launch bare and receive a typed pointer after a readiness gate
+# instead, so they never carried the brief on argv. The default list mirrors
+# the fm-spawn stub allowlist; a harness outside it still gets the full brief
+# and fails the argv check.
 harness_bin() {
   case "$1" in
     cursor) printf '%s' cursor-agent ;;
     *) printf '%s' "$1" ;;
   esac
 }
-HARNESSES=${FM_LAUNCH_BRIEF_STUB_HARNESSES:-claude codex opencode grok gemini cursor muse agy pi omp}
+HARNESSES=${FM_LAUNCH_BRIEF_STUB_HARNESSES:-claude}
 WAIT_SECS=${FM_LAUNCH_BRIEF_STUB_WAIT:-240}
 
 LAB=$(fm_test_tmproot fm-launch-brief-stub-live) || fail "could not create the isolated lab"
@@ -132,4 +137,4 @@ PY
   checked=$((checked + 1))
 done
 
-[ "$checked" -gt 0 ] || fail "no positional-launch harness is installed, so nothing was checked"
+[ "$checked" -gt 0 ] || fail "no allowlisted harness is installed, so nothing was checked"
