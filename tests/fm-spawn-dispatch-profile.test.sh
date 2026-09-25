@@ -111,6 +111,13 @@ $1
 EOF
 }
 
+# launch_prompt <brief-path>: the exact positional launch-brief argument a
+# stub-allowlisted harness (claude) renders. Only this short stub naming the
+# brief file reaches the agent's argv; the brief body never does.
+launch_prompt() {
+  printf '%s' "\"\$(printf '%s' 'Your complete task instructions are in the file named at the end of this message. Read that whole file now, before anything else, and follow it as your task brief: $1' | '${ROOT}/bin/fm-operational-input.sh' encode launch-brief)\""
+}
+
 assert_meta_profile() {
   local meta=$1 harness=$2 model=$3 effort=$4
   assert_grep "harness=$harness" "$meta" "meta missing harness=$harness"
@@ -131,7 +138,7 @@ test_no_profile_keeps_claude_profile_defaults() {
   assert_meta_profile "$HOME_DIR/state/$id.meta" claude default default
 
   launch=$(cat "$LAUNCH_LOG")
-  expected="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude --dangerously-skip-permissions --settings '{\"feedbackDrafts\":\"off\",\"attribution\":{\"commit\":\"\",\"pr\":\"\",\"sessionUrl\":false}}' \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < '$HOME_DIR/data/$id/launch-brief.md')\""
+  expected="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude --dangerously-skip-permissions --settings '{\"feedbackDrafts\":\"off\",\"attribution\":{\"commit\":\"\",\"pr\":\"\",\"sessionUrl\":false}}' $(launch_prompt "$HOME_DIR/data/$id/launch-brief.md")"
   [ "$launch" = "$expected" ] || fail "no-profile claude launch did not use the canonical launch kind"$'\n'"expected: $expected"$'\n'"actual:   $launch"
   pass "no --model/--effort records defaults and types the claude launch instructions"
 }
@@ -1203,12 +1210,66 @@ SH
   pass "fm-spawn: actual ship/scout launch commands deliver the worker role contract"
 }
 
+# `pkill -f`/`pgrep -f` match a process's full command line, so the brief body
+# must never reach an allowlisted (stub-verified) worker's argv: shell-shaped
+# brief prose there let unrelated pattern kills SIGTERM live workers. Drive the
+# real spawn, execute the rendered launch against an argv-recording harness, and
+# require claude to receive only the typed launch-brief stub naming the brief
+# file that still holds the prose, while a harness not yet live-verified (codex)
+# keeps receiving the full brief as its typed launch-brief input.
+test_launch_argv_carries_only_the_brief_file_stub() {
+  local harness rec id out status launch brief argvbin last kind body
+  for harness in claude codex; do
+    id="argv-stub-$harness"
+    rec=$(make_spawn_case "argv-stub-$harness" "$harness" "$id")
+    read_case_record "$rec"
+    # shellcheck disable=SC2016 # literal brief prose, never expanded
+    printf '%s\n' '' 'Verify isolation: run `pwd -P` first.' 'Validate with `no-mistakes axi run`.' \
+      >> "$HOME_DIR/data/$id/brief.md"
+    out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+    status=$?
+    expect_code 0 "$status" "$harness spawn failed: $out"
+    brief="$HOME_DIR/data/$id/launch-brief.md"
+    assert_grep 'pwd -P' "$brief" "$harness launch brief lost the authored prose"
+    launch=$(cat "$LAUNCH_LOG")
+    assert_not_contains "$launch" 'pwd -P' "$harness launch command carries brief prose"
+    assert_contains "$launch" "$brief" "$harness launch command does not name the brief file"
+
+    argvbin="$CASE_DIR/argvbin"
+    mkdir -p "$argvbin"
+    cat > "$argvbin/$harness" <<'SH'
+#!/usr/bin/env bash
+for last in "$@"; do :; done
+printf '%s' "$last" > "$FM_ARGV_LAST"
+printf '%s\n' "$@" > "$FM_ARGV_ALL"
+SH
+    chmod +x "$argvbin/$harness"
+    last="$CASE_DIR/argv-last"
+    FM_ARGV_LAST="$last" FM_ARGV_ALL="$CASE_DIR/argv-all" PATH="$argvbin:$FAKEBIN_DIR:$PATH" bash -c "$launch" \
+      || fail "could not consume the $harness launch command"
+    kind=$("$ROOT/bin/fm-operational-input.sh" kind < "$last") || fail "$harness prompt is not a typed operational input"
+    [ "$kind" = launch-brief ] || fail "$harness prompt kind is '$kind', expected launch-brief"
+    body=$("$ROOT/bin/fm-operational-input.sh" body < "$last") || fail "$harness prompt body could not be read"
+    if [ "$harness" = claude ]; then
+      assert_no_grep 'pwd -P' "$CASE_DIR/argv-all" "$harness received brief prose on its argv"
+      assert_no_grep 'no-mistakes axi run' "$CASE_DIR/argv-all" "$harness received brief prose on its argv"
+      case "$body" in
+        *": $brief") ;;
+        *) fail "$harness prompt does not end with the brief file path: $body" ;;
+      esac
+    else
+      [ "$body" = "$(cat "$brief")" ] || fail "$harness prompt is not the full launch brief: $body"
+    fi
+  done
+  pass "fm-spawn: claude gets only a typed stub naming the brief file; unverified harnesses keep the full typed brief"
+}
+
 # config/claude-permission-mode (bin/fm-spawn.sh header): absent and `bypass`
 # must both produce today's launch byte-for-byte, `auto` swaps only the
 # permission flag, and any other token refuses before endpoint or metadata.
 claude_expected_launch() {  # <home> <id> <permission-flag>
   local home=$1 id=$2 flag=$3
-  printf '%s' "env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude $flag --settings '{\"feedbackDrafts\":\"off\",\"attribution\":{\"commit\":\"\",\"pr\":\"\",\"sessionUrl\":false}}' \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < '$home/data/$id/launch-brief.md')\""
+  printf '%s' "env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude $flag --settings '{\"feedbackDrafts\":\"off\",\"attribution\":{\"commit\":\"\",\"pr\":\"\",\"sessionUrl\":false}}' $(launch_prompt "$home/data/$id/launch-brief.md")"
 }
 
 test_claude_permission_mode_bypass_matches_absent_launch() {
@@ -1297,6 +1358,7 @@ test_non_claude_harness_ignores_claude_permission_mode() {
 }
 
 test_worker_launch_delivers_role_scope
+test_launch_argv_carries_only_the_brief_file_stub
 test_no_profile_keeps_claude_profile_defaults
 test_non_cursor_launch_clears_inherited_cursor_markers
 test_relative_home_overrides_launch_with_absolute_cross_process_paths

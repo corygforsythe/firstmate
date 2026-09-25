@@ -446,6 +446,26 @@ The lab home was deleted and the test entry was removed from the store and verif
 That automated spawn case runs against a fake claude, so it asserts the store entry and the launch command and nothing more; the live arms above are what establish that the entry actually suppresses the dialog.
 The composer-classification record below observes the same gate from the other side, where an untrusted worktree left Claude, Grok, and Muse unverified because the guard reads a first-launch trust dialog as an unreadable composer.
 
+## Launch brief stub
+
+A harness in the `bin/fm-spawn.sh` stub allowlist (`launch_brief_stub_verified`, today Claude only) receives only a typed launch-brief stub naming its brief file, never the brief body, because `pkill -f` and `pgrep -f` match a process's full command line and shell-shaped brief prose there let unrelated pattern kills stop live workers.
+Every other positional-launch harness (Codex, OpenCode, Pi, pi-signed, Grok, Cursor, Gemini, Muse, omp, agy) keeps the full typed brief on its launch until it is live-verified to read an out-of-worktree brief file on its first turn; a harness is promoted by adding it to the allowlist only after the guard below passes for it.
+The one behavioral assumption - a real worker reads the named file on its first turn and follows it - was verified for Claude on 2026-09-24, on tmux 3.6a, macOS arm64, on an isolated private socket and worktree pool, driving the REAL `bin/fm-spawn.sh` through a scout whose completion token existed only inside its brief file.
+
+```sh
+FM_LAUNCH_BRIEF_STUB_LIVE=1 tests/fm-launch-brief-stub-live-e2e.test.sh
+```
+
+```text
+ok - claude 2.1.282 (Claude Code) reads its brief file on turn one from a stub-only argv
+```
+
+The same guard run against the previous full-brief launch failed on its argv check, naming the live `claude` process whose command line carried the brief prose, so the guard detects the regression it pins.
+To check a candidate, add it to the allowlist and run the guard with `FM_LAUNCH_BRIEF_STUB_HARNESSES=<harness>`.
+Kimi, Rovo, Hermes, and hermes-vps already launch bare and receive a typed pointer after a readiness gate, so they never carried the brief on argv and are outside this guard.
+`tests/fm-spawn-dispatch-profile.test.sh` pins the harness-independent half: Claude's rendered launch and received argv carry the brief path and none of its prose, and a non-allowlisted harness still receives the full typed brief.
+The stub still names the home path and task id, so a kill pattern matching those still matches a Claude worker.
+
 ## Composer classification matrix
 
 The shared composer classifier (`bin/fm-composer-lib.sh`, `fm_composer_classify_screen`) owns every composer shape fleet-wide; each backend contributes only a capture and a capability descriptor.
