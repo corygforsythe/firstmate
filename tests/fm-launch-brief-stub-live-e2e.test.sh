@@ -90,15 +90,19 @@ for harness in $HARNESSES; do
   status="$LAB/home/state/$id.status"
   FM_HOME="$LAB/home" "$ROOT/bin/fm-brief.sh" "$id" probe --scout >/dev/null \
     || fail "could not scaffold the $harness probe brief"
-  python3 - "$LAB/home/data/$id/brief.md" "$status" "$token" <<'PY'
+  # The sentinel is unique per run: harnesses' own tool shells legitimately run
+  # commands such as `pwd -P` (Claude Code appends it to every Bash call), so a
+  # fixed shell phrase would flag the worker's tool shells, not its launch argv.
+  sentinel="fmstubsentinel$RANDOM$RANDOM"
+  python3 - "$LAB/home/data/$id/brief.md" "$status" "$token" "$sentinel" <<'PY'
 from pathlib import Path
 import sys
 
-brief, status, token = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+brief, status, token, sentinel = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 text = brief.read_text()
 text = text.replace("{TASK}", f"""Launch stub probe.
 Append exactly `done: token {token}` to `{status}` and stop.
-Shell-shaped sentinel prose you do not need to run: `pwd -P` and `no-mistakes axi run`.
+Shell-shaped sentinel prose you must not run or repeat: `{sentinel} --probe`.
 Do not change project files or make a commit.""")
 text = text.replace("{FIRSTMATE_SPEC}", "Nothing beyond the captain's intent.")
 brief.write_text(text)
@@ -123,7 +127,7 @@ PY
     while read -r pid; do
       args=$(ps -o args= -p "$pid" 2>/dev/null) || continue
       case "$args" in
-        *'pwd -P'* | *'no-mistakes axi run'*) fail "$harness $version process $pid carries brief prose on its argv: $args" ;;
+        *"$sentinel"*) fail "$harness $version process $pid carries brief prose on its argv: $args" ;;
         *"$LAB/home/data/$id/launch-brief.md"*) seen_path=1 ;;
       esac
     done < <(descendants "$pane_pid")
