@@ -111,6 +111,13 @@ $1
 EOF
 }
 
+# launch_prompt <brief-path>: the exact positional launch-brief argument a
+# positional-launch template renders. Only this short stub naming the brief
+# file reaches the agent's argv; the brief body never does.
+launch_prompt() {
+  printf '%s' "\"\$(printf '%s' 'Your complete task instructions are in the file named at the end of this message. Read that whole file now, before anything else, and follow it as your task brief: $1' | '${ROOT}/bin/fm-operational-input.sh' encode launch-brief)\""
+}
+
 assert_meta_profile() {
   local meta=$1 harness=$2 model=$3 effort=$4
   assert_grep "harness=$harness" "$meta" "meta missing harness=$harness"
@@ -131,7 +138,7 @@ test_no_profile_keeps_claude_profile_defaults() {
   assert_meta_profile "$HOME_DIR/state/$id.meta" claude default default
 
   launch=$(cat "$LAUNCH_LOG")
-  expected="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude --dangerously-skip-permissions --settings '{\"feedbackDrafts\":\"off\",\"attribution\":{\"commit\":\"\",\"pr\":\"\",\"sessionUrl\":false}}' \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < '$HOME_DIR/data/$id/launch-brief.md')\""
+  expected="env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude --dangerously-skip-permissions --settings '{\"feedbackDrafts\":\"off\",\"attribution\":{\"commit\":\"\",\"pr\":\"\",\"sessionUrl\":false}}' $(launch_prompt "$HOME_DIR/data/$id/launch-brief.md")"
   [ "$launch" = "$expected" ] || fail "no-profile claude launch did not use the canonical launch kind"$'\n'"expected: $expected"$'\n'"actual:   $launch"
   pass "no --model/--effort records defaults and types the claude launch instructions"
 }
@@ -176,7 +183,7 @@ test_relative_home_overrides_launch_with_absolute_cross_process_paths() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "-e '$home_real/state/$id.pi-ext.ts'" \
     "relative FM_STATE_OVERRIDE leaked into Pi's cross-process extension path"
-  assert_contains "$launch" "< '$home_real/data/$id/launch-brief.md'" \
+  assert_contains "$launch" ": $home_real/data/$id/launch-brief.md'" \
     "relative FM_DATA_OVERRIDE leaked into the cross-process brief path"
   pass "relative home overrides ignore CDPATH and become absolute before spawn launch construction"
 }
@@ -205,7 +212,7 @@ test_home_defaults_preserve_absolute_or_resolve_relative_paths() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "-e '$home_real/state/$relative_id.pi-ext.ts'" \
     "relative FM_HOME leaked into Pi's default cross-process extension path"
-  assert_contains "$launch" "< '$home_real/data/$relative_id/launch-brief.md'" \
+  assert_contains "$launch" ": $home_real/data/$relative_id/launch-brief.md'" \
     "relative FM_HOME leaked into the default cross-process brief path"
 
   linked_home="$CASE_DIR/home-link"
@@ -225,7 +232,7 @@ test_home_defaults_preserve_absolute_or_resolve_relative_paths() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "-e '$linked_home/state/$absolute_id.pi-ext.ts'" \
     "absolute FM_HOME spelling changed in Pi's default cross-process extension path"
-  assert_contains "$launch" "< '$linked_home/data/$absolute_id/launch-brief.md'" \
+  assert_contains "$launch" ": $linked_home/data/$absolute_id/launch-brief.md'" \
     "absolute FM_HOME spelling changed in the default cross-process brief path"
   pass "FM_HOME defaults resolve relative paths and preserve absolute spellings"
 }
@@ -253,7 +260,7 @@ test_absolute_override_spelling_is_preserved_in_launch_paths() {
   launch=$(cat "$LAUNCH_LOG")
   assert_contains "$launch" "-e '$linked_home/state/$id.pi-ext.ts'" \
     "absolute FM_STATE_OVERRIDE spelling changed in Pi's cross-process extension path"
-  assert_contains "$launch" "< '$linked_home/data/$id/launch-brief.md'" \
+  assert_contains "$launch" ": $linked_home/data/$id/launch-brief.md'" \
     "absolute FM_DATA_OVERRIDE spelling changed in the cross-process brief path"
   pass "absolute override spellings are preserved in spawn launch paths"
 }
@@ -462,7 +469,7 @@ test_grok_omits_invalid_max_reasoning_effort() {
   expect_code 0 "$status" "grok spawn with unsupported max reasoning effort should omit the effort flag"
   assert_meta_profile "$HOME_DIR/state/$id.meta" grok grok-4 max
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "grok --always-approve --model 'grok-4' \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < " \
+  assert_contains "$launch" "grok --always-approve --model 'grok-4' \"\$(printf '%s' 'Your complete task instructions" \
     "grok launch did not preserve the model flag and typed brief when max effort was omitted"
   assert_not_contains "$launch" "--reasoning-effort" "grok launch must omit unsupported max reasoning effort"
   assert_not_contains "$launch" "--effort" "grok launch must not fall back to --effort for reasoning effort"
@@ -481,7 +488,7 @@ test_grok_omits_invalid_xhigh_reasoning_effort() {
   expect_code 0 "$status" "grok spawn with unsupported xhigh reasoning effort should omit the effort flag"
   assert_meta_profile "$HOME_DIR/state/$id.meta" grok grok-4 xhigh
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "grok --always-approve --model 'grok-4' \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < " \
+  assert_contains "$launch" "grok --always-approve --model 'grok-4' \"\$(printf '%s' 'Your complete task instructions" \
     "grok launch did not preserve the model flag and typed brief when xhigh effort was omitted"
   assert_not_contains "$launch" "--reasoning-effort" "grok launch must omit unsupported xhigh reasoning effort"
   assert_not_contains "$launch" "--effort" "grok launch must not fall back to --effort for reasoning effort"
@@ -774,7 +781,8 @@ test_pi_signed_persistent_secondmate_uses_pi_extensions_and_identity() {
   cmp -s "$CASE_DIR/charter-before" "$sm/data/charter.md" || fail "secondmate launch rewrote the charter"
   assert_absent "$HOME_DIR/data/$id/launch-brief.md" "secondmate launch received a worker overlay"
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "< '$sm/data/charter.md'" "secondmate launch lost its original charter"
+  assert_contains "$launch" ": $sm/data/charter.md'" "secondmate launch lost its original charter"
+  assert_not_contains "$launch" "charter for $id" "secondmate launch put charter prose on the harness argv"
   assert_contains "$launch" "FM_PI_HARNESS=pi-signed '$FAKEBIN_DIR/pi-signed' --tui-mode regular -e '$sm/.pi/extensions/fm-primary-turnend-guard.ts' -e '$sm/.pi/extensions/fm-primary-pi-watch.ts'" \
     "pi-signed secondmate did not force the regular TUI with Pi's primary extension launch shape"
   if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
@@ -1142,7 +1150,7 @@ test_launch_environment_inherited_by_secondmate
 test_launch_environment_inheritance_preserves_on_source_errors
 
 test_worker_launch_delivers_role_scope() {
-  local rec id out launch kind prompt brief_kind brief content
+  local rec id out launch kind prompt brief_kind brief content named
   for brief_kind in heading legacy scaffold; do
   for kind in no-mistakes direct-PR local-only scout; do
     [ "$brief_kind" = heading ] && [ "$kind" != no-mistakes ] && continue
@@ -1181,21 +1189,26 @@ SH
     launch=$(cat "$LAUNCH_LOG")
     prompt="$CASE_DIR/prompt"
     FM_ROLE_PROMPT="$prompt" PATH="$FAKEBIN_DIR:$PATH" bash -c "$launch" || fail "could not consume $kind launch command"
-    # The final prompt delivered to the harness is the generated interface.
-    # An authored role heading must neither suppress nor duplicate the current
-    # worker contract; the launch section is its single, superseding owner.
-    assert_grep 'follow this brief instead of that supervisor contract' "$prompt" "$kind command did not deliver the role correction"
-    assert_grep 'brief for' "$prompt" "$kind command lost the task"
-    [ "$(grep -c '^# Current worker role contract$' "$prompt")" -eq 1 ] ||
+    # The harness receives only a stub naming the brief file; the file it names
+    # is the generated interface. An authored role heading must neither
+    # suppress nor duplicate the current worker contract; the launch section is
+    # its single, superseding owner.
+    named=$(sed -n 's/^.*follow it as your task brief: //p' "$prompt" | tail -n 1)
+    [ -n "$named" ] && [ -f "$named" ] || fail "$kind command did not name a readable brief file: $(cat "$prompt")"
+    assert_no_grep 'brief for' "$prompt" "$kind command put brief prose on the harness argv"
+    assert_grep 'follow this brief instead of that supervisor contract' "$named" "$kind command did not deliver the role correction"
+    assert_grep 'brief for' "$named" "$kind command lost the task"
+    [ "$(grep -c '^# Current worker role contract$' "$named")" -eq 1 ] ||
       fail "$brief_kind $kind duplicated the delivered worker contract"
     if [ "$brief_kind" = heading ]; then
-      assert_grep 'Follow the project instructions' "$prompt" "$kind command dropped the authored role section"
+      assert_grep 'Follow the project instructions' "$named" "$kind command dropped the authored role section"
     fi
     cmp -s "$CASE_DIR/brief-before" "$HOME_DIR/data/$id/brief.md" || fail "spawn rewrote the authored brief"
     if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
       printf '# evidence begin: %s %s worker\n%s\n' "$brief_kind" "$kind" "$out"
       printf 'launch command executed with an argv-capture harness:\n%s\nreceived arguments and final prompt:\n' "$launch"
       cat "$prompt"
+      printf 'brief file named by the prompt: %s\n' "$named"
       printf 'authored brief remains byte-identical\n# evidence end\n'
     fi
   done
@@ -1203,12 +1216,62 @@ SH
   pass "fm-spawn: actual ship/scout launch commands deliver the worker role contract"
 }
 
+# `pkill -f`/`pgrep -f` match a process's full command line, so the brief body
+# must never reach a worker's argv: shell-shaped brief prose there let unrelated
+# pattern kills SIGTERM live workers. Drive the real spawn, execute the rendered
+# launch against an argv-recording harness, and require the agent to receive
+# only the typed launch-brief stub naming the brief file that still holds the
+# prose.
+test_launch_argv_carries_only_the_brief_file_stub() {
+  local harness rec id out status launch brief argvbin last kind body
+  for harness in claude codex grok opencode; do
+    id="argv-stub-$harness"
+    rec=$(make_spawn_case "argv-stub-$harness" "$harness" "$id")
+    read_case_record "$rec"
+    # shellcheck disable=SC2016 # literal brief prose, never expanded
+    printf '%s\n' '' 'Verify isolation: run `pwd -P` first.' 'Validate with `no-mistakes axi run`.' \
+      >> "$HOME_DIR/data/$id/brief.md"
+    out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR")
+    status=$?
+    expect_code 0 "$status" "$harness spawn failed: $out"
+    brief="$HOME_DIR/data/$id/launch-brief.md"
+    assert_grep 'pwd -P' "$brief" "$harness launch brief lost the authored prose"
+    launch=$(cat "$LAUNCH_LOG")
+    assert_not_contains "$launch" 'pwd -P' "$harness launch command carries brief prose"
+    assert_not_contains "$launch" 'no-mistakes axi run' "$harness launch command carries brief prose"
+    assert_contains "$launch" "$brief" "$harness launch command does not name the brief file"
+
+    argvbin="$CASE_DIR/argvbin"
+    mkdir -p "$argvbin"
+    cat > "$argvbin/$harness" <<'SH'
+#!/usr/bin/env bash
+for last in "$@"; do :; done
+printf '%s' "$last" > "$FM_ARGV_LAST"
+printf '%s\n' "$@" > "$FM_ARGV_ALL"
+SH
+    chmod +x "$argvbin/$harness"
+    last="$CASE_DIR/argv-last"
+    FM_ARGV_LAST="$last" FM_ARGV_ALL="$CASE_DIR/argv-all" PATH="$argvbin:$FAKEBIN_DIR:$PATH" bash -c "$launch" \
+      || fail "could not consume the $harness launch command"
+    assert_no_grep 'pwd -P' "$CASE_DIR/argv-all" "$harness received brief prose on its argv"
+    assert_no_grep 'no-mistakes axi run' "$CASE_DIR/argv-all" "$harness received brief prose on its argv"
+    kind=$("$ROOT/bin/fm-operational-input.sh" kind < "$last") || fail "$harness prompt is not a typed operational input"
+    [ "$kind" = launch-brief ] || fail "$harness prompt kind is '$kind', expected launch-brief"
+    body=$("$ROOT/bin/fm-operational-input.sh" body < "$last") || fail "$harness prompt body could not be read"
+    case "$body" in
+      *": $brief") ;;
+      *) fail "$harness prompt does not end with the brief file path: $body" ;;
+    esac
+  done
+  pass "fm-spawn: positional launches pass only a typed stub naming the brief file, never the brief prose"
+}
+
 # config/claude-permission-mode (bin/fm-spawn.sh header): absent and `bypass`
 # must both produce today's launch byte-for-byte, `auto` swaps only the
 # permission flag, and any other token refuses before endpoint or metadata.
 claude_expected_launch() {  # <home> <id> <permission-flag>
   local home=$1 id=$2 flag=$3
-  printf '%s' "env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude $flag --settings '{\"feedbackDrafts\":\"off\",\"attribution\":{\"commit\":\"\",\"pr\":\"\",\"sessionUrl\":false}}' \"\$('${ROOT}/bin/fm-operational-input.sh' encode launch-brief < '$home/data/$id/launch-brief.md')\""
+  printf '%s' "env -u CURSOR_AGENT -u CURSOR_INVOKED_AS -u GEMINI_CLI CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude $flag --settings '{\"feedbackDrafts\":\"off\",\"attribution\":{\"commit\":\"\",\"pr\":\"\",\"sessionUrl\":false}}' $(launch_prompt "$home/data/$id/launch-brief.md")"
 }
 
 test_claude_permission_mode_bypass_matches_absent_launch() {
@@ -1297,6 +1360,7 @@ test_non_claude_harness_ignores_claude_permission_mode() {
 }
 
 test_worker_launch_delivers_role_scope
+test_launch_argv_carries_only_the_brief_file_stub
 test_no_profile_keeps_claude_profile_defaults
 test_non_cursor_launch_clears_inherited_cursor_markers
 test_relative_home_overrides_launch_with_absolute_cross_process_paths

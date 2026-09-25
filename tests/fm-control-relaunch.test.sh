@@ -481,7 +481,7 @@ test_disabled_relaunch_clears_prior_trace_context() {
 }
 
 test_relaunch_appends_the_progress_note_to_the_instructions() {
-  local dir out rc brief
+  local dir out rc brief named
   dir=$(new_case note rl2)
   add_ship_task "$dir" rl2 claude
   out=$(run_control "$dir" rl2 relaunch --note "reproduced the crash in parser.go"); rc=$?
@@ -492,6 +492,12 @@ test_relaunch_appends_the_progress_note_to_the_instructions() {
   assert_grep "reproduced the crash in parser.go" "$brief" "the note text should reach the replacement"
   assert_grep "reproduced the crash in parser.go" "$dir/home/state/rl2.control-relaunch.note" \
     "the note should also be preserved beside the transaction record"
+  # The replacement's launch carries only a stub naming its brief file, so the
+  # note must be in the file that stub names, not on the launch command.
+  named=$(sed -n "s/^.*follow it as your task brief: \([^']*\)'.*$/\1/p" "$dir/fake/literal" | tail -n 1)
+  [ -n "$named" ] && [ -f "$named" ] || fail "the replacement launch named no readable brief file: $(cat "$dir/fake/literal")"
+  assert_grep "reproduced the crash in parser.go" "$named" "the note should reach the brief file the replacement reads"
+  assert_no_grep "reproduced the crash in parser.go" "$dir/fake/literal" "the note must not ride the launch command"
   pass "fm-control relaunch: the progress note lands in the instructions the replacement reads"
 }
 
